@@ -1,0 +1,1764 @@
+<!DOCTYPE html>
+<!--
+  https://github.com/yrambler2001/seek-thermal-firmware-dump
+
+  Read the USB-reachable 4 MiB SPIFI flash of a Seek Thermal camera from the
+  browser, over WebUSB, and decrypt any firmware images found in it.
+
+  Read-only by design:
+    - uses SetOperationMode(0) only if the device is not already in mode 0;
+    - uses BeginFirmwareUpgrade(subcmd) only as a volatile read-window selector;
+    - reads with GetFeaturedFirmwareData;
+    - never calls SetFeaturedFirmwareData, CompleteMemoryUpgrade, ResetDevice,
+      upload, commit, erase, or any other flash-modifying RPC.
+
+  USB protocol limitation:
+    BeginFirmwareUpgrade exposes all known 64 KiB blocks in 0x14000000..0x143fffff
+    except 0x14060000. The combined 4 MiB image therefore marks that block as a
+    gap and fills it with the gap-fill byte (default 0xff). Use SWD/J-Link for a
+    truly complete byte-for-byte 4 MiB flash dump including that block.
+
+  Why a browser can talk to this device at all:
+    Interface 0 is bInterfaceClass 0xFF (vendor specific), which is not on
+    Chrome's protected-class blocklist, so WebUSB is allowed to claim it. The
+    firmware's EP0 handler masks bmRequestType & 0x60 and only requires
+    wIndex == 0, so both recipient=interface (0x41/0xC1) and recipient=device
+    (0x40/0xC0) are accepted.
+
+  The decryption stage is a port of decrypt_firmware.js: Marsaglia xorshift128
+  (shifts 11/8/19) keystream, key found by scanning the dump for any 16-byte
+  window whose decryption makes the image checksum hit the profile target.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Dump and decrypt the 4 MiB SPIFI flash of a Seek Thermal camera from your browser over WebUSB. Read-only, no driver install on macOS or Linux.">
+<meta name="color-scheme" content="light">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f6feb'/%3E%3Cpath d='M9 10h14M9 16h14M9 22h9' stroke='white' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<title>Seek Thermal Firmware Dump (WebUSB)</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #5c6570;
+    --line: #d8dee6;
+    --panel: #f6f8fa;
+    --accent: #2f6feb;
+    --ok: #1a7f37;
+    --warn: #9a6700;
+    --err: #cf222e;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--bg); }
+  body {
+    margin: 0;
+    padding: 1.5rem 1rem 3rem;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  main { max-width: 58rem; margin: 0 auto; }
+  h1 { font-size: 1.45rem; margin: 0 0 .3rem; letter-spacing: -.01em; }
+  h2 { font-size: 1.05rem; margin: 1.75rem 0 .6rem; }
+  h3 { font-size: .95rem; margin: 1.1rem 0 .35rem; }
+  .sub { color: var(--muted); margin: 0 0 1.25rem; font-size: .9rem; }
+  a { color: var(--accent); }
+  code, pre, .mono { font-family: var(--mono); font-size: .85em; }
+  section {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 1rem 1.1rem;
+    margin-bottom: 1rem;
+    background: var(--panel);
+  }
+  .banner {
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--accent);
+    padding: .7rem .9rem;
+    border-radius: 8px;
+    background: var(--panel);
+    margin-bottom: 1rem;
+  }
+  .banner.ok  { border-left-color: var(--ok); }
+  .banner.warn{ border-left-color: var(--warn); }
+  .banner.err { border-left-color: var(--err); }
+  .banner p { margin: .25rem 0; }
+  .row { display: flex; flex-wrap: wrap; gap: .75rem; align-items: flex-end; }
+  label { display: block; font-size: .8rem; color: var(--muted); margin-bottom: .2rem; }
+  input[type=text], input[type=number], select {
+    font: inherit;
+    font-family: var(--mono);
+    font-size: .85rem;
+    padding: .4rem .5rem;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--fg);
+    width: 9.5rem;
+    max-width: 100%;
+  }
+  button {
+    font: inherit;
+    font-weight: 600;
+    padding: .5rem .9rem;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    background: var(--bg);
+    color: var(--fg);
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .btnrow { display: flex; flex-wrap: wrap; gap: .5rem; }
+  #bar, #bar2 {
+    height: 10px;
+    border-radius: 5px;
+    background: var(--line);
+    overflow: hidden;
+    margin: .9rem 0 .45rem;
+  }
+  #barFill, #barFill2 { height: 100%; width: 0%; background: var(--accent); transition: width .1s linear; }
+  #status, #status2 { font-size: .85rem; color: var(--muted); }
+  #log, #log2 {
+    font-family: var(--mono);
+    font-size: .78rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 24rem;
+    overflow-y: auto;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: .6rem .7rem;
+    margin: .85rem 0 0;
+  }
+  .l-ok  { color: var(--ok); }
+  .l-warn{ color: var(--warn); }
+  .l-err { color: var(--err); }
+  .l-dim { color: var(--muted); }
+  details.opts { border: 1px dashed var(--line); border-radius: 8px; padding: .55rem .8rem; background: var(--bg); }
+  details.opts[open] { padding-bottom: .9rem; }
+  details.opts > summary { cursor: pointer; font-size: .88rem; color: var(--muted); }
+  details.opts > summary strong { color: var(--fg); }
+  details.sub-details { border-top: 1px solid var(--line); padding-top: .7rem; margin-top: .9rem; }
+  details.sub-details > summary { cursor: pointer; font-weight: 600; font-size: .9rem; }
+  pre.block {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: .6rem .7rem;
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .85rem; min-width: 34rem; }
+  th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  ul { padding-left: 1.2rem; }
+  li { margin: .2rem 0; }
+  .hidden { display: none !important; }
+  .note { font-size: .85rem; color: var(--muted); }
+  /* the offline decryptor is a side door, not part of the numbered flow */
+  section.optional {
+    background: var(--bg);
+    border-style: dashed;
+    margin-top: 1.75rem;
+  }
+  .optlabel {
+    margin: 0 0 .3rem;
+    font-size: .72rem;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+  }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Seek Thermal Firmware Dump</h1>
+<p class="sub">
+  Reads the 4&nbsp;MiB SPIFI flash of a Seek Thermal camera over WebUSB and decrypts any firmware
+  images it finds. Everything runs locally in your browser &mdash; nothing is uploaded anywhere.
+  <strong>Read-only:</strong> no flash write, erase, upload, commit, or reset command is ever issued.
+</p>
+
+<div id="support" class="banner">Checking browser support&hellip;</div>
+
+<section>
+  <h2 style="margin-top:0">1 &middot; Connect</h2>
+  <div class="btnrow">
+    <button id="btnConnect" class="primary">Connect device</button>
+    <button id="btnTest" disabled>Test connection</button>
+    <button id="btnForget" disabled>Forget device</button>
+  </div>
+  <p id="devInfo" class="note" style="margin:.9rem 0 0">No device selected.</p>
+  <p class="note" style="margin:.5rem 0 0">
+    Any Seek Thermal device is offered (USB vendor <code>0x289d</code>) &mdash; Compact,
+    Compact&nbsp;PRO, Nano and so on. Pick yours in the browser's device chooser.
+  </p>
+</section>
+
+<section>
+  <h2 style="margin-top:0">2 &middot; Dump</h2>
+  <div class="btnrow">
+    <button id="btnStart" class="primary" disabled>Start dump</button>
+    <button id="btnCancel" disabled>Cancel</button>
+  </div>
+  <div id="bar"><div id="barFill"></div></div>
+  <div id="status">Idle.</div>
+  <pre id="log" class="hidden"></pre>
+
+  <details class="opts" style="margin-top:1rem">
+    <summary><strong>Options</strong> &mdash; the defaults are correct; you do not need to change anything here.</summary>
+    <div class="row" style="margin-top:.9rem">
+      <div>
+        <label for="optChunk">chunk (control-IN bytes)</label>
+        <input type="number" id="optChunk" value="256" min="1" max="65536" step="1">
+      </div>
+      <div>
+        <label for="optGapFill">gap-fill byte</label>
+        <input type="text" id="optGapFill" value="0xff">
+      </div>
+      <div>
+        <label for="optRetries">retries per window</label>
+        <input type="number" id="optRetries" value="2" min="0" max="10" step="1">
+      </div>
+      <div>
+        <label for="optRetryDelay">retry delay (ms)</label>
+        <input type="number" id="optRetryDelay" value="500" min="0" max="10000" step="50">
+      </div>
+      <div>
+        <label for="optRecipient">control transfer recipient</label>
+        <select id="optRecipient">
+          <option value="auto" selected>auto</option>
+          <option value="interface">interface (0x41/0xC1)</option>
+          <option value="device">device (0x40/0xC0)</option>
+        </select>
+      </div>
+      <div>
+        <label for="optDecrypt">decrypt firmware</label>
+        <select id="optDecrypt">
+          <option value="1" selected>yes</option>
+          <option value="0">no</option>
+        </select>
+      </div>
+    </div>
+    <p class="note" style="margin:.9rem 0 0">
+      <strong>chunk</strong> is the size of each control-IN read; larger is faster but the device may
+      clamp it, which would truncate a window. <strong>gap-fill</strong> is the byte written into the
+      one 64&nbsp;KiB block USB cannot reach. <strong>recipient</strong> defaults to interface and falls
+      back to device if the browser cannot claim interface&nbsp;0 &mdash; the firmware accepts both.
+    </p>
+  </details>
+</section>
+
+<section id="offlineSection" class="optional">
+  <p class="optlabel">Optional &mdash; not part of the two steps above</p>
+  <h2 style="margin-top:0">Decrypt a dump you already have</h2>
+  <p class="note" style="margin-top:0">
+    Step 2 already decrypts everything it reads, so you only need this if your flash image came from
+    somewhere else &mdash; an earlier run, J-Link, or an SPI programmer. The file is read locally and
+    never uploaded.
+    <strong>This part works in every browser</strong>, including Safari and iOS, because it needs no
+    USB access.
+  </p>
+  <div class="btnrow">
+    <button id="btnPick" class="primary">Choose dump file&hellip;</button>
+    <button id="btnCancelDec" disabled>Cancel</button>
+  </div>
+  <input type="file" id="filePick" accept=".bin,.img,.rom,application/octet-stream" class="hidden">
+  <div id="bar2"><div id="barFill2"></div></div>
+  <div id="status2">No file chosen.</div>
+  <pre id="log2" class="hidden"></pre>
+</section>
+
+<section>
+  <h2 style="margin-top:0">What you get</h2>
+  <p class="note" style="margin-top:0">A single <code>.zip</code> download containing:</p>
+  <div class="tablewrap">
+  <table>
+    <tbody>
+      <tr><td class="mono">flash_4m_usb_partial_gap_ff.bin</td><td>the assembled 4 MiB flash image</td></tr>
+      <tr><td class="mono">windows/*.bin</td><td>each 64 KiB block exactly as it came off the wire</td></tr>
+      <tr><td class="mono">decrypted/*.bin</td><td>every firmware image slot, decrypted (if a key was found)</td></tr>
+      <tr><td class="mono">decrypted/*.txt</td><td>per-slot report: key, key location, cipher profile, SP, entry, SHA-256</td></tr>
+      <tr><td class="mono">manifest.json</td><td>exact read/gap/decryption metadata</td></tr>
+      <tr><td class="mono">README.md</td><td>what the capture is and what its limits are</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="note">
+    The key is recovered from the dump itself, so no key file or device secret is needed.
+  </p>
+  <p class="note">
+    Decryption is still best-effort. If no key is found &mdash; for example on a unit whose bootloader
+    derives the key from chip OTP, which is not present in a flash dump &mdash; that slot is simply
+    skipped and the rest of the archive is unaffected.
+  </p>
+</section>
+
+<section>
+  <h2 style="margin-top:0">Platform notes</h2>
+
+  <h3>macOS</h3>
+  <p class="note">
+    Works out of the box in Chrome, Edge or any Chromium browser. No driver install, no admin rights.
+    Quit any other program that is already talking to the camera first &mdash; only one process can hold
+    the USB interface at a time.
+  </p>
+
+  <h3>Linux</h3>
+  <p class="note">Give your user access to the device, then unplug and replug it:</p>
+  <pre class="block"># /etc/udev/rules.d/70-seek-thermal.rules
+SUBSYSTEM=="usb", ATTR{idVendor}=="289d", MODE="0666", TAG+="uaccess"
+
+sudo udevadm control --reload-rules &amp;&amp; sudo udevadm trigger</pre>
+  <p class="note">
+    Snap and Flatpak Chromium builds are often sandboxed away from raw USB devices; the <code>.deb</code>
+    or <code>.rpm</code> build is the reliable one.
+  </p>
+
+  <h3>Windows</h3>
+  <p class="note">
+    Windows needs the WinUSB driver bound to the camera before any browser can reach it. Use
+    <a href="https://zadig.akeo.ie/" rel="noopener">Zadig</a>: <em>Options &rarr; List All Devices</em>,
+    then in the dropdown pick the entry named after your camera &mdash; for example
+    <code>CompactPRO FF</code> &mdash; choose <strong>WinUSB</strong> as the driver, and click Replace
+    Driver. If your camera appears more than once, take the entry labelled
+    <em>(Interface&nbsp;0)</em>. This takes the device away from the vendor software until you revert it
+    in Device Manager (<em>Uninstall device &rarr; Delete driver</em>, then replug).
+  </p>
+
+  <h3>Android</h3>
+  <p class="note">
+    Works in Chrome for Android with a USB-OTG cable, provided the phone can supply bus power to the
+    camera. Android grants USB access through its own permission dialog. The download lands in your
+    Downloads folder like any other file.
+  </p>
+
+  <h3>iPhone and iPad</h3>
+  <p class="note">
+    <strong>Cannot read a camera</strong>, and this will not change. Safari does not implement WebUSB,
+    and on iOS and iPadOS every browser &mdash; including Chrome and Firefox &mdash; is required to
+    render with WebKit, so none of them expose the API. There is no flag, extension, or app that
+    works around it. Use a desktop or an Android phone to dump.
+  </p>
+  <p class="note">
+    The optional decryptor does work here: decrypting a dump you already have needs no USB access, so
+    you can do that from an iPhone or iPad, or from Firefox and Safari on the desktop.
+  </p>
+</section>
+
+<section>
+  <h2 style="margin-top:0">Read-only guarantee</h2>
+  <p class="note" style="margin-top:0">
+    This page can issue exactly five vendor commands. That is its entire vocabulary &mdash; there is no
+    code path to anything else:
+  </p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Opcode</th><th>Name</th><th>Dir</th><th>Why it is used</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">0x35</td><td>GetErrorCode</td><td>IN</td><td>check status after each step</td></tr>
+      <tr><td class="mono">0x3c</td><td>SetOperationMode</td><td>OUT</td><td>only to select mode 0, and only if not already there</td></tr>
+      <tr><td class="mono">0x3d</td><td>GetOperationMode</td><td>IN</td><td>read the current mode</td></tr>
+      <tr><td class="mono">0x4f</td><td>GetFeaturedFirmwareData</td><td>IN</td><td>the actual flash read</td></tr>
+      <tr><td class="mono">0x52</td><td>BeginFirmwareUpgrade</td><td>OUT</td><td>volatile read-window selector only &mdash; it selects which 64 KiB block the next reads return, and writes nothing</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="note" style="margin-bottom:0">
+    <code>SetFeaturedFirmwareData</code>, <code>CompleteMemoryUpgrade</code>, <code>ResetDevice</code> and
+    every upload, commit and erase command are absent from the source. <code>USBDevice.reset()</code> is
+    never called either; the retry path just closes and reopens the handle. Decryption happens entirely
+    in memory on the copy in your browser and never touches the device.
+  </p>
+
+  <details class="sub-details">
+    <summary>The 0x14060000 gap</summary>
+    <p class="note">
+      The USB command set exposes a read-window selector for every 64 KiB block of the 4 MiB flash
+      except <code>0x14060000..0x1406ffff</code>. That block is filled with <code>0xff</code> in the
+      combined image and recorded in <code>manifest.json</code>.
+    </p>
+    <p class="note">
+      <strong>In practice this costs you nothing.</strong> On most cameras that block is simply erased
+      flash, which reads as <code>0xff</code> anyway &mdash; so the filler matches what is really there
+      and the image is complete.
+    </p>
+    <p class="note">
+      And when the block <em>is</em> in use, what it holds is a redundant copy. These cameras keep the
+      same firmware image in several 64 KiB slots: across every multi-slot dump checked while building
+      this page, all slots decrypted to byte-identical firmware &mdash; in one case across four slots
+      that had been written with two different keys. On the one unit seen with a real image at
+      <code>0x14060000</code>, it was byte-for-byte the same as the copies at <code>0x14050000</code>
+      and <code>0x14070000</code>, so the archive still contains that firmware, just read from a
+      different address.
+    </p>
+    <p class="note">
+      That redundancy is also why a camera whose <code>0x14060000</code> reads back as <code>0xff</code>
+      is fine: the bootable firmware still exists in the other slots. Nothing on this page writes to the
+      device in any case &mdash; the gap affects only the file you download.
+    </p>
+    <p class="note">
+      If you do want a strictly complete byte-for-byte image &mdash; to diff flash against a reference,
+      say &mdash; read it over SWD/J-Link or with an SPI programmer.
+    </p>
+  </details>
+</section>
+
+</main>
+
+<script>
+"use strict";
+
+/* ==================================================================== *
+ * USB constants
+ * ==================================================================== */
+
+const VID = 0x289d;               /* Seek Thermal, Inc. — any product id */
+
+const OP = {
+  GET_ERROR_CODE: 0x35,
+  SET_OPERATION_MODE: 0x3c,
+  GET_OPERATION_MODE: 0x3d,
+  GET_FEATURED_FIRMWARE_DATA: 0x4f,
+  BEGIN_FIRMWARE_UPGRADE: 0x52,
+};
+
+const FLASH_BASE = 0x14000000;
+const FLASH_SIZE = 4 * 1024 * 1024;
+const WINDOW_SIZE = 0x10000;
+const GAP_ADDRESS = 0x14060000;
+const INTERFACE_NUMBER = 0;
+const CONFIGURATION_VALUE = 1;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const yieldToUi = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function hex(n, width = 0) {
+  return "0x" + (n >>> 0).toString(16).padStart(width, "0");
+}
+
+function hexUp(n, width = 8) {
+  return "0x" + (n >>> 0).toString(16).toUpperCase().padStart(width, "0");
+}
+
+function addrTag(n) {
+  return (n >>> 0).toString(16).toUpperCase().padStart(8, "0");
+}
+
+function isoStamp() {
+  return new Date().toISOString().replace(/:/g, "-").replace(/\.\d{3}Z$/, "Z");
+}
+
+function parseNum(s, fallback) {
+  if (s == null || s === "") return fallback;
+  const t = String(s).trim();
+  const v = t.startsWith("0x") || t.startsWith("0X") ? parseInt(t, 16) : parseInt(t, 10);
+  return Number.isNaN(v) ? fallback : v;
+}
+
+function bytesToHex(bytes, count) {
+  let out = "";
+  const n = count == null ? bytes.length : Math.min(count, bytes.length);
+  for (let i = 0; i < n; i++) out += bytes[i].toString(16).padStart(2, "0");
+  return out;
+}
+
+async function sha256hex(bytes) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return bytesToHex(new Uint8Array(digest));
+}
+
+/* The BeginFirmwareUpgrade selector map: which subcommand exposes which
+ * 64 KiB block. Covers all of 0x14000000..0x143fffff except 0x14060000. */
+function buildAddressMap() {
+  const entries = [
+    { subcmd: 2, address: 0x14000000, note: "SPIFI flash base" },
+    { subcmd: 3, address: 0x14010000, note: "boot config block" },
+    { subcmd: 1, address: 0x14020000, note: "config/factory area" },
+    { subcmd: 5, address: 0x14030000, note: "slot A" },
+    { subcmd: 6, address: 0x14040000, note: "0x14040000 window" },
+    { subcmd: 8, address: 0x14050000, note: "slot B / active-bank selector" },
+    { subcmd: 9, address: 0x14070000, note: "recovery selector" },
+  ];
+  for (let subcmd = 0x0a; subcmd <= 0x21; subcmd++) {
+    entries.push({
+      subcmd,
+      address: 0x14080000 + (subcmd - 0x0a) * WINDOW_SIZE,
+      note: "linear window",
+    });
+  }
+  for (let subcmd = 0x22; subcmd <= 0x41; subcmd++) {
+    entries.push({
+      subcmd,
+      address: (subcmd + 5118) << 16,
+      note: "linear high window",
+    });
+  }
+  entries.sort((a, b) => a.address - b.address);
+  return entries;
+}
+
+/* ==================================================================== *
+ * UI plumbing
+ * ==================================================================== */
+
+const el = (id) => document.getElementById(id);
+const ui = {
+  support: el("support"),
+  btnConnect: el("btnConnect"),
+  btnTest: el("btnTest"),
+  btnForget: el("btnForget"),
+  btnStart: el("btnStart"),
+  btnCancel: el("btnCancel"),
+  devInfo: el("devInfo"),
+  optChunk: el("optChunk"),
+  optGapFill: el("optGapFill"),
+  optRetries: el("optRetries"),
+  optRetryDelay: el("optRetryDelay"),
+  optRecipient: el("optRecipient"),
+  optDecrypt: el("optDecrypt"),
+  barFill: el("barFill"),
+  status: el("status"),
+  log: el("log"),
+  btnPick: el("btnPick"),
+  btnCancelDec: el("btnCancelDec"),
+  filePick: el("filePick"),
+  barFill2: el("barFill2"),
+  status2: el("status2"),
+  log2: el("log2"),
+};
+
+/* The USB dump and the offline decryptor share log()/setProgress(); `out`
+ * decides which panel they write to. */
+const PANELS = {
+  dump: { barFill: ui.barFill, status: ui.status, log: ui.log },
+  offline: { barFill: ui.barFill2, status: ui.status2, log: ui.log2 },
+};
+let out = PANELS.dump;
+const useOutput = (which) => { out = PANELS[which]; };
+
+function log(msg, cls) {
+  out.log.classList.remove("hidden");
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  out.log.appendChild(line);
+  out.log.scrollTop = out.log.scrollHeight;
+}
+
+let lastPaint = 0;
+function setProgress(done, total, text) {
+  if (text != null) out.status.textContent = text;
+  const now = performance.now();
+  if (now - lastPaint < 60 && done < total) return;
+  lastPaint = now;
+  out.barFill.style.width = (total ? Math.min(100, (done / total) * 100) : 0).toFixed(2) + "%";
+}
+
+function banner(kind, html) {
+  ui.support.className = "banner " + kind;
+  ui.support.innerHTML = html;
+}
+
+/* ==================================================================== *
+ * Environment detection
+ * ==================================================================== */
+
+const hasWebUsb = typeof navigator !== "undefined" && !!navigator.usb;
+const isIos = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1 && !hasWebUsb);
+
+function checkSupport() {
+  /* Dumping needs WebUSB; decrypting a file you already have does not. So an
+   * unsupported browser loses steps 1-2 but keeps the offline decryptor. */
+  const offlineStillWorks =
+    "<p>You can still use <strong>Decrypt a dump you already have</strong> below &mdash; that runs " +
+    "entirely on a file you pick and needs no USB access.</p>";
+
+  if (isIos && !hasWebUsb) {
+    banner("warn",
+      "<p><strong>WebUSB is not available on iOS or iPadOS,</strong> so this device cannot read a " +
+      "camera's flash.</p>" +
+      "<p>Safari does not implement it, and every iOS browser is required to use WebKit, so Chrome " +
+      "and Firefox here cannot expose it either. There is no flag or extension that changes this. " +
+      "To dump a camera, use a desktop computer or an Android phone with a USB-OTG cable.</p>" +
+      offlineStillWorks);
+    ui.btnConnect.disabled = true;
+    return false;
+  }
+
+  if (!hasWebUsb) {
+    banner("warn",
+      "<p><strong>This browser cannot access USB devices.</strong></p>" +
+      "<p>WebUSB is available in Chrome, Edge, Opera and other Chromium browsers on Windows, macOS, " +
+      "Linux and Android. Firefox and Safari have both declined to implement it.</p>" +
+      (window.isSecureContext ? "" :
+        "<p>This page is also not being served over a secure connection, which blocks WebUSB on its " +
+        "own.</p>") +
+      offlineStillWorks);
+    ui.btnConnect.disabled = true;
+    return false;
+  }
+
+  if (!window.isSecureContext) {
+    banner("warn",
+      "<p><strong>Insecure connection.</strong> WebUSB is disabled here.</p>" +
+      "<p>Open this page over HTTPS or from <code>http://localhost</code>. A plain LAN address such " +
+      "as <code>http://192.168.1.10:8000</code> does not qualify.</p>" +
+      offlineStillWorks);
+    ui.btnConnect.disabled = true;
+    return false;
+  }
+
+  banner("ok",
+    "<p><strong>Ready.</strong> Plug in your Seek camera and press <em>Connect device</em>.</p>" +
+    (location.protocol === "file:"
+      ? "<p>Opened as a local file, so the browser will not remember the device between reloads. " +
+        "That is harmless.</p>"
+      : ""));
+  return true;
+}
+
+/* ==================================================================== *
+ * WebUSB transport
+ * ==================================================================== */
+
+let device = null;
+let recipient = "interface";
+let claimed = false;
+
+function setupPacket(op) {
+  return {
+    requestType: "vendor",
+    recipient,
+    request: op,
+    value: 0,
+    index: recipient === "interface" ? INTERFACE_NUMBER : 0,
+  };
+}
+
+async function openDevice(dev) {
+  if (!dev.opened) await dev.open();
+  if (dev.configuration === null || dev.configuration.configurationValue !== CONFIGURATION_VALUE) {
+    await dev.selectConfiguration(CONFIGURATION_VALUE);
+  }
+
+  const want = ui.optRecipient.value;
+  claimed = false;
+
+  if (want === "device") {
+    recipient = "device";
+    return dev;
+  }
+
+  try {
+    await dev.claimInterface(INTERFACE_NUMBER);
+    claimed = true;
+    recipient = "interface";
+  } catch (e) {
+    if (want === "interface") {
+      throw new Error("could not claim USB interface 0: " + e.message +
+        " — another program or a system driver is holding the camera. See the platform notes below.");
+    }
+    recipient = "device";
+    log("could not claim interface 0 (" + e.message + "); using recipient=device instead", "l-warn");
+  }
+  return dev;
+}
+
+async function closeDevice(dev) {
+  try {
+    if (claimed) await dev.releaseInterface(INTERFACE_NUMBER);
+  } catch (e) { /* already released */ }
+  claimed = false;
+  try {
+    if (dev.opened) await dev.close();
+  } catch (e) { /* already closed */ }
+}
+
+/* Safe to call when the device has already vanished — a mid-dump unplug nulls
+ * `device`, and a throwing cleanup path would mask the real error. */
+async function safeClose() {
+  if (!device) { claimed = false; return; }
+  await closeDevice(device);
+}
+
+/* WebUSB resolves on a stall instead of rejecting, so status must be checked
+ * explicitly — otherwise a stalled read silently becomes a zero-length one. */
+async function rpcOut(dev, op, payload) {
+  const r = await dev.controlTransferOut(setupPacket(op), payload);
+  if (r.status !== "ok") throw new Error("control OUT " + hex(op) + " -> " + r.status);
+}
+
+async function rpcIn(dev, op, length) {
+  const r = await dev.controlTransferIn(setupPacket(op), length);
+  if (r.status !== "ok") throw new Error("control IN " + hex(op) + " -> " + r.status);
+  const d = r.data;
+  if (!d) return new Uint8Array(0);
+  return new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+}
+
+function u16Payload(v) {
+  const b = new Uint8Array(2);
+  new DataView(b.buffer).setUint16(0, v & 0xffff, true);
+  return b;
+}
+
+async function getErrorCode(dev) {
+  const raw = await rpcIn(dev, OP.GET_ERROR_CODE, 4);
+  if (raw.length < 4) return null;
+  return new DataView(raw.buffer, raw.byteOffset, raw.byteLength).getUint32(0, true) >>> 0;
+}
+
+async function getOperationMode(dev) {
+  const raw = await rpcIn(dev, OP.GET_OPERATION_MODE, 2);
+  if (raw.length < 2) return null;
+  return new DataView(raw.buffer, raw.byteOffset, raw.byteLength).getUint16(0, true);
+}
+
+async function setOperationMode(dev, mode) {
+  await rpcOut(dev, OP.SET_OPERATION_MODE, u16Payload(mode));
+}
+
+/* ==================================================================== *
+ * Window read
+ * ==================================================================== */
+
+async function readWindow(dev, entry, chunk, onChunk) {
+  const { subcmd, address } = entry;
+
+  let opMode;
+  try {
+    opMode = await getOperationMode(dev);
+  } catch (e) {
+    throw new Error("GetOperationMode failed: " + e.message);
+  }
+  if (opMode !== 0) {
+    try {
+      await setOperationMode(dev, 0);
+      await sleep(20);
+    } catch (e) {
+      throw new Error("SetOperationMode(0) failed: " + e.message);
+    }
+  }
+
+  try {
+    await rpcOut(dev, OP.BEGIN_FIRMWARE_UPGRADE, u16Payload(subcmd));
+    await sleep(20);
+  } catch (e) {
+    throw new Error("BeginFirmwareUpgrade(" + hex(subcmd) + ") failed: " + e.message);
+  }
+
+  let beginErr;
+  try {
+    beginErr = await getErrorCode(dev);
+  } catch (e) {
+    throw new Error("GetErrorCode after BeginFirmwareUpgrade(" + hex(subcmd) + ") failed: " + e.message);
+  }
+  if (beginErr) {
+    throw new Error("BeginFirmwareUpgrade(" + hex(subcmd) + ") for " + hex(address, 8) +
+      " returned " + hex(beginErr));
+  }
+
+  const raw = new Uint8Array(WINDOW_SIZE);
+  let got = 0;
+  while (got < WINDOW_SIZE) {
+    if (cancelRequested) throw new Error("cancelled");
+    const want = Math.min(chunk, WINDOW_SIZE - got);
+    let blk;
+    try {
+      blk = await rpcIn(dev, OP.GET_FEATURED_FIRMWARE_DATA, want);
+    } catch (e) {
+      throw new Error("GetFeaturedFirmwareData failed at offset " + hex(got, 4) + ": " + e.message);
+    }
+    if (!blk.length) break;
+    raw.set(blk, got);
+    got += blk.length;
+    if (onChunk) onChunk(blk.length);
+    if (blk.length < want) break;
+  }
+
+  let readErr;
+  try {
+    readErr = await getErrorCode(dev);
+  } catch (e) {
+    throw new Error("GetErrorCode after reading " + hex(address, 8) + " failed: " + e.message);
+  }
+  if (readErr) {
+    throw new Error("read " + hex(address, 8) + " subcmd " + hex(subcmd) + " returned " +
+      hex(readErr) + " after " + got + " B");
+  }
+
+  return raw.subarray(0, got);
+}
+
+/* ==================================================================== *
+ * Firmware decryption — port of decrypt_firmware.js
+ *
+ * Marsaglia xorshift128 (shifts 11/8/19). The 16-byte key maps to state as
+ * x = k1^K, y = k2^K, z = k3^K, w = k0^K for a per-build whitening constant K.
+ * One keystream word is consumed per image word and the generator always
+ * advances, but words 128..143 (0x200..0x23F, the cleartext header) are not
+ * XORed. A key is accepted when the 32-bit sum of the decrypted words equals
+ * the profile's target, which makes the cipher self-validating: every 16-byte
+ * window in the dump can be tried as a candidate key, so the key's location
+ * never has to be known in advance.
+ * ==================================================================== */
+
+const DEC_PROFILES = [
+  { name: "xs128/K=13579BDF/sum=FFFF", K: 0x13579bdf, TARGET: 0x0000ffff },
+  { name: "xs128/K=0/sum=0", K: 0x00000000, TARGET: 0x00000000 },
+];
+
+const HDR_LO = 128, HDR_HI = 143;
+const IMG_MAGIC = 0xa1b2c3d4, HDR_OFF = 0x200, SLOT_STEP = 0x10000, MAX_IMG_LEN = 0x1c000;
+
+function xsNext(s) {
+  const x = s[0], v1 = (x ^ (x << 11)) >>> 0;
+  s[0] = s[1]; s[1] = s[2];
+  const w = s[3]; s[2] = w;
+  const v3 = (w ^ (w >>> 19) ^ v1 ^ (v1 >>> 8)) >>> 0;
+  s[3] = v3;
+  return v3 >>> 0;
+}
+
+function seedFromKeyBytes(dv, off, K) {
+  const k0 = dv.getUint32(off, true), k1 = dv.getUint32(off + 4, true),
+        k2 = dv.getUint32(off + 8, true), k3 = dv.getUint32(off + 12, true);
+  return Uint32Array.of((k1 ^ K) >>> 0, (k2 ^ K) >>> 0, (k3 ^ K) >>> 0, (k0 ^ K) >>> 0);
+}
+
+const isEnc = (i) => (((i - HDR_LO) >>> 0) > (HDR_HI - HDR_LO));
+
+function checksum32(dv, base, byteLen, state) {
+  let acc = 0;
+  const n = byteLen >>> 2;
+  for (let i = 0; i < n; i++) {
+    const k = xsNext(state), w = dv.getUint32(base + 4 * i, true);
+    acc = (acc + (isEnc(i) ? (k ^ w) >>> 0 : w)) >>> 0;
+  }
+  return acc >>> 0;
+}
+
+function decryptImage(dv, base, byteLen, state) {
+  const out = new Uint8Array(byteLen);
+  const ov = new DataView(out.buffer);
+  const n = byteLen >>> 2;
+  for (let i = 0; i < n; i++) {
+    const k = xsNext(state), w = dv.getUint32(base + 4 * i, true);
+    ov.setUint32(4 * i, (isEnc(i) ? (k ^ w) >>> 0 : w) >>> 0, true);
+  }
+  return out;
+}
+
+function validKey(dv, keyOff, profile, imgBase, imgLen) {
+  return checksum32(dv, imgBase, imgLen, seedFromKeyBytes(dv, keyOff, profile.K)) === profile.TARGET;
+}
+
+/* Candidate stack-pointer pre-filters, tried in order until a key turns up.
+ *
+ * The pre-filter is only an optimisation — the real acceptance test is the
+ * 32-bit checksum — so relaxing it can never produce a wrong key, only a
+ * slower scan. That matters because the obvious filter (take the SRAM prefix
+ * from the dump's own reset vector) fails on any device whose word 0 is not a
+ * valid stack pointer. Some units ship with it poisoned to 0xBEBEBE00 while
+ * the rest of the vector table is intact, which makes the derived prefix
+ * 0xbe and rejects every real candidate.
+ *
+ * Stage 1 reproduces that original heuristic exactly, so dumps it already
+ * handled keep resolving identically and at the same speed. Only when it
+ * comes up empty do the broader stages run. */
+const SP_FILTERS = [
+  {
+    id: "reset-vector",
+    label: "SP prefix taken from the dump's own reset vector",
+    make: (ramPrefix) => (sp) => (sp >>> 24) === ramPrefix,
+  },
+  {
+    id: "sram-region",
+    label: "SP anywhere in an LPC43xx SRAM region (0x10/0x20)",
+    make: () => (sp) => { const p = sp >>> 24; return p === 0x10 || p === 0x20; },
+  },
+  {
+    id: "alignment-only",
+    label: "no SP region constraint — alignment and entry vector only",
+    make: () => () => true,
+  },
+];
+
+function findImages(dv, len) {
+  const out = [];
+  for (let b = 0; b + HDR_OFF + 8 <= len; b += SLOT_STEP) {
+    if (dv.getUint32(b + HDR_OFF, true) !== (IMG_MAGIC >>> 0)) continue;
+    const imgLen = dv.getUint32(b + HDR_OFF + 4, true);
+    if ((imgLen & 3) !== 0 || imgLen <= HDR_OFF || imgLen >= MAX_IMG_LEN || b + imgLen > len) continue;
+    out.push({ base: b, len: imgLen });
+  }
+  return out;
+}
+
+/* Scan every byte offset of the dump for a window that decrypts this image
+ * correctly. The pre-filter (SP word-aligned and accepted by spAccept, entry
+ * a Thumb code address) discards almost everything before the full checksum
+ * runs, so a pass over 4 MiB stays fast. */
+async function findKeyOffsets(dv, dumpLen, imgBase, imgLen, spAccept, profile, onProgress) {
+  const c0 = dv.getUint32(imgBase, true), c1 = dv.getUint32(imgBase + 4, true);
+  const K = profile.K;
+  const hits = [];
+  const end = dumpLen - 16;
+  const YIELD_EVERY = 1 << 19;
+
+  for (let o = 0; o <= end; o++) {
+    if ((o & (YIELD_EVERY - 1)) === 0 && o) {
+      if (onProgress) onProgress(o, end);
+      await yieldToUi();
+      if (cancelRequested) return hits;
+    }
+
+    const k0 = (dv.getUint32(o + 4, true) ^ K) >>> 0;   /* x */
+    const k1 = (dv.getUint32(o + 8, true) ^ K) >>> 0;   /* y */
+    const k3 = (dv.getUint32(o, true) ^ K) >>> 0;       /* w */
+
+    let x = k0, w = k3, t = (x ^ (x << 11)) >>> 0;
+    const o0 = (w ^ (w >>> 19) ^ t ^ (t >>> 8)) >>> 0;  /* keystream[0] */
+    const sp = (o0 ^ c0) >>> 0;
+    if ((sp & 3) !== 0 || !spAccept(sp)) continue;
+
+    x = k1; w = o0; t = (x ^ (x << 11)) >>> 0;
+    const o1 = (w ^ (w >>> 19) ^ t ^ (t >>> 8)) >>> 0;  /* keystream[1] */
+    const entry = (o1 ^ c1) >>> 0, et = entry >>> 24;
+    if ((et !== 0x10 && et !== 0x14) || (entry & 1) !== 1) continue;
+
+    if (validKey(dv, o, profile, imgBase, imgLen)) hits.push({ off: o, sp, entry });
+  }
+  return hits;
+}
+
+/* Returns { files, summary } and never throws — decryption is a bonus stage,
+ * so any failure must leave the flash dump itself untouched. */
+async function decryptDump(combined, stem, dumpPath) {
+  const files = [];
+  const summary = {
+    attempted: true,
+    images: [],
+    keys: [],
+    error: null,
+  };
+
+  const dv = new DataView(combined.buffer, combined.byteOffset, combined.byteLength);
+  const len = combined.length;
+  const ramPrefix = dv.getUint32(0, true) >>> 24;
+
+  const images = findImages(dv, len);
+  log("");
+  log("decrypt: scanning for firmware image slots ...", "l-dim");
+  if (!images.length) {
+    log("decrypt: no image slots found (no header magic at any 64 KiB boundary) — skipping", "l-warn");
+    summary.note = "no image slots found";
+    return { files, summary };
+  }
+  log("decrypt: " + images.length + " slot(s) at " +
+    images.map((i) => hexUp(FLASH_BASE + i.base)).join(", "), "l-dim");
+
+  const knownKeys = [];
+  const keyByCipher = new Map();
+  const plainHashFirst = new Map();
+  const reportLines = [
+    "Firmware decryption report",
+    "==========================",
+    "Generated : " + new Date().toISOString(),
+    "Dump      : " + dumpPath + " (" + len + " bytes)",
+    "Reset SP  : " + hexUp(dv.getUint32(0, true)) + "  -> SRAM prefix 0x" + ramPrefix.toString(16) +
+      ((ramPrefix === 0x10 || ramPrefix === 0x20) ? "" :
+        "  (not a usable stack pointer; relaxed key search used)"),
+    "Slots     : " + images.map((i) => hexUp(FLASH_BASE + i.base)).join(", "),
+    "",
+  ];
+
+  for (const im of images) {
+    if (cancelRequested) break;
+
+    const src = combined.subarray(im.base, im.base + im.len);
+    const cHash = await sha256hex(src);
+    const flash = FLASH_BASE + im.base;
+    const tag = "slot " + hexUp(flash) + " (file " + hexUp(im.base) + ", len " + hexUp(im.len) + ")";
+
+    let found = keyByCipher.get(cHash) || null;
+
+    if (!found) {
+      for (const k of knownKeys) {
+        if (validKey(dv, k.off, k.profile, im.base, im.len)) { found = k; break; }
+      }
+    }
+    if (!found) {
+      search:
+      for (const stage of SP_FILTERS) {
+        const spAccept = stage.make(ramPrefix);
+        for (const p of DEC_PROFILES) {
+          if (cancelRequested) break search;
+          setProgress(0, 1, "decrypt: scanning 4 MiB for key of " + hexUp(flash) +
+            " [" + p.name + "] ...");
+          const hits = await findKeyOffsets(dv, len, im.base, im.len, spAccept, p,
+            (o, end) => setProgress(o, end,
+              "decrypt: key scan " + hexUp(flash) + " [" + p.name + "] " +
+              ((o / end) * 100).toFixed(0) + "%"));
+          if (hits.length) {
+            found = {
+              off: hits[0].off,
+              bytes: combined.slice(hits[0].off, hits[0].off + 16),
+              profile: p,
+              stage,
+            };
+            knownKeys.push(found);
+            if (stage.id !== SP_FILTERS[0].id) {
+              log("decrypt: the dump's reset vector is not a usable stack pointer; " +
+                "found the key with a relaxed filter (" + stage.label + ")", "l-warn");
+            }
+            break search;
+          }
+        }
+      }
+    }
+    if (found) keyByCipher.set(cHash, found);
+
+    if (!found) {
+      log("decrypt: " + tag + ": no key found — slot skipped", "l-warn");
+      reportLines.push(tag + ": NO key found -> skipped", "");
+      summary.images.push({
+        flash: hexUp(flash), fileOffset: hexUp(im.base), length: im.len,
+        cipherSha256: cHash, decrypted: false, reason: "no key found",
+      });
+      continue;
+    }
+
+    const plain = decryptImage(dv, im.base, im.len, seedFromKeyBytes(dv, found.off, found.profile.K));
+    const pHash = await sha256hex(plain);
+    const pv = new DataView(plain.buffer);
+    const sp = pv.getUint32(0, true), entry = pv.getUint32(4, true);
+    const dupOf = plainHashFirst.has(pHash) ? plainHashFirst.get(pHash) : null;
+    if (dupOf === null) plainHashFirst.set(pHash, flash);
+
+    const binName = stem + "_decrypted_" + addrTag(flash) + ".bin";
+    const txtName = stem + "_decrypted_" + addrTag(flash) + ".txt";
+    const keyHex = bytesToHex(found.bytes);
+
+    const info =
+      "Firmware decryption report\n" +
+      "==========================\n" +
+      "Generated      : " + new Date().toISOString() + "  in the browser (WebUSB dump page)\n" +
+      "Input dump     : " + dumpPath + "\n" +
+      "Dump size      : " + len + " bytes (" + hexUp(len) + ")\n" +
+      "\n" +
+      "Image slot     : flash " + hexUp(flash) + "   (file offset " + hexUp(im.base) + ")\n" +
+      "Image length   : " + im.len + " bytes (" + hexUp(im.len) + ")\n" +
+      "\n" +
+      "Key (auto-found): " + keyHex + "\n" +
+      "Key location    : file " + hexUp(found.off) + "  (flash " + hexUp(FLASH_BASE + found.off) + ")\n" +
+      "Key search      : " + found.stage.label + "\n" +
+      "Cipher profile  : " + found.profile.name + "\n" +
+      "  xorshift128 shifts 11/8/19; state = key^0x" +
+        found.profile.K.toString(16).toUpperCase() + " (word-rotated)\n" +
+      "  header words 128..143 (0x200..0x23F) left cleartext\n" +
+      "  acceptance: 32-bit sum of decrypted words == " + hexUp(found.profile.TARGET) + "  (passed)\n" +
+      "\n" +
+      "Decrypted SP    : " + hexUp(sp) + "\n" +
+      "Decrypted entry : " + hexUp(entry) + "  (Thumb=" + ((entry & 1) ? "yes" : "no") + ")\n" +
+      "\n" +
+      "Ciphertext SHA-256 : " + cHash + "\n" +
+      "Plaintext  SHA-256 : " + pHash + "\n" +
+      (dupOf !== null
+        ? "Note            : identical decrypted image to slot " + hexUp(dupOf) + " (redundant copy)\n"
+        : "") +
+      "Output image    : " + binName + "\n";
+
+    files.push({ name: "decrypted/" + binName, data: plain });
+    files.push({ name: "decrypted/" + txtName, data: new TextEncoder().encode(info) });
+
+    const dupNote = dupOf !== null ? "  (same plaintext as " + hexUp(dupOf) + ")" : "";
+    log("decrypt: " + tag + " -> " + binName + dupNote, "l-ok");
+    log("         key@" + hexUp(found.off) + "=" + keyHex + "  [" + found.profile.name + "]", "l-dim");
+    log("         SP=" + hexUp(sp) + " entry=" + hexUp(entry) + " sha256=" + pHash.slice(0, 24), "l-dim");
+
+    reportLines.push(
+      tag + ": key@" + hexUp(found.off) + "=" + keyHex + "  [" + found.profile.name +
+        "] via " + found.stage.id,
+      "      SP=" + hexUp(sp) + " entry=" + hexUp(entry) + "  plain-sha256=" + pHash + dupNote,
+      "      -> " + binName,
+      "");
+
+    summary.images.push({
+      flash: hexUp(flash),
+      fileOffset: hexUp(im.base),
+      length: im.len,
+      cipherSha256: cHash,
+      plainSha256: pHash,
+      decrypted: true,
+      key: keyHex,
+      keyFileOffset: hexUp(found.off),
+      keyFlashAddress: hexUp(FLASH_BASE + found.off),
+      keySearch: found.stage.id,
+      profile: found.profile.name,
+      sp: hexUp(sp),
+      entry: hexUp(entry),
+      duplicateOf: dupOf !== null ? hexUp(dupOf) : null,
+      file: "decrypted/" + binName,
+    });
+  }
+
+  for (const k of knownKeys) {
+    summary.keys.push({
+      key: bytesToHex(k.bytes),
+      fileOffset: hexUp(k.off),
+      flashAddress: hexUp(FLASH_BASE + k.off),
+      profile: k.profile.name,
+      keySearch: k.stage.id,
+    });
+  }
+
+  reportLines.push("Keys discovered: " + knownKeys.length);
+  for (const k of knownKeys) {
+    reportLines.push("  " + bytesToHex(k.bytes) + "  @file " + hexUp(k.off) +
+      " (flash " + hexUp(FLASH_BASE + k.off) + ")  [" + k.profile.name + "]");
+  }
+  reportLines.push("");
+
+  files.push({
+    name: "decrypted/decryption_report.txt",
+    data: new TextEncoder().encode(reportLines.join("\n")),
+  });
+
+  const okCount = summary.images.filter((i) => i.decrypted).length;
+  log("decrypt: " + okCount + "/" + images.length + " slot(s) decrypted, " +
+    knownKeys.length + " key(s) recovered", okCount ? "l-ok" : "l-warn");
+
+  return { files, summary };
+}
+
+/* ==================================================================== *
+ * ZIP writer (store-only, no dependencies)
+ * ==================================================================== */
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    t[i] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function buildZip(files) {
+  const enc = new TextEncoder();
+  const now = new Date();
+  const dosTime = ((now.getHours() & 31) << 11) | ((now.getMinutes() & 63) << 5) |
+    ((now.getSeconds() >> 1) & 31);
+  const dosDate = (((now.getFullYear() - 1980) & 127) << 9) | (((now.getMonth() + 1) & 15) << 5) |
+    (now.getDate() & 31);
+
+  const parts = [];
+  const centrals = [];
+  let offset = 0;
+
+  for (const f of files) {
+    const name = enc.encode(f.name);
+    const crc = crc32(f.data);
+    const size = f.data.length;
+
+    const lh = new Uint8Array(30 + name.length);
+    const lv = new DataView(lh.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, 20, true);
+    lv.setUint16(6, 0x0800, true);       /* UTF-8 names */
+    lv.setUint16(8, 0, true);            /* method: store */
+    lv.setUint16(10, dosTime, true);
+    lv.setUint16(12, dosDate, true);
+    lv.setUint32(14, crc, true);
+    lv.setUint32(18, size, true);
+    lv.setUint32(22, size, true);
+    lv.setUint16(26, name.length, true);
+    lv.setUint16(28, 0, true);
+    lh.set(name, 30);
+    parts.push(lh, f.data);
+
+    const ch = new Uint8Array(46 + name.length);
+    const cv = new DataView(ch.buffer);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(4, 20, true);
+    cv.setUint16(6, 20, true);
+    cv.setUint16(8, 0x0800, true);
+    cv.setUint16(10, 0, true);
+    cv.setUint16(12, dosTime, true);
+    cv.setUint16(14, dosDate, true);
+    cv.setUint32(16, crc, true);
+    cv.setUint32(20, size, true);
+    cv.setUint32(24, size, true);
+    cv.setUint16(28, name.length, true);
+    cv.setUint32(42, offset, true);
+    ch.set(name, 46);
+    centrals.push(ch);
+
+    offset += lh.length + size;
+  }
+
+  const cdSize = centrals.reduce((n, c) => n + c.length, 0);
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(8, files.length, true);
+  ev.setUint16(10, files.length, true);
+  ev.setUint32(12, cdSize, true);
+  ev.setUint32(16, offset, true);
+
+  return new Blob(parts.concat(centrals, [eocd]), { type: "application/zip" });
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+/* ==================================================================== *
+ * README shipped inside the archive
+ * ==================================================================== */
+
+function makeReadme(gapFill, manifest) {
+  return [
+    "# Seek Thermal 4 MiB USB Flash Dump",
+    "",
+    "Captured: " + manifest.startedAt + " .. " + manifest.finishedAt,
+    "Device:   " + manifest.device.product + " (VID " + manifest.vid + " PID " + manifest.pid + ")",
+    "",
+    "Produced in a browser over WebUSB by",
+    "https://github.com/yrambler2001/seek-thermal-firmware-dump",
+    "",
+    "This was read using read-only USB EP0 vendor control transfers.",
+    "No flash-write, flash-modify, upload, commit, erase or reset command was issued.",
+    "",
+    "## Important limitation",
+    "",
+    "The USB command set does not expose a read window for `0x14060000..0x1406ffff`.",
+    "The combined 4 MiB image fills that block with `" + hex(gapFill, 2) + "` and records it in `manifest.json`.",
+    "Use SWD/J-Link or an SPI programmer if you need a strictly complete byte-for-byte image.",
+    "",
+    "## Files",
+    "",
+    "- `" + manifest.combinedFile + "`: assembled 4 MiB image with the USB gap filled.",
+    "- `windows/`: raw 64 KiB blocks as read, named by flash address and subcommand.",
+    "- `decrypted/`: firmware image slots after decryption, with a report per slot.",
+    "- `manifest.json`: exact read, gap and decryption metadata.",
+    "",
+    "## Decryption",
+    "",
+    "The cipher is Marsaglia xorshift128 (shifts 11/8/19). The key is found by",
+    "scanning the dump for any 16-byte window that makes the image checksum hit the",
+    "expected target, so no key offset has to be known in advance. Slots whose key",
+    "cannot be recovered from flash alone are skipped and listed in `manifest.json`.",
+    "",
+  ].join("\n");
+}
+
+/* ==================================================================== *
+ * Main dump routine
+ * ==================================================================== */
+
+let cancelRequested = false;
+let running = false;
+let decrypting = false;
+
+function readOptions() {
+  const chunk = parseNum(ui.optChunk.value, 256);
+  if (!Number.isInteger(chunk) || chunk <= 0 || chunk > WINDOW_SIZE) {
+    throw new Error("chunk must be between 1 and 65536, got " + ui.optChunk.value);
+  }
+  const gapFill = parseNum(ui.optGapFill.value, 0xff);
+  if (!Number.isInteger(gapFill) || gapFill < 0 || gapFill > 0xff) {
+    throw new Error("gap-fill must be a single byte, got " + ui.optGapFill.value);
+  }
+  const retries = parseNum(ui.optRetries.value, 2);
+  if (!Number.isInteger(retries) || retries < 0) {
+    throw new Error("retries must be zero or more, got " + ui.optRetries.value);
+  }
+  const retryDelayMs = parseNum(ui.optRetryDelay.value, 500);
+  if (!Number.isInteger(retryDelayMs) || retryDelayMs < 0) {
+    throw new Error("retry delay must be zero or more, got " + ui.optRetryDelay.value);
+  }
+  return { chunk, gapFill, retries, retryDelayMs, decrypt: ui.optDecrypt.value === "1" };
+}
+
+async function runDump() {
+  const args = readOptions();
+  const entries = buildAddressMap();
+  const totalBytes = entries.length * WINDOW_SIZE;
+  const stamp = isoStamp();
+  const dirName = "seek_flash4m_" + stamp;
+
+  const combined = new Uint8Array(FLASH_SIZE).fill(args.gapFill);
+  const files = [];
+  let bytesDone = 0;
+
+  const manifest = {
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    vid: hex(device.vendorId, 4),
+    pid: hex(device.productId, 4),
+    device: {
+      product: device.productName || null,
+      manufacturer: device.manufacturerName || null,
+      serialNumber: device.serialNumber || null,
+    },
+    flashBase: hex(FLASH_BASE, 8),
+    flashSize: FLASH_SIZE,
+    windowSize: WINDOW_SIZE,
+    chunk: args.chunk,
+    usbComplete: false,
+    gapFilled: true,
+    gapFill: hex(args.gapFill, 2),
+    producer: "seek-thermal-firmware-dump (WebUSB)",
+    transport: {
+      api: "WebUSB",
+      requestType: "vendor",
+      recipient,
+      bmRequestTypeOut: recipient === "interface" ? "0x41" : "0x40",
+      bmRequestTypeIn: recipient === "interface" ? "0xc1" : "0xc0",
+      interface: INTERFACE_NUMBER,
+      claimedInterface: claimed,
+      userAgent: navigator.userAgent,
+    },
+    safety: [
+      "No flash-write/flash-modify RPCs were called.",
+      "BeginFirmwareUpgrade was used only as a volatile read-window selector.",
+      "GetFeaturedFirmwareData was used for control-IN reads.",
+    ],
+    windows: [],
+    gaps: [{
+      address: hex(GAP_ADDRESS, 8),
+      offset: hex(GAP_ADDRESS - FLASH_BASE, 6),
+      length: WINDOW_SIZE,
+      fill: hex(args.gapFill, 2),
+      reason: "No BeginFirmwareUpgrade selector is exposed for this 64 KiB block.",
+    }],
+    combinedFile: "flash_4m_usb_partial_gap_" + args.gapFill.toString(16).padStart(2, "0") + ".bin",
+    decryption: null,
+  };
+
+  log(describeDevice(device), "l-dim");
+  log("selector map: " + entries.length + " windows, " + (totalBytes / 1024) + " KiB expected", "l-dim");
+  log("transport: vendor control, recipient=" + recipient +
+    ", chunk=" + args.chunk + " B, retries=" + args.retries, "l-dim");
+  log("");
+
+  try {
+    for (const entry of entries) {
+      if (cancelRequested) break;
+      const off = entry.address - FLASH_BASE;
+      const name = "addr_" + entry.address.toString(16) + "_subcmd_" +
+        entry.subcmd.toString(16).padStart(2, "0") + ".bin";
+      const label = "read " + hex(entry.address, 8) + " subcmd=" + hex(entry.subcmd);
+
+      setProgress(bytesDone, totalBytes, label + " ...");
+
+      let lastError = null;
+      let raw = null;
+      const startBytes = bytesDone;
+
+      for (let attempt = 0; attempt <= args.retries; attempt++) {
+        try {
+          bytesDone = startBytes;
+          raw = await readWindow(dev(), entry, args.chunk, (n) => {
+            bytesDone += n;
+            setProgress(bytesDone, totalBytes);
+          });
+          lastError = null;
+          if (attempt) log(label + ": recovered on attempt " + (attempt + 1), "l-warn");
+          break;
+        } catch (e) {
+          lastError = e;
+          if (cancelRequested) break;
+          if (attempt < args.retries) {
+            log(label + ": attempt " + (attempt + 1) + " failed (" + e.message + "); reopening ...", "l-warn");
+            await safeClose();
+            await sleep(args.retryDelayMs);
+            await openDevice(dev());
+          }
+        }
+      }
+
+      if (cancelRequested && !raw) break;
+
+      if (raw && raw.length) {
+        const copy = raw.slice();
+        files.push({ name: "windows/" + name, data: copy });
+        combined.set(copy, off);
+        bytesDone = startBytes + copy.length;
+        manifest.windows.push({
+          address: hex(entry.address, 8),
+          offset: hex(off, 6),
+          subcmd: hex(entry.subcmd),
+          note: entry.note,
+          requested: WINDOW_SIZE,
+          lengthRead: copy.length,
+          file: "windows/" + name,
+          preview: bytesToHex(copy, 32),
+          ok: copy.length === WINDOW_SIZE,
+        });
+        log(label + " ... " + copy.length + " B", copy.length === WINDOW_SIZE ? "l-ok" : "l-warn");
+      } else {
+        const msg = lastError ? lastError.message : "no data read";
+        bytesDone = startBytes;
+        manifest.windows.push({
+          address: hex(entry.address, 8),
+          offset: hex(off, 6),
+          subcmd: hex(entry.subcmd),
+          note: entry.note,
+          requested: WINDOW_SIZE,
+          error: msg,
+          ok: false,
+        });
+        log(label + " ... failed: " + msg, "l-err");
+      }
+      setProgress(bytesDone, totalBytes);
+    }
+  } finally {
+    await safeClose();
+  }
+
+  const ok = manifest.windows.filter((w) => w.ok).length;
+  manifest.usbReadableWindows = ok;
+  manifest.expectedReadableWindows = entries.length;
+  manifest.cancelled = cancelRequested;
+
+  log("");
+  log("USB-readable windows: " + ok + "/" + entries.length, ok === entries.length ? "l-ok" : "l-warn");
+  log("gap filled: " + hex(GAP_ADDRESS, 8) + ".." + hex(GAP_ADDRESS + WINDOW_SIZE - 1, 8) +
+    " with " + hex(args.gapFill, 2), "l-dim");
+  if (cancelRequested) log("cancelled — saving what was read", "l-warn");
+
+  /* Decryption is a bonus stage: it must never cost the user their dump. */
+  if (args.decrypt && ok > 0) {
+    try {
+      const stem = manifest.combinedFile.replace(/\.bin$/, "");
+      const result = await decryptDump(combined, stem, dirName + "/" + manifest.combinedFile);
+      files.push(...result.files);
+      manifest.decryption = result.summary;
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      log("decrypt: failed (" + msg + ") — the flash dump itself is unaffected", "l-err");
+      manifest.decryption = { attempted: true, error: msg, images: [], keys: [] };
+    }
+  } else if (!args.decrypt) {
+    manifest.decryption = { attempted: false, reason: "disabled in options" };
+  } else {
+    manifest.decryption = { attempted: false, reason: "no windows were read" };
+  }
+
+  manifest.finishedAt = new Date().toISOString();
+
+  const enc = new TextEncoder();
+  files.push({ name: manifest.combinedFile, data: combined });
+  files.push({ name: "manifest.json", data: enc.encode(JSON.stringify(manifest, null, 2) + "\n") });
+  files.push({ name: "README.md", data: enc.encode(makeReadme(args.gapFill, manifest)) });
+
+  setProgress(1, 1, "Building archive ...");
+  await yieldToUi();
+
+  const zip = buildZip(files.map((f) => ({ name: dirName + "/" + f.name, data: f.data })));
+  downloadBlob(zip, dirName + ".zip");
+
+  log("");
+  log("downloaded " + dirName + ".zip — " + files.length + " files, " +
+    (zip.size / (1024 * 1024)).toFixed(1) + " MiB", "l-ok");
+
+  setProgress(1, 1,
+    "Done — " + ok + "/" + entries.length + " windows read" + (cancelRequested ? " (cancelled)" : "") +
+    ". Check your downloads.");
+}
+
+/* ==================================================================== *
+ * Event wiring
+ * ==================================================================== */
+
+function dev() {
+  if (!device) throw new Error("device disconnected or not selected");
+  return device;
+}
+
+function describeDevice(d) {
+  const parts = [];
+  parts.push((d.productName || "unknown product") + " — " + (d.manufacturerName || "unknown vendor"));
+  parts.push("VID " + hex(d.vendorId, 4) + " PID " + hex(d.productId, 4));
+  if (d.serialNumber) parts.push("serial " + d.serialNumber);
+  return parts.join(" · ");
+}
+
+function setConnected(d) {
+  device = d;
+  ui.devInfo.textContent = describeDevice(d);
+  ui.btnStart.disabled = false;
+  ui.btnTest.disabled = false;
+  ui.btnForget.disabled = typeof d.forget !== "function";
+  ui.btnConnect.textContent = "Change device";
+}
+
+function setDisconnected(reason) {
+  device = null;
+  claimed = false;
+  ui.devInfo.textContent = reason || "No device selected.";
+  ui.btnStart.disabled = true;
+  ui.btnTest.disabled = true;
+  ui.btnForget.disabled = true;
+  ui.btnConnect.textContent = "Connect device";
+}
+
+ui.btnConnect.addEventListener("click", async () => {
+  try {
+    const d = await navigator.usb.requestDevice({ filters: [{ vendorId: VID }] });
+    setConnected(d);
+    log("selected " + describeDevice(d), "l-ok");
+  } catch (e) {
+    if (e && e.name === "NotFoundError") {
+      log("no device chosen", "l-dim");
+    } else {
+      log("could not open the device chooser: " + (e && e.message ? e.message : String(e)), "l-err");
+    }
+  }
+});
+
+ui.btnForget.addEventListener("click", async () => {
+  try {
+    if (device && typeof device.forget === "function") await device.forget();
+    setDisconnected("Permission revoked.");
+    log("device permission revoked", "l-dim");
+  } catch (e) {
+    log("forget failed: " + e.message, "l-err");
+  }
+});
+
+ui.btnTest.addEventListener("click", async () => {
+  ui.btnTest.disabled = true;
+  useOutput("dump");
+  try {
+    await openDevice(dev());
+    log("opened; recipient=" + recipient + (claimed ? " (interface 0 claimed)" : " (no claim)"), "l-dim");
+    const mode = await getOperationMode(dev());
+    const err = await getErrorCode(dev());
+    log("GetOperationMode -> " + (mode === null ? "no data" : hex(mode)) +
+      ", GetErrorCode -> " + (err === null ? "no data" : hex(err)), err ? "l-warn" : "l-ok");
+    log("transport works — ready to dump", "l-ok");
+  } catch (e) {
+    log("test failed: " + (e && e.message ? e.message : String(e)), "l-err");
+  } finally {
+    await safeClose();
+    ui.btnTest.disabled = !device;
+  }
+});
+
+ui.btnStart.addEventListener("click", async () => {
+  if (running) return;
+  running = true;
+  cancelRequested = false;
+  useOutput("dump");
+  ui.btnStart.disabled = true;
+  ui.btnCancel.disabled = false;
+  ui.btnConnect.disabled = true;
+  ui.btnTest.disabled = true;
+  ui.btnPick.disabled = true;
+  ui.log.textContent = "";
+
+  try {
+    await openDevice(dev());
+    await runDump();
+  } catch (e) {
+    log("ERROR: " + (e && e.message ? e.message : String(e)), "l-err");
+    ui.status.textContent = "Failed — see the log above.";
+    await safeClose();
+  } finally {
+    running = false;
+    ui.btnCancel.disabled = true;
+    ui.btnConnect.disabled = false;
+    ui.btnStart.disabled = !device;
+    ui.btnTest.disabled = !device;
+    ui.btnPick.disabled = false;
+  }
+});
+
+ui.btnCancel.addEventListener("click", () => {
+  cancelRequested = true;
+  ui.btnCancel.disabled = true;
+  ui.status.textContent = "Cancelling — will save whatever has been read so far ...";
+  log("cancel requested", "l-warn");
+});
+
+/* ==================================================================== *
+ * Offline decryption of a dump the user already has
+ * ==================================================================== */
+
+async function decryptPickedFile(file) {
+  useOutput("offline");
+  ui.log2.textContent = "";
+  cancelRequested = false;
+
+  const stem = file.name.replace(/\.[^.\/\\]+$/, "") || "dump";
+  log(file.name + " — " + file.size.toLocaleString() + " bytes", "l-dim");
+
+  if (file.size < HDR_OFF + 8) {
+    log("file is too small to contain a firmware image header", "l-err");
+    setProgress(0, 1, "Not a usable dump.");
+    return;
+  }
+  if (file.size % 4 !== 0) {
+    log("warning: file size is not a multiple of 4; trailing bytes will be ignored", "l-warn");
+  }
+
+  setProgress(0, 1, "Reading file ...");
+  const combined = new Uint8Array(await file.arrayBuffer());
+  const inputSha = await sha256hex(combined);
+  log("sha256 " + inputSha, "l-dim");
+
+  const startedAt = new Date().toISOString();
+  const { files, summary } = await decryptDump(combined, stem, file.name);
+  const decryptedCount = files.filter((f) => f.name.endsWith(".bin")).length;
+
+  if (cancelRequested) {
+    log("cancelled", "l-warn");
+    setProgress(0, 1, "Cancelled.");
+    return;
+  }
+
+  if (!decryptedCount) {
+    log("", null);
+    log("nothing to package — no firmware image in this file could be decrypted", "l-err");
+    setProgress(1, 1, "No images decrypted — see the log for why.");
+    return;
+  }
+
+  const manifest = {
+    producer: "seek-thermal-firmware-dump (offline decrypt)",
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    source: { fileName: file.name, size: file.size, sha256: inputSha },
+    flashBase: hex(FLASH_BASE, 8),
+    decryption: summary,
+  };
+
+  const enc = new TextEncoder();
+  const dirName = stem + "_decrypted_" + isoStamp();
+  const outFiles = files.slice();
+  outFiles.push({ name: "manifest.json", data: enc.encode(JSON.stringify(manifest, null, 2) + "\n") });
+  outFiles.push({
+    name: "README.md",
+    data: enc.encode([
+      "# Decrypted Seek Thermal Firmware",
+      "",
+      "Source file : " + file.name,
+      "Size        : " + file.size + " bytes",
+      "SHA-256     : " + inputSha,
+      "Decrypted   : " + manifest.finishedAt,
+      "",
+      "Produced offline in a browser by",
+      "https://github.com/yrambler2001/seek-thermal-firmware-dump",
+      "",
+      "The source image was not modified and no device was contacted.",
+      "See `decrypted/decryption_report.txt` for the key, its location in the dump,",
+      "the cipher profile, and per-slot SP/entry/SHA-256 details.",
+      "",
+    ].join("\n")),
+  });
+
+  setProgress(1, 1, "Building archive ...");
+  await yieldToUi();
+
+  const zip = buildZip(outFiles.map((f) => ({ name: dirName + "/" + f.name, data: f.data })));
+  downloadBlob(zip, dirName + ".zip");
+
+  const okCount = summary.images.filter((i) => i.decrypted).length;
+  log("");
+  log("downloaded " + dirName + ".zip — " + outFiles.length + " files, " +
+    (zip.size / (1024 * 1024)).toFixed(2) + " MiB", "l-ok");
+  setProgress(1, 1, "Done — " + okCount + "/" + summary.images.length +
+    " slot(s) decrypted. Check your downloads.");
+}
+
+ui.btnPick.addEventListener("click", () => ui.filePick.click());
+
+ui.filePick.addEventListener("change", async () => {
+  const file = ui.filePick.files && ui.filePick.files[0];
+  ui.filePick.value = "";              /* allow re-picking the same file */
+  if (!file || decrypting || running) return;
+
+  decrypting = true;
+  ui.btnPick.disabled = true;
+  ui.btnCancelDec.disabled = false;
+  ui.btnStart.disabled = true;
+  try {
+    await decryptPickedFile(file);
+  } catch (e) {
+    log("ERROR: " + (e && e.message ? e.message : String(e)), "l-err");
+    ui.status2.textContent = "Failed — see the log above.";
+  } finally {
+    decrypting = false;
+    ui.btnPick.disabled = false;
+    ui.btnCancelDec.disabled = true;
+    ui.btnStart.disabled = !device;
+  }
+});
+
+ui.btnCancelDec.addEventListener("click", () => {
+  cancelRequested = true;
+  ui.btnCancelDec.disabled = true;
+  ui.status2.textContent = "Cancelling ...";
+});
+
+window.addEventListener("beforeunload", (e) => {
+  if (running || decrypting) { e.preventDefault(); e.returnValue = ""; }
+});
+
+if (hasWebUsb) {
+  navigator.usb.addEventListener("disconnect", (e) => {
+    if (device && e.device === device) {
+      setDisconnected("Device disconnected.");
+      log("device disconnected", "l-err");
+    }
+  });
+}
+
+async function init() {
+  if (!checkSupport()) return;
+  try {
+    const known = await navigator.usb.getDevices();
+    const match = known.find((d) => d.vendorId === VID);
+    if (match) {
+      setConnected(match);
+      log("reusing previously authorized device: " + describeDevice(match), "l-dim");
+    }
+  } catch (e) { /* getDevices is unavailable on opaque origins */ }
+}
+
+init();
+</script>
+</body>
+</html>
