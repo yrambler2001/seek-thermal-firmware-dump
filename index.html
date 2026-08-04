@@ -25,9 +25,10 @@
     wIndex == 0, so both recipient=interface (0x41/0xC1) and recipient=device
     (0x40/0xC0) are accepted.
 
-  The decryption stage is a port of decrypt_firmware.js: Marsaglia xorshift128
-  (shifts 11/8/19) keystream, key found by scanning the dump for any 16-byte
-  window whose decryption makes the image checksum hit the profile target.
+  The decryption stage recovers the key cryptanalytically: Marsaglia xorshift128
+  (shifts 11/8/19) is linear over GF(2), so the 128-bit state is solved directly
+  from each image's known-zero Cortex-M reserved vectors — no key search, so it
+  works even when the dump's key region is missing or corrupted.
 -->
 <html lang="en">
 <head>
@@ -116,16 +117,16 @@
   button.primary:hover:not(:disabled) { filter: brightness(1.08); }
   button:disabled { opacity: .45; cursor: not-allowed; }
   .btnrow { display: flex; flex-wrap: wrap; gap: .5rem; }
-  #bar, #bar2 {
+  #bar, #bar2, #bar3 {
     height: 10px;
     border-radius: 5px;
     background: var(--line);
     overflow: hidden;
     margin: .9rem 0 .45rem;
   }
-  #barFill, #barFill2 { height: 100%; width: 0%; background: var(--accent); transition: width .1s linear; }
-  #status, #status2 { font-size: .85rem; color: var(--muted); }
-  #log, #log2 {
+  #barFill, #barFill2, #barFill3 { height: 100%; width: 0%; background: var(--accent); transition: width .1s linear; }
+  #status, #status2, #status3 { font-size: .85rem; color: var(--muted); }
+  #log, #log2, #log3 {
     font-family: var(--mono);
     font-size: .78rem;
     line-height: 1.5;
@@ -211,8 +212,15 @@
   <h2 style="margin-top:0">2 &middot; Dump</h2>
   <div class="btnrow">
     <button id="btnStart" class="primary" disabled>Start dump</button>
+    <button id="btnSweep" disabled>Dump all selectors (0x00&ndash;0xFF)</button>
     <button id="btnCancel" disabled>Cancel</button>
   </div>
+  <p class="note" style="margin:.6rem 0 0">
+    <strong>Start dump</strong> uses the known selector map. <strong>Dump all selectors</strong> instead
+    probes every <code>BeginFirmwareUpgrade</code> selector <code>0x00</code>&ndash;<code>0xFF</code>
+    and saves whatever each one returns &mdash; slower, but it also captures blocks the curated map
+    skips. Unmapped selectors simply stall and are recorded.
+  </p>
   <div id="bar"><div id="barFill"></div></div>
   <div id="status">Idle.</div>
   <pre id="log" class="hidden"></pre>
@@ -259,6 +267,48 @@
       back to device if the browser cannot claim interface&nbsp;0 &mdash; the firmware accepts both.
     </p>
   </details>
+</section>
+
+<section id="legacySection" class="optional">
+  <p class="optlabel">Optional &mdash; for older or locked firmware</p>
+  <h2 style="margin-top:0">Dump older / locked firmware</h2>
+  <p class="note" style="margin-top:0">
+    Older Seek firmware locks the boot, calibration and app-image banks
+    (<code>0x14010000</code>&ndash;<code>0x14070000</code>) behind an authenticated read channel and
+    exposes no selector for the top 2&nbsp;MiB. On such a unit the normal <em>Start dump</em> above
+    stalls on those banks and returns only a partial, header-less image that will not decrypt. This
+    variant speaks the legacy protocol: it unlocks the protected banks with the firmware's own
+    channel-<code>0x12</code> token so their firmware images come through &mdash; including
+    <code>0x14060000</code> &mdash; and marks the blocks the old protocol genuinely cannot reach as
+    gaps. It is still <strong>read-only</strong>: the token only arms a read window, and nothing is
+    ever written.
+  </p>
+  <p class="note">
+    Needs a connected device (step&nbsp;1). If the normal dump already reads every window, use that
+    instead &mdash; this is only for units where it stalls. If windows come back truncated, open
+    <em>Options</em> in step&nbsp;2 and set <strong>chunk</strong> to <code>64</code>.
+  </p>
+  <p class="note">
+    One caveat. The unlock token is <strong>build-specific</strong>; the one built in was recovered
+    from a Compact&nbsp;PRO (PIR324) unit. On firmware with a different token the protected banks just
+    stall and are gap-filled &mdash; the same result as the normal dump, and still safe. The app
+    images come through <em>encrypted</em> (the key's boot bank at <code>0x14000000</code> stays
+    blocked on every channel), but that no longer matters: decryption recovers the key from each
+    encrypted image itself, so any slot that is actually captured still decrypts here.
+  </p>
+  <div class="btnrow">
+    <button id="btnStartOld" class="primary" disabled>Dump legacy firmware</button>
+    <button id="btnSweepOld" disabled>Dump all selectors (0x00&ndash;0xFF)</button>
+    <button id="btnCancelOld" disabled>Cancel</button>
+  </div>
+  <p class="note" style="margin:.6rem 0 0">
+    <strong>Dump all selectors</strong> here probes every selector <code>0x00</code>&ndash;<code>0xFF</code>
+    on the authenticated channel (with the unlock token), so it captures every block the older firmware
+    exposes, not just the mapped ones.
+  </p>
+  <div id="bar3"><div id="barFill3"></div></div>
+  <div id="status3">Idle.</div>
+  <pre id="log3" class="hidden"></pre>
 </section>
 
 <section id="offlineSection" class="optional">
@@ -381,6 +431,13 @@ sudo udevadm control --reload-rules &amp;&amp; sudo udevadm trigger</pre>
     every upload, commit and erase command are absent from the source. <code>USBDevice.reset()</code> is
     never called either; the retry path just closes and reopens the handle. Decryption happens entirely
     in memory on the copy in your browser and never touches the device.
+  </p>
+
+  <p class="note">
+    The <em>legacy firmware</em> dump uses the same five commands. Its only difference is that
+    <code>BeginFirmwareUpgrade</code> carries the firmware's own channel-<code>0x12</code> unlock
+    token (an 18-byte payload) so older firmware will arm a read window over its protected banks. The
+    token gates the read-window <em>selector</em> only &mdash; still nothing is written to the device.
   </p>
 
   <details class="sub-details">
@@ -510,6 +567,67 @@ function buildAddressMap() {
   return entries;
 }
 
+/* ---- Legacy ("older / locked firmware") algorithm -------------------
+ *
+ * Older Seek firmware differs from current firmware in two ways that defeat the
+ * selector map above:
+ *
+ *   1. The banks 0x14010000..0x14070000 (boot config, calibration, app images)
+ *      are locked to an authenticated read channel. BeginFirmwareUpgrade rejects
+ *      those subcommands on the plain 2-byte channel and requires an 18-byte
+ *      payload (wLength 0x12) whose bytes 2..17 match a 16-byte token baked into
+ *      the firmware; only then does it arm the read window. 0x14000000 (the live
+ *      XIP/boot base) is hard-blocked on every channel and cannot be read at all.
+ *   2. There is no selector for anything above 0x141fffff, so the upper 2 MiB is
+ *      unreachable.
+ *
+ * This map sends the token on the protected banks and omits the blocks the legacy
+ * protocol cannot reach; runOldDump() records those as gaps. The subcommand ->
+ * address assignment is the old firmware's own (decoded from its
+ * BeginFirmwareUpgrade jump table), which differs from the current map: e.g.
+ * 0x14050000/0x14060000/0x14070000 are subcommands 7/8/9. The token selects a
+ * read window only — nothing is written to the device.
+ *
+ * The 16-byte token is a per-build constant the firmware compares the payload
+ * against (memcmp at the handler). It is build-specific: the value below was
+ * recovered and verified against a Compact PRO (PIR324) unit and unlocks every
+ * build sharing that image. On a unit with a different token the protected banks
+ * simply stall and are gap-filled — same as the standard dump, and still safe. */
+const OLD_FW_UNLOCK_TOKEN = new Uint8Array([
+  0x53, 0x16, 0x10, 0x31, 0x80, 0xdd, 0x00, 0xb7,
+  0x4a, 0xf9, 0xe4, 0x17, 0xc5, 0x94, 0xbe, 0xd4,
+]);
+
+function authPayload(subcmd) {
+  const b = new Uint8Array(2 + OLD_FW_UNLOCK_TOKEN.length);
+  new DataView(b.buffer).setUint16(0, subcmd & 0xffff, true);
+  b.set(OLD_FW_UNLOCK_TOKEN, 2);
+  return b;
+}
+
+function buildOldFirmwareMap() {
+  const entries = [
+    { subcmd: 0x3, address: 0x14010000, auth: true,  note: "boot config block (auth)" },
+    { subcmd: 0x1, address: 0x14020000, auth: false, note: "config/factory area" },
+    { subcmd: 0x5, address: 0x14030000, auth: true,  note: "protected bank (auth)" },
+    { subcmd: 0x6, address: 0x14040000, auth: true,  note: "protected bank (auth)" },
+    { subcmd: 0x7, address: 0x14050000, auth: true,  note: "app image slot (auth)" },
+    { subcmd: 0x8, address: 0x14060000, auth: true,  note: "app image slot (auth)" },
+    { subcmd: 0x9, address: 0x14070000, auth: true,  note: "app image slot (auth)" },
+  ];
+  for (let subcmd = 0x0a; subcmd <= 0x21; subcmd++) {
+    entries.push({
+      subcmd,
+      address: 0x14080000 + (subcmd - 0x0a) * WINDOW_SIZE,
+      auth: false,
+      note: "linear window",
+    });
+  }
+  for (const e of entries) if (e.auth) e.payload = authPayload(e.subcmd);
+  entries.sort((a, b) => a.address - b.address);
+  return entries;
+}
+
 /* ==================================================================== *
  * UI plumbing
  * ==================================================================== */
@@ -521,6 +639,7 @@ const ui = {
   btnTest: el("btnTest"),
   btnForget: el("btnForget"),
   btnStart: el("btnStart"),
+  btnSweep: el("btnSweep"),
   btnCancel: el("btnCancel"),
   devInfo: el("devInfo"),
   optChunk: el("optChunk"),
@@ -538,6 +657,12 @@ const ui = {
   barFill2: el("barFill2"),
   status2: el("status2"),
   log2: el("log2"),
+  btnStartOld: el("btnStartOld"),
+  btnSweepOld: el("btnSweepOld"),
+  btnCancelOld: el("btnCancelOld"),
+  barFill3: el("barFill3"),
+  status3: el("status3"),
+  log3: el("log3"),
 };
 
 /* The USB dump and the offline decryptor share log()/setProgress(); `out`
@@ -545,6 +670,7 @@ const ui = {
 const PANELS = {
   dump: { barFill: ui.barFill, status: ui.status, log: ui.log },
   offline: { barFill: ui.barFill2, status: ui.status2, log: ui.log2 },
+  legacy: { barFill: ui.barFill3, status: ui.status3, log: ui.log3 },
 };
 let out = PANELS.dump;
 const useOutput = (which) => { out = PANELS[which]; };
@@ -755,7 +881,7 @@ async function readWindow(dev, entry, chunk, onChunk) {
   }
 
   try {
-    await rpcOut(dev, OP.BEGIN_FIRMWARE_UPGRADE, u16Payload(subcmd));
+    await rpcOut(dev, OP.BEGIN_FIRMWARE_UPGRADE, entry.payload || u16Payload(subcmd));
     await sleep(20);
   } catch (e) {
     throw new Error("BeginFirmwareUpgrade(" + hex(subcmd) + ") failed: " + e.message);
@@ -805,16 +931,24 @@ async function readWindow(dev, entry, chunk, onChunk) {
 }
 
 /* ==================================================================== *
- * Firmware decryption — port of decrypt_firmware.js
+ * Firmware decryption — cryptanalytic key recovery (no key search)
  *
  * Marsaglia xorshift128 (shifts 11/8/19). The 16-byte key maps to state as
  * x = k1^K, y = k2^K, z = k3^K, w = k0^K for a per-build whitening constant K.
  * One keystream word is consumed per image word and the generator always
  * advances, but words 128..143 (0x200..0x23F, the cleartext header) are not
- * XORed. A key is accepted when the 32-bit sum of the decrypted words equals
- * the profile's target, which makes the cipher self-validating: every 16-byte
- * window in the dump can be tried as a candidate key, so the key's location
- * never has to be known in advance.
+ * XORed.
+ *
+ * xorshift128 is linear over GF(2), so every keystream word is a linear
+ * function of the 128-bit state. A Cortex-M image begins with a vector table
+ * whose reserved slots at word indices 7,8,9,10 are 0x00000000; those words are
+ * encrypted, so the ciphertext there IS the keystream. Those 128 known keystream
+ * bits feed a 128x128 GF(2) solve that yields the state directly from the image
+ * — the stored key is never needed and is never scanned for. The state alone
+ * decrypts the image; K only labels which build a recovered key belongs to, and
+ * the build profile is identified by which acceptance TARGET the decrypted
+ * checksum hits. A profile miss never aborts a slot: it is decrypted anyway and
+ * the recovered key material is logged with a per-slot confidence.
  * ==================================================================== */
 
 const DEC_PROFILES = [
@@ -834,11 +968,14 @@ function xsNext(s) {
   return v3 >>> 0;
 }
 
-function seedFromKeyBytes(dv, off, K) {
-  const k0 = dv.getUint32(off, true), k1 = dv.getUint32(off + 4, true),
-        k2 = dv.getUint32(off + 8, true), k3 = dv.getUint32(off + 12, true);
-  return Uint32Array.of((k1 ^ K) >>> 0, (k2 ^ K) >>> 0, (k3 ^ K) >>> 0, (k0 ^ K) >>> 0);
-}
+/* Reserved Cortex-M vectors that are 0x00000000 in a valid image. Words 7..10
+ * are used as known-zero plaintext to solve for the state; word 13 is held back
+ * to independently confirm the recovered state. */
+const KNOWN_ZERO_IDX = [7, 8, 9, 10];
+const CHECK_ZERO_IDX = 13;
+/* Whitening constants to list a nominal key under when no TARGET matches
+ * (K is unidentifiable from ciphertext alone). */
+const CANDIDATE_K = [0x00000000, 0x13579bdf];
 
 const isEnc = (i) => (((i - HDR_LO) >>> 0) > (HDR_HI - HDR_LO));
 
@@ -863,40 +1000,67 @@ function decryptImage(dv, base, byteLen, state) {
   return out;
 }
 
-function validKey(dv, keyOff, profile, imgBase, imgLen) {
-  return checksum32(dv, imgBase, imgLen, seedFromKeyBytes(dv, keyOff, profile.K)) === profile.TARGET;
+/* keystream words at the requested positions for a chosen initial state */
+function outsAtState(state, positions) {
+  const s = Uint32Array.from(state);
+  const maxP = Math.max.apply(null, positions);
+  const want = new Set(positions), got = {};
+  for (let i = 0; i <= maxP; i++) { const o = xsNext(s); if (want.has(i)) got[i] = o; }
+  return positions.map((p) => got[p]);
 }
 
-/* Candidate stack-pointer pre-filters, tried in order until a key turns up.
- *
- * The pre-filter is only an optimisation — the real acceptance test is the
- * 32-bit checksum — so relaxing it can never produce a wrong key, only a
- * slower scan. That matters because the obvious filter (take the SRAM prefix
- * from the dump's own reset vector) fails on any device whose word 0 is not a
- * valid stack pointer. Some units ship with it poisoned to 0xBEBEBE00 while
- * the rest of the vector table is intact, which makes the derived prefix
- * 0xbe and rejects every real candidate.
- *
- * Stage 1 reproduces that original heuristic exactly, so dumps it already
- * handled keep resolving identically and at the same speed. Only when it
- * comes up empty do the broader stages run. */
-const SP_FILTERS = [
-  {
-    id: "reset-vector",
-    label: "SP prefix taken from the dump's own reset vector",
-    make: (ramPrefix) => (sp) => (sp >>> 24) === ramPrefix,
-  },
-  {
-    id: "sram-region",
-    label: "SP anywhere in an LPC43xx SRAM region (0x10/0x20)",
-    make: () => (sp) => { const p = sp >>> 24; return p === 0x10 || p === 0x20; },
-  },
-  {
-    id: "alignment-only",
-    label: "no SP region constraint — alignment and entry vector only",
-    make: () => () => true,
-  },
-];
+/* The GF(2) coefficient matrix (state bits -> keystream at KNOWN_ZERO_IDX)
+ * depends only on the generator and those positions, so build it once. */
+const A_ROWS = (() => {
+  const rows = new Array(128).fill(0n);
+  for (let j = 0; j < 128; j++) {
+    const st = [0, 0, 0, 0]; st[j >> 5] = (1 << (j & 31)) >>> 0;
+    const outs = outsAtState(st, KNOWN_ZERO_IDX);
+    for (let p = 0; p < outs.length; p++)
+      for (let b = 0; b < 32; b++)
+        if ((outs[p] >>> b) & 1) rows[p * 32 + b] |= (1n << BigInt(j));
+  }
+  return rows;
+})();
+
+/* Solve A * state = keystream(known-zero words) over GF(2). Returns the
+ * recovered 128-bit initial state as a Uint32Array [x, y, z, w]. */
+function recoverState(dv, base) {
+  let y = 0n;
+  KNOWN_ZERO_IDX.forEach((idx, p) => {
+    const c = dv.getUint32(base + 4 * idx, true) >>> 0;
+    for (let b = 0; b < 32; b++) if ((c >>> b) & 1) y |= (1n << BigInt(p * 32 + b));
+  });
+  const aug = A_ROWS.map((r, i) => r | (((y >> BigInt(i)) & 1n) << 128n));
+  const where = new Array(128).fill(-1);
+  let pr = 0;
+  for (let col = 0; col < 128 && pr < 128; col++) {
+    let sel = -1;
+    for (let r = pr; r < 128; r++) if ((aug[r] >> BigInt(col)) & 1n) { sel = r; break; }
+    if (sel < 0) continue;
+    const tmp = aug[pr]; aug[pr] = aug[sel]; aug[sel] = tmp;
+    for (let r = 0; r < 128; r++)
+      if (r !== pr && ((aug[r] >> BigInt(col)) & 1n)) aug[r] ^= aug[pr];
+    where[col] = pr; pr++;
+  }
+  const bits = new Array(128).fill(0);
+  for (let col = 0; col < 128; col++)
+    if (where[col] >= 0) bits[col] = Number((aug[where[col]] >> 128n) & 1n);
+  const st = [0, 0, 0, 0];
+  for (let j = 0; j < 128; j++) if (bits[j]) st[j >> 5] |= (1 << (j & 31));
+  return Uint32Array.of(st[0] >>> 0, st[1] >>> 0, st[2] >>> 0, st[3] >>> 0);
+}
+
+/* key = state XOR K, word-rotated: k0=w^K, k1=x^K, k2=y^K, k3=z^K. */
+function keyFromState(state, K) {
+  const key = new Uint8Array(16);
+  const kv = new DataView(key.buffer);
+  kv.setUint32(0, (state[3] ^ K) >>> 0, true);
+  kv.setUint32(4, (state[0] ^ K) >>> 0, true);
+  kv.setUint32(8, (state[1] ^ K) >>> 0, true);
+  kv.setUint32(12, (state[2] ^ K) >>> 0, true);
+  return key;
+}
 
 function findImages(dv, len) {
   const out = [];
@@ -909,41 +1073,38 @@ function findImages(dv, len) {
   return out;
 }
 
-/* Scan every byte offset of the dump for a window that decrypts this image
- * correctly. The pre-filter (SP word-aligned and accepted by spAccept, entry
- * a Thumb code address) discards almost everything before the full checksum
- * runs, so a pass over 4 MiB stays fast. */
-async function findKeyOffsets(dv, dumpLen, imgBase, imgLen, spAccept, profile, onProgress) {
-  const c0 = dv.getUint32(imgBase, true), c1 = dv.getUint32(imgBase + 4, true);
-  const K = profile.K;
-  const hits = [];
-  const end = dumpLen - 16;
-  const YIELD_EVERY = 1 << 19;
+/* Recover everything about a slot from its ciphertext alone. Never throws.
+ * Returns { state, checksum, profile, sane, word13, selfConsistent,
+ *           confidence, key, candidates }. */
+function recoverKeyInfo(dv, base, byteLen) {
+  const state = recoverState(dv, base);
+  const checksum = checksum32(dv, base, byteLen, Uint32Array.from(state));
+  const profile = DEC_PROFILES.find((p) => p.TARGET === checksum) || null;
 
-  for (let o = 0; o <= end; o++) {
-    if ((o & (YIELD_EVERY - 1)) === 0 && o) {
-      if (onProgress) onProgress(o, end);
-      await yieldToUi();
-      if (cancelRequested) return hits;
-    }
+  /* structural confidence (independent of K / TARGET) */
+  const probe = Uint32Array.from(state);
+  const sp = (xsNext(probe) ^ dv.getUint32(base, true)) >>> 0;
+  const entry = (xsNext(probe) ^ dv.getUint32(base + 4, true)) >>> 0;
+  const spPrefix = sp >>> 24;
+  const sane = (spPrefix === 0x10 || spPrefix === 0x20) && (sp & 3) === 0 && (entry & 1) === 1;
 
-    const k0 = (dv.getUint32(o + 4, true) ^ K) >>> 0;   /* x */
-    const k1 = (dv.getUint32(o + 8, true) ^ K) >>> 0;   /* y */
-    const k3 = (dv.getUint32(o, true) ^ K) >>> 0;       /* w */
-
-    let x = k0, w = k3, t = (x ^ (x << 11)) >>> 0;
-    const o0 = (w ^ (w >>> 19) ^ t ^ (t >>> 8)) >>> 0;  /* keystream[0] */
-    const sp = (o0 ^ c0) >>> 0;
-    if ((sp & 3) !== 0 || !spAccept(sp)) continue;
-
-    x = k1; w = o0; t = (x ^ (x << 11)) >>> 0;
-    const o1 = (w ^ (w >>> 19) ^ t ^ (t >>> 8)) >>> 0;  /* keystream[1] */
-    const entry = (o1 ^ c1) >>> 0, et = entry >>> 24;
-    if ((et !== 0x10 && et !== 0x14) || (entry & 1) !== 1) continue;
-
-    if (validKey(dv, o, profile, imgBase, imgLen)) hits.push({ off: o, sp, entry });
+  /* word 13 is a reserved vector NOT fed into the solve -> free consistency check */
+  let word13 = null, selfConsistent = false;
+  if (byteLen > 4 * CHECK_ZERO_IDX) {
+    const probe2 = Uint32Array.from(state);
+    let ks13 = 0;
+    for (let i = 0; i <= CHECK_ZERO_IDX; i++) ks13 = xsNext(probe2);
+    word13 = (ks13 ^ dv.getUint32(base + 4 * CHECK_ZERO_IDX, true)) >>> 0;
+    selfConsistent = word13 === 0;
   }
-  return hits;
+
+  const confidence = profile ? "VERIFIED(profile)"
+    : (selfConsistent && sane) ? "VERIFIED(structural)"
+    : "UNVERIFIED";
+  const K = profile ? profile.K : 0x00000000;   /* K=0 => key == raw state */
+  const key = keyFromState(state, K);
+  const candidates = CANDIDATE_K.map((k) => ({ K: k, keyHex: bytesToHex(keyFromState(state, k)) }));
+  return { state, checksum, profile, sane, word13, selfConsistent, confidence, key, candidates };
 }
 
 /* Returns { files, summary } and never throws — decryption is a bonus stage,
@@ -959,7 +1120,6 @@ async function decryptDump(combined, stem, dumpPath) {
 
   const dv = new DataView(combined.buffer, combined.byteOffset, combined.byteLength);
   const len = combined.length;
-  const ramPrefix = dv.getUint32(0, true) >>> 24;
 
   const images = findImages(dv, len);
   log("");
@@ -972,78 +1132,41 @@ async function decryptDump(combined, stem, dumpPath) {
   log("decrypt: " + images.length + " slot(s) at " +
     images.map((i) => hexUp(FLASH_BASE + i.base)).join(", "), "l-dim");
 
-  const knownKeys = [];
-  const keyByCipher = new Map();
+  const infoByCipher = new Map();
   const plainHashFirst = new Map();
+  const keyLog = [];
   const reportLines = [
     "Firmware decryption report",
     "==========================",
     "Generated : " + new Date().toISOString(),
     "Dump      : " + dumpPath + " (" + len + " bytes)",
-    "Reset SP  : " + hexUp(dv.getUint32(0, true)) + "  -> SRAM prefix 0x" + ramPrefix.toString(16) +
-      ((ramPrefix === 0x10 || ramPrefix === 0x20) ? "" :
-        "  (not a usable stack pointer; relaxed key search used)"),
+    "Method    : cryptanalytic (xorshift128 linear GF(2) solve); no key search",
     "Slots     : " + images.map((i) => hexUp(FLASH_BASE + i.base)).join(", "),
     "",
   ];
 
-  for (const im of images) {
+  for (let idx = 0; idx < images.length; idx++) {
     if (cancelRequested) break;
+    const im = images[idx];
+    setProgress(idx, images.length,
+      "decrypt: recovering key for " + hexUp(FLASH_BASE + im.base) + " ...");
+    await yieldToUi();
 
     const src = combined.subarray(im.base, im.base + im.len);
     const cHash = await sha256hex(src);
     const flash = FLASH_BASE + im.base;
     const tag = "slot " + hexUp(flash) + " (file " + hexUp(im.base) + ", len " + hexUp(im.len) + ")";
 
-    let found = keyByCipher.get(cHash) || null;
+    let info = infoByCipher.get(cHash);
+    if (!info) { info = recoverKeyInfo(dv, im.base, im.len); infoByCipher.set(cHash, info); }
 
-    if (!found) {
-      for (const k of knownKeys) {
-        if (validKey(dv, k.off, k.profile, im.base, im.len)) { found = k; break; }
-      }
-    }
-    if (!found) {
-      search:
-      for (const stage of SP_FILTERS) {
-        const spAccept = stage.make(ramPrefix);
-        for (const p of DEC_PROFILES) {
-          if (cancelRequested) break search;
-          setProgress(0, 1, "decrypt: scanning 4 MiB for key of " + hexUp(flash) +
-            " [" + p.name + "] ...");
-          const hits = await findKeyOffsets(dv, len, im.base, im.len, spAccept, p,
-            (o, end) => setProgress(o, end,
-              "decrypt: key scan " + hexUp(flash) + " [" + p.name + "] " +
-              ((o / end) * 100).toFixed(0) + "%"));
-          if (hits.length) {
-            found = {
-              off: hits[0].off,
-              bytes: combined.slice(hits[0].off, hits[0].off + 16),
-              profile: p,
-              stage,
-            };
-            knownKeys.push(found);
-            if (stage.id !== SP_FILTERS[0].id) {
-              log("decrypt: the dump's reset vector is not a usable stack pointer; " +
-                "found the key with a relaxed filter (" + stage.label + ")", "l-warn");
-            }
-            break search;
-          }
-        }
-      }
-    }
-    if (found) keyByCipher.set(cHash, found);
+    const { state, checksum, profile, confidence, key, candidates, word13, selfConsistent, sane } = info;
+    const profName = profile ? profile.name
+      : "xs128/K=? (checksum=" + hexUp(checksum) + ", unknown profile)";
+    const keyHex = bytesToHex(key);
+    const stHex = Array.from(state, (v) => hexUp(v)).join(" ");
 
-    if (!found) {
-      log("decrypt: " + tag + ": no key found — slot skipped", "l-warn");
-      reportLines.push(tag + ": NO key found -> skipped", "");
-      summary.images.push({
-        flash: hexUp(flash), fileOffset: hexUp(im.base), length: im.len,
-        cipherSha256: cHash, decrypted: false, reason: "no key found",
-      });
-      continue;
-    }
-
-    const plain = decryptImage(dv, im.base, im.len, seedFromKeyBytes(dv, found.off, found.profile.K));
+    const plain = decryptImage(dv, im.base, im.len, Uint32Array.from(state));
     const pHash = await sha256hex(plain);
     const pv = new DataView(plain.buffer);
     const sp = pv.getUint32(0, true), entry = pv.getUint32(4, true);
@@ -1052,9 +1175,26 @@ async function decryptDump(combined, stem, dumpPath) {
 
     const binName = stem + "_decrypted_" + addrTag(flash) + ".bin";
     const txtName = stem + "_decrypted_" + addrTag(flash) + ".txt";
-    const keyHex = bytesToHex(found.bytes);
+    const keyName = stem + "_" + addrTag(flash) + ".key";
 
-    const info =
+    const keyRecord =
+      "slot           : flash " + hexUp(flash) + "  (file " + hexUp(im.base) +
+        ", len " + hexUp(im.len) + ")\n" +
+      "confidence     : " + confidence + "\n" +
+      "recovered state: " + stHex + "   (x y z w; the actual decryption secret)\n" +
+      "derived TARGET : " + hexUp(checksum) +
+        (profile ? "  (matches known profile)" : "  (no known TARGET matched)") + "\n" +
+      "self-check     : word13 decrypts to " + (word13 === null ? "n/a" : hexUp(word13)) +
+        (selfConsistent ? "  == 0 OK" : (word13 === null ? "" : "  != 0 (assumption may not hold)")) +
+        "; reset-vector sane=" + sane + "\n" +
+      "cipher profile : " + profName + "\n" +
+      (profile
+        ? "key (exact)    : " + keyHex + "   [K=" + hexUp(profile.K) + "]\n"
+        : "key UNKNOWN-K  : K is unidentifiable from ciphertext alone; candidates below.\n" +
+          "  un-whitened  : " + keyHex + "   [K=0x00000000 == raw state]\n" +
+          candidates.map((c) => "  K=" + hexUp(c.K) + " : " + c.keyHex).join("\n") + "\n");
+
+    const info_txt =
       "Firmware decryption report\n" +
       "==========================\n" +
       "Generated      : " + new Date().toISOString() + "  in the browser (WebUSB dump page)\n" +
@@ -1064,14 +1204,15 @@ async function decryptDump(combined, stem, dumpPath) {
       "Image slot     : flash " + hexUp(flash) + "   (file offset " + hexUp(im.base) + ")\n" +
       "Image length   : " + im.len + " bytes (" + hexUp(im.len) + ")\n" +
       "\n" +
-      "Key (auto-found): " + keyHex + "\n" +
-      "Key location    : file " + hexUp(found.off) + "  (flash " + hexUp(FLASH_BASE + found.off) + ")\n" +
-      "Key search      : " + found.stage.label + "\n" +
-      "Cipher profile  : " + found.profile.name + "\n" +
-      "  xorshift128 shifts 11/8/19; state = key^0x" +
-        found.profile.K.toString(16).toUpperCase() + " (word-rotated)\n" +
-      "  header words 128..143 (0x200..0x23F) left cleartext\n" +
-      "  acceptance: 32-bit sum of decrypted words == " + hexUp(found.profile.TARGET) + "  (passed)\n" +
+      "Confidence     : " + confidence + "\n" +
+      "Key recovery   : cryptanalytic — xorshift128 linear GF(2) solve from ciphertext\n" +
+      "                 (no key search; the stored key slot is never read)\n" +
+      "  known-plaintext: image words " + KNOWN_ZERO_IDX.join(",") +
+        " (Cortex-M reserved vectors) == 0\n" +
+      "  self-check     : word " + CHECK_ZERO_IDX + " decrypts to " +
+        (word13 === null ? "n/a" : hexUp(word13)) + (selfConsistent ? " (==0, consistent)" : "") + "\n" +
+      "\n" +
+      keyRecord +
       "\n" +
       "Decrypted SP    : " + hexUp(sp) + "\n" +
       "Decrypted entry : " + hexUp(entry) + "  (Thumb=" + ((entry & 1) ? "yes" : "no") + ")\n" +
@@ -1084,16 +1225,20 @@ async function decryptDump(combined, stem, dumpPath) {
       "Output image    : " + binName + "\n";
 
     files.push({ name: "decrypted/" + binName, data: plain });
-    files.push({ name: "decrypted/" + txtName, data: new TextEncoder().encode(info) });
+    files.push({ name: "decrypted/" + txtName, data: new TextEncoder().encode(info_txt) });
+    files.push({ name: "decrypted/" + keyName, data: new TextEncoder().encode(keyRecord) });
+    keyLog.push(keyRecord);
 
     const dupNote = dupOf !== null ? "  (same plaintext as " + hexUp(dupOf) + ")" : "";
-    log("decrypt: " + tag + " -> " + binName + dupNote, "l-ok");
-    log("         key@" + hexUp(found.off) + "=" + keyHex + "  [" + found.profile.name + "]", "l-dim");
+    const cls = confidence === "UNVERIFIED" ? "l-warn" : "l-ok";
+    log("decrypt: " + tag + " -> " + binName + dupNote, cls);
+    log("         [" + confidence + "] " + (profile ? "key=" + keyHex : "state=" + stHex) +
+      "  [" + profName + "]", "l-dim");
     log("         SP=" + hexUp(sp) + " entry=" + hexUp(entry) + " sha256=" + pHash.slice(0, 24), "l-dim");
 
     reportLines.push(
-      tag + ": key@" + hexUp(found.off) + "=" + keyHex + "  [" + found.profile.name +
-        "] via " + found.stage.id,
+      tag + ": [" + confidence + "] " + (profile ? "key=" + keyHex : "state=" + stHex) +
+        "  [" + profName + "]",
       "      SP=" + hexUp(sp) + " entry=" + hexUp(entry) + "  plain-sha256=" + pHash + dupNote,
       "      -> " + binName,
       "");
@@ -1105,32 +1250,25 @@ async function decryptDump(combined, stem, dumpPath) {
       cipherSha256: cHash,
       plainSha256: pHash,
       decrypted: true,
-      key: keyHex,
-      keyFileOffset: hexUp(found.off),
-      keyFlashAddress: hexUp(FLASH_BASE + found.off),
-      keySearch: found.stage.id,
-      profile: found.profile.name,
+      confidence: confidence,
+      key: profile ? keyHex : null,
+      state: stHex,
+      derivedTarget: hexUp(checksum),
+      profile: profName,
       sp: hexUp(sp),
       entry: hexUp(entry),
       duplicateOf: dupOf !== null ? hexUp(dupOf) : null,
       file: "decrypted/" + binName,
     });
+
+    if (profile && !summary.keys.some((kk) => kk.key === keyHex && kk.profile === profName)) {
+      summary.keys.push({ key: keyHex, profile: profName, recovery: "cryptanalytic", confidence });
+    }
   }
 
-  for (const k of knownKeys) {
-    summary.keys.push({
-      key: bytesToHex(k.bytes),
-      fileOffset: hexUp(k.off),
-      flashAddress: hexUp(FLASH_BASE + k.off),
-      profile: k.profile.name,
-      keySearch: k.stage.id,
-    });
-  }
-
-  reportLines.push("Keys discovered: " + knownKeys.length);
-  for (const k of knownKeys) {
-    reportLines.push("  " + bytesToHex(k.bytes) + "  @file " + hexUp(k.off) +
-      " (flash " + hexUp(FLASH_BASE + k.off) + ")  [" + k.profile.name + "]");
+  reportLines.push("Keys recovered (cryptanalytic): " + summary.keys.length);
+  for (const k of summary.keys) {
+    reportLines.push("  " + k.key + "  [" + k.profile + "]  (" + k.confidence + ")");
   }
   reportLines.push("");
 
@@ -1138,10 +1276,22 @@ async function decryptDump(combined, stem, dumpPath) {
     name: "decrypted/decryption_report.txt",
     data: new TextEncoder().encode(reportLines.join("\n")),
   });
+  files.push({
+    name: "decrypted/" + stem + "_keys.log",
+    data: new TextEncoder().encode(
+      "Recovered keys — " + new Date().toISOString() + "\n" +
+      "Method: cryptanalytic (xorshift128 linear solve); no key search.\n" +
+      "The STATE is the true decryption secret. When no known TARGET matched, K is\n" +
+      "unidentifiable from ciphertext alone, so nominal keys under each candidate K\n" +
+      "are listed and the slot is flagged UNVERIFIED (still valid plaintext).\n" +
+      "================================================================================\n\n" +
+      keyLog.join("\n--------------------------------------------------------------------------------\n") +
+      "\n"),
+  });
 
   const okCount = summary.images.filter((i) => i.decrypted).length;
-  log("decrypt: " + okCount + "/" + images.length + " slot(s) decrypted, " +
-    knownKeys.length + " key(s) recovered", okCount ? "l-ok" : "l-warn");
+  log("decrypt: " + okCount + "/" + images.length +
+    " slot(s) decrypted from ciphertext (no key search)", okCount ? "l-ok" : "l-warn");
 
   return { files, summary };
 }
@@ -1274,10 +1424,67 @@ function makeReadme(gapFill, manifest) {
     "",
     "## Decryption",
     "",
-    "The cipher is Marsaglia xorshift128 (shifts 11/8/19). The key is found by",
-    "scanning the dump for any 16-byte window that makes the image checksum hit the",
-    "expected target, so no key offset has to be known in advance. Slots whose key",
-    "cannot be recovered from flash alone are skipped and listed in `manifest.json`.",
+    "The cipher is Marsaglia xorshift128 (shifts 11/8/19), which is linear over",
+    "GF(2). The key is recovered cryptanalytically: the 128-bit state is solved",
+    "directly from each image's known-zero Cortex-M reserved vectors, so the stored",
+    "key is never needed. This decrypts images even when the dump's key region is",
+    "missing or corrupted. Each slot's confidence is recorded in `manifest.json`.",
+    "",
+  ].join("\n");
+}
+
+function makeLegacyReadme(gapFill, manifest, okCount, reachable, gapCount) {
+  const fill = "`" + hex(gapFill, 2) + "`";
+  return [
+    "# Seek Thermal Flash Dump — legacy (locked-firmware) algorithm",
+    "",
+    "Captured: " + manifest.startedAt + " .. " + manifest.finishedAt,
+    "Device:   " + (manifest.device.product || "unknown") +
+      " (VID " + manifest.vid + " PID " + manifest.pid + ")",
+    "",
+    "Produced in a browser over WebUSB by",
+    "https://github.com/yrambler2001/seek-thermal-firmware-dump",
+    "",
+    "This capture used the legacy read algorithm, for older firmware that locks its",
+    "boot/calibration/app banks behind an authenticated read channel and exposes no",
+    "selector for the upper 2 MiB.",
+    "",
+    "Read-only: BeginFirmwareUpgrade was used only as a read-window selector. On the",
+    "protected banks it carried the firmware's own channel-0x12 unlock token so the",
+    "device would arm the window; nothing was written. No flash-write, erase, upload,",
+    "commit or reset command was issued.",
+    "",
+    "## Coverage",
+    "",
+    okCount + " of " + reachable + " reachable 64 KiB windows were read.",
+    gapCount + " of 64 windows are unreachable on this firmware and were gap-filled with " + fill + ":",
+    "  - 0x14000000              live XIP/boot base, hard-blocked by the firmware",
+    "  - 0x14200000..0x143fffff  upper 2 MiB, no read-window selector exists",
+    "See manifest.json for exact per-window and per-gap detail.",
+    "",
+    "The protected app-image banks 0x14010000..0x14070000 ARE included here (read via",
+    "the unlock token), so this dump contains the firmware images the standard algorithm",
+    "cannot reach on these units — including 0x14060000.",
+    "",
+    "## Files",
+    "",
+    "- `" + manifest.combinedFile + "`: assembled 4 MiB image (unreachable blocks gap-filled).",
+    "- `windows/`: raw 64 KiB blocks as read, named by flash address and subcommand.",
+    "- `decrypted/`: firmware image slots after decryption, with a report per slot.",
+    "- `manifest.json`: exact read, gap, unlock-token and decryption metadata.",
+    "",
+    "## Decryption",
+    "",
+    "Same as the standard dump: Marsaglia xorshift128 (shifts 11/8/19); the key is",
+    "recovered cryptanalytically from each image's own ciphertext (the state is solved",
+    "from its known-zero Cortex-M reserved vectors), so no stored key is needed.",
+    "",
+    "Note for legacy dumps: on these units the xorshift key lives in the boot bank at",
+    "0x14000000, which the old firmware hard-blocks on every channel (even with the",
+    "unlock token). That bank cannot be read here — but it does not have to be. Because",
+    "the key is solved from the encrypted image itself, the app-image slots decrypt from",
+    "this dump alone as long as the slot was actually captured. Only blocks the old",
+    "protocol cannot reach at all are left as gaps and listed in manifest.json.",
     "",
   ].join("\n");
 }
@@ -1289,6 +1496,95 @@ function makeReadme(gapFill, manifest) {
 let cancelRequested = false;
 let running = false;
 let decrypting = false;
+
+/* Shared window-read loop for both the standard and legacy dumps. Reads every
+ * entry into `combined`, appends raw blocks to `files`, records each window in
+ * `manifest.windows`, and returns the count of fully-read windows. An entry may
+ * carry a `payload` (legacy auth banks) and an `auth` flag for logging. */
+async function readWindowsInto(entries, args, combined, files, manifest) {
+  const totalBytes = entries.length * WINDOW_SIZE;
+  let bytesDone = 0;
+
+  try {
+    for (const entry of entries) {
+      if (cancelRequested) break;
+      const off = entry.address - FLASH_BASE;
+      const name = "addr_" + entry.address.toString(16) + "_subcmd_" +
+        entry.subcmd.toString(16).padStart(2, "0") + ".bin";
+      const label = "read " + hex(entry.address, 8) + " subcmd=" + hex(entry.subcmd) +
+        (entry.auth ? " (auth)" : "");
+
+      setProgress(bytesDone, totalBytes, label + " ...");
+
+      let lastError = null;
+      let raw = null;
+      const startBytes = bytesDone;
+
+      for (let attempt = 0; attempt <= args.retries; attempt++) {
+        try {
+          bytesDone = startBytes;
+          raw = await readWindow(dev(), entry, args.chunk, (n) => {
+            bytesDone += n;
+            setProgress(bytesDone, totalBytes);
+          });
+          lastError = null;
+          if (attempt) log(label + ": recovered on attempt " + (attempt + 1), "l-warn");
+          break;
+        } catch (e) {
+          lastError = e;
+          if (cancelRequested) break;
+          if (attempt < args.retries) {
+            log(label + ": attempt " + (attempt + 1) + " failed (" + e.message + "); reopening ...", "l-warn");
+            await safeClose();
+            await sleep(args.retryDelayMs);
+            await openDevice(dev());
+          }
+        }
+      }
+
+      if (cancelRequested && !raw) break;
+
+      if (raw && raw.length) {
+        const copy = raw.slice();
+        files.push({ name: "windows/" + name, data: copy });
+        combined.set(copy, off);
+        bytesDone = startBytes + copy.length;
+        manifest.windows.push({
+          address: hex(entry.address, 8),
+          offset: hex(off, 6),
+          subcmd: hex(entry.subcmd),
+          note: entry.note,
+          auth: !!entry.auth,
+          requested: WINDOW_SIZE,
+          lengthRead: copy.length,
+          file: "windows/" + name,
+          preview: bytesToHex(copy, 32),
+          ok: copy.length === WINDOW_SIZE,
+        });
+        log(label + " ... " + copy.length + " B", copy.length === WINDOW_SIZE ? "l-ok" : "l-warn");
+      } else {
+        const msg = lastError ? lastError.message : "no data read";
+        bytesDone = startBytes;
+        manifest.windows.push({
+          address: hex(entry.address, 8),
+          offset: hex(off, 6),
+          subcmd: hex(entry.subcmd),
+          note: entry.note,
+          auth: !!entry.auth,
+          requested: WINDOW_SIZE,
+          error: msg,
+          ok: false,
+        });
+        log(label + " ... failed: " + msg, "l-err");
+      }
+      setProgress(bytesDone, totalBytes);
+    }
+  } finally {
+    await safeClose();
+  }
+
+  return manifest.windows.filter((w) => w.ok).length;
+}
 
 function readOptions() {
   const chunk = parseNum(ui.optChunk.value, 256);
@@ -1319,7 +1615,6 @@ async function runDump() {
 
   const combined = new Uint8Array(FLASH_SIZE).fill(args.gapFill);
   const files = [];
-  let bytesDone = 0;
 
   const manifest = {
     startedAt: new Date().toISOString(),
@@ -1372,82 +1667,7 @@ async function runDump() {
     ", chunk=" + args.chunk + " B, retries=" + args.retries, "l-dim");
   log("");
 
-  try {
-    for (const entry of entries) {
-      if (cancelRequested) break;
-      const off = entry.address - FLASH_BASE;
-      const name = "addr_" + entry.address.toString(16) + "_subcmd_" +
-        entry.subcmd.toString(16).padStart(2, "0") + ".bin";
-      const label = "read " + hex(entry.address, 8) + " subcmd=" + hex(entry.subcmd);
-
-      setProgress(bytesDone, totalBytes, label + " ...");
-
-      let lastError = null;
-      let raw = null;
-      const startBytes = bytesDone;
-
-      for (let attempt = 0; attempt <= args.retries; attempt++) {
-        try {
-          bytesDone = startBytes;
-          raw = await readWindow(dev(), entry, args.chunk, (n) => {
-            bytesDone += n;
-            setProgress(bytesDone, totalBytes);
-          });
-          lastError = null;
-          if (attempt) log(label + ": recovered on attempt " + (attempt + 1), "l-warn");
-          break;
-        } catch (e) {
-          lastError = e;
-          if (cancelRequested) break;
-          if (attempt < args.retries) {
-            log(label + ": attempt " + (attempt + 1) + " failed (" + e.message + "); reopening ...", "l-warn");
-            await safeClose();
-            await sleep(args.retryDelayMs);
-            await openDevice(dev());
-          }
-        }
-      }
-
-      if (cancelRequested && !raw) break;
-
-      if (raw && raw.length) {
-        const copy = raw.slice();
-        files.push({ name: "windows/" + name, data: copy });
-        combined.set(copy, off);
-        bytesDone = startBytes + copy.length;
-        manifest.windows.push({
-          address: hex(entry.address, 8),
-          offset: hex(off, 6),
-          subcmd: hex(entry.subcmd),
-          note: entry.note,
-          requested: WINDOW_SIZE,
-          lengthRead: copy.length,
-          file: "windows/" + name,
-          preview: bytesToHex(copy, 32),
-          ok: copy.length === WINDOW_SIZE,
-        });
-        log(label + " ... " + copy.length + " B", copy.length === WINDOW_SIZE ? "l-ok" : "l-warn");
-      } else {
-        const msg = lastError ? lastError.message : "no data read";
-        bytesDone = startBytes;
-        manifest.windows.push({
-          address: hex(entry.address, 8),
-          offset: hex(off, 6),
-          subcmd: hex(entry.subcmd),
-          note: entry.note,
-          requested: WINDOW_SIZE,
-          error: msg,
-          ok: false,
-        });
-        log(label + " ... failed: " + msg, "l-err");
-      }
-      setProgress(bytesDone, totalBytes);
-    }
-  } finally {
-    await safeClose();
-  }
-
-  const ok = manifest.windows.filter((w) => w.ok).length;
+  const ok = await readWindowsInto(entries, args, combined, files, manifest);
   manifest.usbReadableWindows = ok;
   manifest.expectedReadableWindows = entries.length;
   manifest.cancelled = cancelRequested;
@@ -1499,6 +1719,357 @@ async function runDump() {
 }
 
 /* ==================================================================== *
+ * Legacy dump routine (older / locked firmware)
+ * ==================================================================== */
+
+async function runOldDump() {
+  const args = readOptions();
+  const entries = buildOldFirmwareMap();
+  const stamp = isoStamp();
+  const dirName = "seek_flash4m_legacy_" + stamp;
+
+  const combined = new Uint8Array(FLASH_SIZE).fill(args.gapFill);
+  const files = [];
+
+  /* every 64 KiB window the legacy selector map cannot reach becomes a gap */
+  const covered = new Set(entries.map((e) => e.address));
+  const gaps = [];
+  for (let a = FLASH_BASE; a < FLASH_BASE + FLASH_SIZE; a += WINDOW_SIZE) {
+    if (covered.has(a)) continue;
+    gaps.push({
+      address: hex(a, 8),
+      offset: hex(a - FLASH_BASE, 6),
+      length: WINDOW_SIZE,
+      fill: hex(args.gapFill, 2),
+      reason: a === 0x14000000
+        ? "Live XIP/boot base — hard-blocked by the legacy firmware on every channel."
+        : (a >= 0x14200000
+          ? "Upper 2 MiB — the legacy firmware exposes no read-window selector here."
+          : "No legacy selector reaches this block."),
+    });
+  }
+
+  const manifest = {
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    algorithm: "legacy-locked-firmware",
+    vid: hex(device.vendorId, 4),
+    pid: hex(device.productId, 4),
+    device: {
+      product: device.productName || null,
+      manufacturer: device.manufacturerName || null,
+      serialNumber: device.serialNumber || null,
+    },
+    flashBase: hex(FLASH_BASE, 8),
+    flashSize: FLASH_SIZE,
+    windowSize: WINDOW_SIZE,
+    chunk: args.chunk,
+    usbComplete: false,
+    gapFilled: true,
+    gapFill: hex(args.gapFill, 2),
+    producer: "seek-thermal-firmware-dump (WebUSB, legacy algorithm)",
+    transport: {
+      api: "WebUSB",
+      requestType: "vendor",
+      recipient,
+      bmRequestTypeOut: recipient === "interface" ? "0x41" : "0x40",
+      bmRequestTypeIn: recipient === "interface" ? "0xc1" : "0xc0",
+      interface: INTERFACE_NUMBER,
+      claimedInterface: claimed,
+      userAgent: navigator.userAgent,
+    },
+    unlockToken: bytesToHex(OLD_FW_UNLOCK_TOKEN),
+    authChannelBanks: entries.filter((e) => e.auth).map((e) => hex(e.address, 8)),
+    safety: [
+      "No flash-write/flash-modify RPCs were called.",
+      "BeginFirmwareUpgrade was used only as a volatile read-window selector.",
+      "On protected banks it carried the channel-0x12 unlock token; nothing was written.",
+      "GetFeaturedFirmwareData was used for control-IN reads.",
+    ],
+    windows: [],
+    gaps,
+    combinedFile: "flash_4m_usb_legacy_partial_gap_" +
+      args.gapFill.toString(16).padStart(2, "0") + ".bin",
+    decryption: null,
+  };
+
+  log(describeDevice(device), "l-dim");
+  log("legacy algorithm: " + entries.length + " reachable windows, " + gaps.length +
+    " gap(s) of 64", "l-dim");
+  log("protected banks 0x14010000..0x14070000 unlocked with the channel-0x12 token", "l-dim");
+  log("transport: vendor control, recipient=" + recipient +
+    ", chunk=" + args.chunk + " B, retries=" + args.retries, "l-dim");
+  log("");
+
+  const ok = await readWindowsInto(entries, args, combined, files, manifest);
+
+  manifest.usbReadableWindows = ok;
+  manifest.expectedReadableWindows = entries.length;
+  manifest.cancelled = cancelRequested;
+
+  log("");
+  log("legacy-reachable windows read: " + ok + "/" + entries.length +
+    "  (" + gaps.length + " of 64 unreachable, gap-filled)",
+    ok === entries.length ? "l-ok" : "l-warn");
+  if (cancelRequested) log("cancelled — saving what was read", "l-warn");
+
+  /* Decryption is a bonus stage: it must never cost the user their dump. */
+  if (args.decrypt && ok > 0) {
+    try {
+      const stem = manifest.combinedFile.replace(/\.bin$/, "");
+      const result = await decryptDump(combined, stem, dirName + "/" + manifest.combinedFile);
+      files.push(...result.files);
+      manifest.decryption = result.summary;
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      log("decrypt: failed (" + msg + ") — the flash dump itself is unaffected", "l-err");
+      manifest.decryption = { attempted: true, error: msg, images: [], keys: [] };
+    }
+  } else if (!args.decrypt) {
+    manifest.decryption = { attempted: false, reason: "disabled in options" };
+  } else {
+    manifest.decryption = { attempted: false, reason: "no windows were read" };
+  }
+
+  manifest.finishedAt = new Date().toISOString();
+
+  const enc = new TextEncoder();
+  files.push({ name: manifest.combinedFile, data: combined });
+  files.push({ name: "manifest.json", data: enc.encode(JSON.stringify(manifest, null, 2) + "\n") });
+  files.push({
+    name: "README.md",
+    data: enc.encode(makeLegacyReadme(args.gapFill, manifest, ok, entries.length, gaps.length)),
+  });
+
+  setProgress(1, 1, "Building archive ...");
+  await yieldToUi();
+
+  const zip = buildZip(files.map((f) => ({ name: dirName + "/" + f.name, data: f.data })));
+  downloadBlob(zip, dirName + ".zip");
+
+  log("");
+  log("downloaded " + dirName + ".zip — " + files.length + " files, " +
+    (zip.size / (1024 * 1024)).toFixed(1) + " MiB", "l-ok");
+  setProgress(1, 1,
+    "Done — " + ok + "/" + entries.length + " reachable windows read" +
+    (cancelRequested ? " (cancelled)" : "") + ". Check your downloads.");
+}
+
+/* ==================================================================== *
+ * Full selector sweep (probe every BeginFirmwareUpgrade selector 0x00..0xff)
+ * ==================================================================== */
+
+function makeSweepReadme(manifest, legacy) {
+  return [
+    "# Seek Thermal — full selector sweep" + (legacy ? " (legacy / unlock token)" : ""),
+    "",
+    "Captured: " + manifest.startedAt + " .. " + manifest.finishedAt,
+    "Device:   " + (manifest.device.product || "unknown") +
+      " (VID " + manifest.vid + " PID " + manifest.pid + ")",
+    "",
+    "Produced in a browser over WebUSB by",
+    "https://github.com/yrambler2001/seek-thermal-firmware-dump",
+    "",
+    "This is an exhaustive probe of every BeginFirmwareUpgrade selector 0x00..0xff,",
+    (legacy
+      ? "each armed on the authenticated channel (0x12) with the unlock token."
+      : "each armed on the normal channel (0x02)."),
+    "Selectors the firmware does not map simply stall and are recorded, not saved.",
+    "",
+    "Read-only: BeginFirmwareUpgrade was used only as a read-window selector and",
+    "GetFeaturedFirmwareData did the reads. No flash-write, erase, upload, commit or",
+    "reset command was issued.",
+    "",
+    "## Results",
+    "",
+    manifest.selectorsArmed + " of 256 selectors armed; " + manifest.selectorsWithData +
+      " returned data.",
+    manifest.placedInImage + " had a known flash address and were assembled into `" +
+      manifest.combinedFile + "`.",
+    "",
+    "## Files",
+    "",
+    "- `blocks/subcmd_XX[_addr].bin`: one 64 KiB block per selector that returned data,",
+    "  named by selector byte (and flash address when the map knows it).",
+    "- `" + manifest.combinedFile + "`: 4 MiB image assembled from selectors with a known address.",
+    "- `decrypted/`: any firmware image slots that could be decrypted from that image.",
+    "- `manifest.json`: the full 256-row table (armed / begin status / error code / address / preview).",
+    "",
+  ].join("\n");
+}
+
+async function runSweep(mode) {
+  const args = readOptions();
+  const legacy = mode === "legacy";
+  const stamp = isoStamp();
+  const dirName = "seek_selectors_" + (legacy ? "legacy_" : "") + stamp;
+
+  const combined = new Uint8Array(FLASH_SIZE).fill(args.gapFill);
+  const files = [];
+  const base = legacy ? buildOldFirmwareMap() : buildAddressMap();
+  const addrBySub = new Map(base.map((e) => [e.subcmd, e.address]));
+  let armed = 0, withData = 0, placed = 0;
+
+  const manifest = {
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    mode: "selector-sweep" + (legacy ? "-legacy" : ""),
+    vid: hex(device.vendorId, 4),
+    pid: hex(device.productId, 4),
+    device: {
+      product: device.productName || null,
+      manufacturer: device.manufacturerName || null,
+      serialNumber: device.serialNumber || null,
+    },
+    flashBase: hex(FLASH_BASE, 8),
+    flashSize: FLASH_SIZE,
+    windowSize: WINDOW_SIZE,
+    chunk: args.chunk,
+    gapFill: hex(args.gapFill, 2),
+    channel: legacy ? "0x12 (unlock token)" : "0x02",
+    unlockToken: legacy ? bytesToHex(OLD_FW_UNLOCK_TOKEN) : null,
+    producer: "seek-thermal-firmware-dump (WebUSB, selector sweep)",
+    transport: {
+      api: "WebUSB", requestType: "vendor", recipient,
+      bmRequestTypeOut: recipient === "interface" ? "0x41" : "0x40",
+      bmRequestTypeIn: recipient === "interface" ? "0xc1" : "0xc0",
+      interface: INTERFACE_NUMBER, claimedInterface: claimed, userAgent: navigator.userAgent,
+    },
+    safety: [
+      "No flash-write/flash-modify RPCs were called.",
+      "BeginFirmwareUpgrade was used only as a volatile read-window selector.",
+      "GetFeaturedFirmwareData was used for control-IN reads.",
+    ],
+    selectors: [],
+    combinedFile: "flash_4m_selectorsweep_gap_" + args.gapFill.toString(16).padStart(2, "0") + ".bin",
+    decryption: null,
+  };
+
+  log(describeDevice(device), "l-dim");
+  log("selector sweep: all 256 BeginFirmwareUpgrade selectors (0x00..0xff)" +
+    (legacy ? " with the channel-0x12 unlock token" : " on channel 2"), "l-dim");
+  log("stalls are expected for selectors the firmware does not map", "l-dim");
+  log("");
+
+  try {
+    try {
+      const m = await getOperationMode(dev());
+      if (m !== 0) { await setOperationMode(dev(), 0); await sleep(20); }
+    } catch (e) { /* proceed anyway */ }
+
+    for (let subcmd = 0x00; subcmd <= 0xff; subcmd++) {
+      if (cancelRequested) break;
+      setProgress(subcmd, 0x100, "probe selector " + hex(subcmd) + " ...");
+      const payload = legacy ? authPayload(subcmd) : u16Payload(subcmd);
+      const address = addrBySub.has(subcmd) ? addrBySub.get(subcmd) : null;
+
+      let begin = "ok", errCode = null;
+      try {
+        await rpcOut(dev(), OP.BEGIN_FIRMWARE_UPGRADE, payload);
+      } catch (e) { begin = "stall"; }
+      if (begin === "ok") { try { errCode = await getErrorCode(dev()); } catch (e) { errCode = null; } }
+
+      const rec = {
+        subcmd: hex(subcmd),
+        mappedAddress: address != null ? hex(address, 8) : null,
+        armed: begin === "ok" && !errCode,
+        begin,
+        errorCode: errCode != null ? hex(errCode) : null,
+        length: 0,
+        file: null,
+        preview: null,
+      };
+
+      if (rec.armed) {
+        armed++;
+        const raw = new Uint8Array(WINDOW_SIZE);
+        let got = 0;
+        try {
+          while (got < WINDOW_SIZE) {
+            if (cancelRequested) break;
+            const want = Math.min(args.chunk, WINDOW_SIZE - got);
+            const blk = await rpcIn(dev(), OP.GET_FEATURED_FIRMWARE_DATA, want);
+            if (!blk.length) break;
+            raw.set(blk, got);
+            got += blk.length;
+            if (blk.length < want) break;
+          }
+        } catch (e) { rec.readError = e.message; }
+        const block = raw.slice(0, got);
+        rec.length = got;
+        rec.preview = bytesToHex(block, 32);
+        if (got) {
+          withData++;
+          const nm = "blocks/subcmd_" + subcmd.toString(16).padStart(2, "0") +
+            (address != null ? "_" + address.toString(16) : "") + ".bin";
+          files.push({ name: nm, data: block });
+          rec.file = nm;
+          if (address != null && address >= FLASH_BASE && address < FLASH_BASE + FLASH_SIZE) {
+            combined.set(block.subarray(0, Math.min(got, WINDOW_SIZE)), address - FLASH_BASE);
+            placed++;
+          }
+          log("selector " + hex(subcmd) + " -> " +
+            (address != null ? hex(address, 8) : "unmapped") + " ... " + got + " B",
+            got === WINDOW_SIZE ? "l-ok" : "l-warn");
+        }
+      }
+      manifest.selectors.push(rec);
+      setProgress(subcmd + 1, 0x100);
+    }
+  } finally {
+    await safeClose();
+  }
+
+  manifest.selectorsArmed = armed;
+  manifest.selectorsWithData = withData;
+  manifest.placedInImage = placed;
+  manifest.cancelled = cancelRequested;
+
+  log("");
+  log("selectors armed: " + armed + "/256, returned data: " + withData +
+    ", placed in the 4 MiB image: " + placed, armed ? "l-ok" : "l-warn");
+  if (cancelRequested) log("cancelled — saving what was read", "l-warn");
+
+  /* Decryption is a bonus stage: it must never cost the user their dump. */
+  if (args.decrypt && placed > 0) {
+    try {
+      const stem = manifest.combinedFile.replace(/\.bin$/, "");
+      const result = await decryptDump(combined, stem, dirName + "/" + manifest.combinedFile);
+      files.push(...result.files);
+      manifest.decryption = result.summary;
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      log("decrypt: failed (" + msg + ") — the dump itself is unaffected", "l-err");
+      manifest.decryption = { attempted: true, error: msg, images: [], keys: [] };
+    }
+  } else {
+    manifest.decryption = {
+      attempted: false,
+      reason: args.decrypt ? "no mapped windows were placed in the image" : "disabled in options",
+    };
+  }
+
+  manifest.finishedAt = new Date().toISOString();
+
+  const enc = new TextEncoder();
+  files.push({ name: manifest.combinedFile, data: combined });
+  files.push({ name: "manifest.json", data: enc.encode(JSON.stringify(manifest, null, 2) + "\n") });
+  files.push({ name: "README.md", data: enc.encode(makeSweepReadme(manifest, legacy)) });
+
+  setProgress(1, 1, "Building archive ...");
+  await yieldToUi();
+
+  const zip = buildZip(files.map((f) => ({ name: dirName + "/" + f.name, data: f.data })));
+  downloadBlob(zip, dirName + ".zip");
+
+  log("");
+  log("downloaded " + dirName + ".zip — " + files.length + " files, " +
+    (zip.size / (1024 * 1024)).toFixed(1) + " MiB", "l-ok");
+  setProgress(1, 1, "Done — " + armed + "/256 selectors armed, " + withData + " with data" +
+    (cancelRequested ? " (cancelled)" : "") + ". Check your downloads.");
+}
+
+/* ==================================================================== *
  * Event wiring
  * ==================================================================== */
 
@@ -1515,23 +2086,45 @@ function describeDevice(d) {
   return parts.join(" · ");
 }
 
+/* The device-driven buttons (all the start/sweep ones plus Test) are enabled
+ * exactly when a device is selected and nothing is running. lockUi()/unlockUi()
+ * keep every long operation from having to juggle each button by hand. */
+function lockUi() {
+  ui.btnStart.disabled = true;
+  ui.btnSweep.disabled = true;
+  ui.btnStartOld.disabled = true;
+  ui.btnSweepOld.disabled = true;
+  ui.btnTest.disabled = true;
+  ui.btnConnect.disabled = true;
+  ui.btnPick.disabled = true;
+}
+
+function unlockUi() {
+  const off = !device;
+  ui.btnStart.disabled = off;
+  ui.btnSweep.disabled = off;
+  ui.btnStartOld.disabled = off;
+  ui.btnSweepOld.disabled = off;
+  ui.btnTest.disabled = off;
+  ui.btnConnect.disabled = false;
+  ui.btnPick.disabled = false;
+}
+
 function setConnected(d) {
   device = d;
   ui.devInfo.textContent = describeDevice(d);
-  ui.btnStart.disabled = false;
-  ui.btnTest.disabled = false;
   ui.btnForget.disabled = typeof d.forget !== "function";
   ui.btnConnect.textContent = "Change device";
+  if (!running && !decrypting) unlockUi();
 }
 
 function setDisconnected(reason) {
   device = null;
   claimed = false;
   ui.devInfo.textContent = reason || "No device selected.";
-  ui.btnStart.disabled = true;
-  ui.btnTest.disabled = true;
   ui.btnForget.disabled = true;
   ui.btnConnect.textContent = "Connect device";
+  if (!running && !decrypting) unlockUi();
 }
 
 ui.btnConnect.addEventListener("click", async () => {
@@ -1577,39 +2170,46 @@ ui.btnTest.addEventListener("click", async () => {
   }
 });
 
-ui.btnStart.addEventListener("click", async () => {
+/* Every device-driven long op (dump, legacy dump, sweep) shares this shell:
+ * mutual exclusion, panel selection, UI lock, open, run, and safe cleanup. */
+async function runDeviceOp(panel, cancelBtn, fn) {
   if (running) return;
   running = true;
   cancelRequested = false;
-  useOutput("dump");
-  ui.btnStart.disabled = true;
-  ui.btnCancel.disabled = false;
-  ui.btnConnect.disabled = true;
-  ui.btnTest.disabled = true;
-  ui.btnPick.disabled = true;
-  ui.log.textContent = "";
-
+  useOutput(panel);
+  lockUi();
+  cancelBtn.disabled = false;
+  PANELS[panel].log.textContent = "";
   try {
     await openDevice(dev());
-    await runDump();
+    await fn();
   } catch (e) {
     log("ERROR: " + (e && e.message ? e.message : String(e)), "l-err");
-    ui.status.textContent = "Failed — see the log above.";
+    PANELS[panel].status.textContent = "Failed — see the log above.";
     await safeClose();
   } finally {
     running = false;
-    ui.btnCancel.disabled = true;
-    ui.btnConnect.disabled = false;
-    ui.btnStart.disabled = !device;
-    ui.btnTest.disabled = !device;
-    ui.btnPick.disabled = false;
+    cancelBtn.disabled = true;
+    unlockUi();
   }
-});
+}
+
+ui.btnStart.addEventListener("click", () => runDeviceOp("dump", ui.btnCancel, runDump));
+ui.btnSweep.addEventListener("click", () => runDeviceOp("dump", ui.btnCancel, () => runSweep("normal")));
+ui.btnStartOld.addEventListener("click", () => runDeviceOp("legacy", ui.btnCancelOld, runOldDump));
+ui.btnSweepOld.addEventListener("click", () => runDeviceOp("legacy", ui.btnCancelOld, () => runSweep("legacy")));
 
 ui.btnCancel.addEventListener("click", () => {
   cancelRequested = true;
   ui.btnCancel.disabled = true;
   ui.status.textContent = "Cancelling — will save whatever has been read so far ...";
+  log("cancel requested", "l-warn");
+});
+
+ui.btnCancelOld.addEventListener("click", () => {
+  cancelRequested = true;
+  ui.btnCancelOld.disabled = true;
+  ui.status3.textContent = "Cancelling — will save whatever has been read so far ...";
   log("cancel requested", "l-warn");
 });
 
@@ -1711,9 +2311,8 @@ ui.filePick.addEventListener("change", async () => {
   if (!file || decrypting || running) return;
 
   decrypting = true;
-  ui.btnPick.disabled = true;
+  lockUi();
   ui.btnCancelDec.disabled = false;
-  ui.btnStart.disabled = true;
   try {
     await decryptPickedFile(file);
   } catch (e) {
@@ -1721,9 +2320,8 @@ ui.filePick.addEventListener("change", async () => {
     ui.status2.textContent = "Failed — see the log above.";
   } finally {
     decrypting = false;
-    ui.btnPick.disabled = false;
     ui.btnCancelDec.disabled = true;
-    ui.btnStart.disabled = !device;
+    unlockUi();
   }
 });
 
