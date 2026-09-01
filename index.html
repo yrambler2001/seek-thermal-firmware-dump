@@ -5,12 +5,44 @@
   Read the USB-reachable 4 MiB SPIFI flash of a Seek Thermal camera from the
   browser, over WebUSB, and decrypt any firmware images found in it.
 
-  Read-only by design:
-    - uses SetOperationMode(0) only if the device is not already in mode 0;
-    - uses BeginFirmwareUpgrade(subcmd) only as a volatile read-window selector;
-    - reads with GetFeaturedFirmwareData;
-    - never calls SetFeaturedFirmwareData, CompleteMemoryUpgrade, ResetDevice,
-      upload, commit, erase, or any other flash-modifying RPC.
+  Two views, selected by the URL hash:
+
+    #dump  (default)  read the flash and decrypt it. Read-only by design:
+      - uses SetOperationMode(0) only if the device is not already in mode 0;
+      - uses BeginFirmwareUpgrade(subcmd) only as a volatile read-window selector;
+      - reads with GetFeaturedFirmwareData;
+      - never calls SetFeaturedFirmwareData, CompleteMemoryUpgrade, ResetDevice,
+        upload, commit, erase, or any other flash-modifying RPC.
+
+    #flash            report the running firmware and write a new plaintext
+                      image through the camera's own upgrade path. This view
+                      DOES write flash. It adds exactly five opcodes on top of
+                      the five above: GetFirmwareInfo (0x4e),
+                      SetFirmwareInfoFeatures (0x55), SetRamDataFeatures (0x5a),
+                      SetFeaturedFirmwareData (0x50) and CompleteMemoryUpgrade
+                      (0x51). ResetDevice is still never sent, the bootloader at
+                      0x14000000 and the recovery slot at 0x14070000 are never
+                      written, and there is no raw-block write path at all.
+
+  What a write actually does (2018+ "4.x" family; the 2016 generation is
+  detected and refused):
+    BeginFirmwareUpgrade(0)  arms fw_update_slot_address() — the slot the camera
+                             did NOT boot from — with a 64 KiB cap.
+    SetFeaturedFirmwareData  stages <=64 B per call (EP0Buf is 64 B; a longer
+                             OUT chunk is silently truncated by the device).
+    CompleteMemoryUpgrade    verifies sum(staged bytes) & 0xFFFF, decrypts with
+                             Key A, re-encrypts with Key B or the per-device key
+                             at 0x14000218, erases the 64 KiB block, programs,
+                             verifies, and repoints cfg[0] at 0x14010000.
+
+  The streamed blob is the whole bank: encrypted image + 0xff pad + the 64-byte
+  "CODE" footer at ((header.length>>14)+1)*0x4000 - 0x40. The bootloader reads
+  that footer undecrypted and only takes the monolithic path when
+  footer[0]=="CODE" and footer[1]==header.length; since the camera erases the
+  whole block and writes back only what the host sends, a bare-image upload
+  destroys the footer and bricks the camera. Key A is read out of the camera's
+  own bootloader block, where it sits in clear next to the 0x14010000 anchor,
+  and is confirmed by matching a slot's cryptanalytically recovered keystream.
 
   USB protocol limitation:
     BeginFirmwareUpgrade exposes all known 64 KiB blocks in 0x14000000..0x143fffff
@@ -34,7 +66,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Dump and decrypt the 4 MiB SPIFI flash of a Seek Thermal camera from your browser over WebUSB. Read-only, no driver install on macOS or Linux.">
+<meta name="description" content="Dump and decrypt the 4 MiB SPIFI flash of a Seek Thermal camera from your browser over WebUSB, and flash a new plaintext firmware image. No driver install on macOS or Linux.">
 <meta name="color-scheme" content="light">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f6feb'/%3E%3Cpath d='M9 10h14M9 16h14M9 22h9' stroke='white' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
 <title>Seek Thermal Firmware Dump (WebUSB)</title>
@@ -117,16 +149,16 @@
   button.primary:hover:not(:disabled) { filter: brightness(1.08); }
   button:disabled { opacity: .45; cursor: not-allowed; }
   .btnrow { display: flex; flex-wrap: wrap; gap: .5rem; }
-  #bar, #bar2, #bar3 {
+  #bar, #bar2, #bar3, #bar4, #bar5 {
     height: 10px;
     border-radius: 5px;
     background: var(--line);
     overflow: hidden;
     margin: .9rem 0 .45rem;
   }
-  #barFill, #barFill2, #barFill3 { height: 100%; width: 0%; background: var(--accent); transition: width .1s linear; }
-  #status, #status2, #status3 { font-size: .85rem; color: var(--muted); }
-  #log, #log2, #log3 {
+  #barFill, #barFill2, #barFill3, #barFill4, #barFill5 { height: 100%; width: 0%; background: var(--accent); transition: width .1s linear; }
+  #status, #status2, #status3, #status4, #status5 { font-size: .85rem; color: var(--muted); }
+  #log, #log2, #log3, #log4, #log5 {
     font-family: var(--mono);
     font-size: .78rem;
     line-height: 1.5;
@@ -180,19 +212,69 @@
     color: var(--muted);
     font-weight: 600;
   }
+  /* the two views (#dump / #flash) share the Connect panel and the platform notes */
+  nav.views {
+    display: flex;
+    gap: .35rem;
+    margin: 0 0 1.25rem;
+    border-bottom: 1px solid var(--line);
+  }
+  nav.views a {
+    padding: .45rem .85rem;
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-radius: 8px 8px 0 0;
+    margin-bottom: -1px;
+    font-size: .9rem;
+    font-weight: 600;
+    color: var(--muted);
+    text-decoration: none;
+  }
+  nav.views a:hover { color: var(--fg); }
+  nav.views a[aria-current="page"] {
+    color: var(--fg);
+    background: var(--panel);
+    border-color: var(--line);
+  }
+  nav.views a.danger[aria-current="page"] { color: var(--err); }
+  label.chk {
+    display: flex;
+    align-items: flex-start;
+    gap: .45rem;
+    font-size: .85rem;
+    color: var(--fg);
+    margin: .9rem 0 0;
+  }
+  label.chk input { margin: .2rem 0 0; }
+  dl.kv { margin: 0; display: grid; grid-template-columns: minmax(9rem, auto) 1fr; gap: .15rem .8rem; font-size: .85rem; }
+  dl.kv dt { color: var(--muted); }
+  dl.kv dd { margin: 0; font-family: var(--mono); font-size: .95em; overflow-wrap: anywhere; }
+  .fwbox { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: .7rem .8rem; margin: .85rem 0 0; }
+  .fwbox h3 { margin-top: 0; }
 </style>
 </head>
 <body>
 <main>
 
 <h1>Seek Thermal Firmware Dump</h1>
-<p class="sub">
+<p class="sub" data-view="dump">
   Reads the 4&nbsp;MiB SPIFI flash of a Seek Thermal camera over WebUSB and decrypts any firmware
   images it finds. Everything runs locally in your browser &mdash; nothing is uploaded anywhere.
-  <strong>Read-only:</strong> no flash write, erase, upload, commit, or reset command is ever issued.
+  <strong>Read-only:</strong> this view issues no flash write, erase, upload, commit, or reset command.
+</p>
+<p class="sub hidden" data-view="flash">
+  Shows what firmware the camera is running right now, and writes a new <em>plaintext</em> firmware
+  image to it over WebUSB using the camera's own upgrade path. Everything runs locally in your browser.
+  <strong>This view writes to flash.</strong> A bad image can leave the camera unbootable, and the
+  bootloader has no USB &mdash; recovery would need SWD/J-Link or an SPI programmer.
 </p>
 
 <div id="support" class="banner">Checking browser support&hellip;</div>
+
+<nav class="views" id="viewNav">
+  <a href="#dump" data-nav="dump">Dump &amp; decrypt</a>
+  <a href="#flash" data-nav="flash" class="danger">Firmware &amp; flashing</a>
+</nav>
 
 <section>
   <h2 style="margin-top:0">1 &middot; Connect</h2>
@@ -208,7 +290,7 @@
   </p>
 </section>
 
-<section>
+<section data-view="dump">
   <h2 style="margin-top:0">2 &middot; Dump</h2>
   <div class="btnrow">
     <button id="btnStart" class="primary" disabled>Start dump</button>
@@ -230,7 +312,7 @@
     <div class="row" style="margin-top:.9rem">
       <div>
         <label for="optChunk">chunk (control-IN bytes)</label>
-        <input type="number" id="optChunk" value="256" min="1" max="65536" step="1">
+        <input type="number" id="optChunk" value="64" min="1" max="65536" step="1">
       </div>
       <div>
         <label for="optGapFill">gap-fill byte</label>
@@ -261,15 +343,16 @@
       </div>
     </div>
     <p class="note" style="margin:.9rem 0 0">
-      <strong>chunk</strong> is the size of each control-IN read; larger is faster but the device may
-      clamp it, which would truncate a window. <strong>gap-fill</strong> is the byte written into the
+      <strong>chunk</strong> is the size of each control-IN read. 64 is the EP0 packet size and the
+      value that works on every camera tested; raising it to 256 is roughly four times faster, and if
+      a camera stalls at that size the page drops back toward 64 on its own and carries on. <strong>gap-fill</strong> is the byte written into the
       one 64&nbsp;KiB block USB cannot reach. <strong>recipient</strong> defaults to interface and falls
       back to device if the browser cannot claim interface&nbsp;0 &mdash; the firmware accepts both.
     </p>
   </details>
 </section>
 
-<section id="legacySection" class="optional">
+<section id="legacySection" class="optional" data-view="dump">
   <p class="optlabel">Optional &mdash; for older or locked firmware</p>
   <h2 style="margin-top:0">Dump older / locked firmware</h2>
   <p class="note" style="margin-top:0">
@@ -286,7 +369,7 @@
   <p class="note">
     Needs a connected device (step&nbsp;1). If the normal dump already reads every window, use that
     instead &mdash; this is only for units where it stalls. If windows come back truncated, open
-    <em>Options</em> in step&nbsp;2 and set <strong>chunk</strong> to <code>64</code>.
+    <em>Options</em> in step&nbsp;2 and lower <strong>chunk</strong>.
   </p>
   <p class="note">
     One caveat. The unlock token is <strong>build-specific</strong>; the one built in was recovered
@@ -311,7 +394,7 @@
   <pre id="log3" class="hidden"></pre>
 </section>
 
-<section id="offlineSection" class="optional">
+<section id="offlineSection" class="optional" data-view="dump">
   <p class="optlabel">Optional &mdash; not part of the two steps above</p>
   <h2 style="margin-top:0">Decrypt a dump you already have</h2>
   <p class="note" style="margin-top:0">
@@ -331,7 +414,7 @@
   <pre id="log2" class="hidden"></pre>
 </section>
 
-<section>
+<section data-view="dump">
   <h2 style="margin-top:0">What you get</h2>
   <p class="note" style="margin-top:0">A single <code>.zip</code> download containing:</p>
   <div class="tablewrap">
@@ -354,6 +437,165 @@
     derives the key from chip OTP, which is not present in a flash dump &mdash; that slot is simply
     skipped and the rest of the archive is unaffected.
   </p>
+</section>
+
+<section data-view="flash" class="hidden">
+  <h2 style="margin-top:0">2 &middot; Current firmware</h2>
+  <p class="note" style="margin-top:0">
+    Read-only. Asks the camera what it is running, then reads the three firmware slots and decrypts
+    them in the browser so you can see exactly what is in each one before you change anything.
+  </p>
+  <div class="btnrow">
+    <button id="btnReadFw" class="primary" disabled>Read device info</button>
+    <button id="btnCancelFw" disabled>Cancel</button>
+  </div>
+  <div id="bar4"><div id="barFill4"></div></div>
+  <div id="status4">Idle.</div>
+  <div id="fwInfo" class="hidden"></div>
+  <pre id="log4" class="hidden"></pre>
+</section>
+
+<section data-view="flash" class="hidden">
+  <h2 style="margin-top:0">3 &middot; Flash a firmware image</h2>
+
+  <div class="banner err" style="margin-top:0">
+    <p><strong>This writes to the camera's flash.</strong> It erases a 64&nbsp;KiB block and programs
+    your image into the slot the camera is <em>not</em> currently booted from, then points the boot
+    config at it.</p>
+    <p>An image that is structurally valid but does not run leaves the camera unbootable, and the
+    first-stage bootloader has no USB &mdash; only SWD/J-Link or an SPI programmer can recover it.
+    Keep the rescue dump this page downloads for you.</p>
+  </div>
+
+  <p class="note">
+    Give it a <strong>plaintext (decrypted)</strong> image &mdash; the same kind of file this page's
+    <code>decrypted/*.bin</code> output contains. Everything else is done for you: the header length is
+    stamped to the real size, the acceptance-sum adjust word is balanced, the image is encrypted with
+    the Key&nbsp;A read out of your camera's own bootloader block, and the <code>CODE</code> footer is
+    rebuilt from the footer already on the device.
+  </p>
+  <p class="note">
+    <strong>The filename must carry the image's own key pair</strong>, the way this page's decrypted
+    output is named: <code>&hellip;-KeyA-&lt;32 hex&gt;-KeyB-&lt;32 hex&gt;.bin</code>. Those keys are
+    found inside the image and rewritten to this camera's before it is packaged, so the image will
+    encrypt its own future upgrades with keys this bootloader can read. A file without them is
+    refused &mdash; there would be no way to tell whether it carries keys for this camera, for another
+    one, or none at all, and the wrong pair quietly stops the camera accepting any later update. A
+    file whose named keys are not both inside it, exactly once each, is refused too.
+  </p>
+
+  <div class="btnrow">
+    <button id="btnPickFw" class="primary">Choose plaintext image&hellip;</button>
+    <button id="btnFlash" disabled>Write to camera</button>
+    <button id="btnCancelFlash" disabled>Cancel</button>
+  </div>
+  <input type="file" id="filePickFw" accept=".bin,.img,.rom,application/octet-stream" class="hidden">
+
+  <label class="chk">
+    <input type="checkbox" id="optDumpFirst" checked>
+    <span>Dump the whole 4&nbsp;MiB flash and download it before writing (rescue copy)</span>
+  </label>
+
+  <div id="flashPreview" class="hidden"></div>
+  <div id="bar5"><div id="barFill5"></div></div>
+  <div id="status5">No image chosen.</div>
+  <pre id="log5" class="hidden"></pre>
+</section>
+
+<section data-view="flash" class="hidden">
+  <h2 style="margin-top:0">What this view writes</h2>
+  <p class="note" style="margin-top:0">
+    The dump view's five read commands, plus these. Nothing else is in the source &mdash; there is no
+    <code>ResetDevice</code>, no raw-block write, and no path that touches the bootloader at
+    <code>0x14000000</code> or the recovery slot at <code>0x14070000</code>.
+  </p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Opcode</th><th>Name</th><th>Dir</th><th>Why it is used</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">0x4e</td><td>GetFirmwareInfo</td><td>IN</td><td>running version, bootloader string, platform, USB speed, boot-config state</td></tr>
+      <tr><td class="mono">0x55</td><td>SetFirmwareInfoFeatures</td><td>OUT</td><td>selects which of the above to return &mdash; a selector register, writes no flash</td></tr>
+      <tr><td class="mono">0x5a</td><td>SetRamDataFeatures</td><td>OUT</td><td>arms the 248-byte RAM device-id block so the serial can be read</td></tr>
+      <tr><td class="mono">0x50</td><td>SetFeaturedFirmwareData</td><td>OUT</td><td>streams the payload into the camera's RAM staging buffer, 64&nbsp;B at a time</td></tr>
+      <tr><td class="mono">0x51</td><td>CompleteMemoryUpgrade</td><td>OUT</td><td>the commit &mdash; the only command here that erases or programs flash</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <details class="sub-details">
+    <summary>What the camera does when you press commit</summary>
+    <p class="note">
+      <code>BeginFirmwareUpgrade(0)</code> arms the upgrade descriptor at
+      <code>fw_update_slot_address()</code> &mdash; the slot the camera did <em>not</em> boot from
+      &mdash; with a 64&nbsp;KiB cap. Each <code>SetFeaturedFirmwareData</code> appends up to 64 bytes
+      (the EP0 buffer is exactly 64 bytes; longer writes are truncated) into RAM.
+    </p>
+    <p class="note">
+      <code>CompleteMemoryUpgrade</code> takes a 16-bit sum of every staged byte and refuses with
+      <code>0x70000</code> if it disagrees. It then decrypts the staged image with Key&nbsp;A,
+      re-encrypts it with Key&nbsp;B or the per-device key at <code>0x14000218</code>, erases the target
+      64&nbsp;KiB block, programs it, verifies the readback, and finally rewrites the boot-config record
+      at <code>0x14010000</code> so <code>cfg[0]</code> points at the slot it just wrote.
+    </p>
+    <p class="note">
+      The bank switch only takes effect on a real power cycle, so unplug and replug the camera
+      afterwards.
+    </p>
+  </details>
+
+  <details class="sub-details">
+    <summary>Why the payload is bigger than your image</summary>
+    <p class="note">
+      Each slot holds the encrypted image, <code>0xff</code> padding, and a 64-byte <code>"CODE"</code>
+      footer at <code>((header.length&gt;&gt;14)+1)&times;0x4000&nbsp;&minus;&nbsp;0x40</code>. The
+      bootloader reads that footer straight out of flash, undecrypted, and takes the normal monolithic
+      boot path <em>only</em> if <code>footer[0] == "CODE"</code> and
+      <code>footer[1] == header.length</code>.
+    </p>
+    <p class="note">
+      The camera erases the whole 64&nbsp;KiB block and writes back only what you stream, and it never
+      writes the footer itself. So the footer has to be part of the payload &mdash; a bare-image upload
+      wipes the footer that was there, the bootloader falls through to its segmented loader, decrypts a
+      monolithic image as a segment table, and bricks. This page always streams the full bank payload
+      and refuses to send one whose footer does not validate.
+    </p>
+  </details>
+
+  <details class="sub-details">
+    <summary>The two checksums, and why images get rejected silently</summary>
+    <p class="note">
+      They are different values checked at different times.
+      <strong>The transfer checksum</strong> is a 16-bit sum of the payload bytes, checked by
+      <code>CompleteMemoryUpgrade</code> during the write.
+      <strong>The acceptance sum</strong> is a 32-bit sum of the <em>decrypted</em> words over exactly
+      <code>header.length</code> bytes, and the bootloader requires it to be <code>0x0000FFFF</code> at
+      boot. There is no signature and no MAC &mdash; that sum is the whole check.
+    </p>
+    <p class="note">
+      This is why <code>header.length</code> (file offset <code>0x204</code>) must equal the real image
+      size. If it does not, the bootloader sums the wrong range, the slot fails acceptance, and the
+      camera quietly boots the other bank &mdash; the classic "I flashed it but it is still running the
+      old firmware". This page stamps the length and balances the reserved adjust word at
+      <code>0x238</code> over that exact range for you.
+    </p>
+  </details>
+
+  <details class="sub-details">
+    <summary>If the camera stops working</summary>
+    <p class="note">
+      The bootloader picks a slot from <code>cfg[0]</code> at <code>0x14010000</code>: blank or
+      <code>0</code> tries slot&nbsp;A, then B, then recovery; <code>1</code> tries B, then A, then
+      recovery; anything else tries recovery first. A slot is accepted when its header is valid and
+      either the device key or Key&nbsp;A decrypts it to the acceptance sum.
+    </p>
+    <p class="note">
+      So an image that fails acceptance is harmless &mdash; the camera falls back to a good slot. The
+      dangerous case is an image that passes acceptance but does not run: the bootloader keeps
+      selecting it and there is no USB in the bootloader to talk to. Recovering that means writing the
+      rescue dump back with an SPI programmer, or over SWD/J-Link. The recovery slot at
+      <code>0x14070000</code> is never touched by this page, so it stays as your golden copy.
+    </p>
+  </details>
 </section>
 
 <section>
@@ -408,7 +650,7 @@ sudo udevadm control --reload-rules &amp;&amp; sudo udevadm trigger</pre>
   </p>
 </section>
 
-<section>
+<section data-view="dump">
   <h2 style="margin-top:0">Read-only guarantee</h2>
   <p class="note" style="margin-top:0">
     This page can issue exactly five vendor commands. That is its entire vocabulary &mdash; there is no
@@ -428,9 +670,15 @@ sudo udevadm control --reload-rules &amp;&amp; sudo udevadm trigger</pre>
   </div>
   <p class="note" style="margin-bottom:0">
     <code>SetFeaturedFirmwareData</code>, <code>CompleteMemoryUpgrade</code>, <code>ResetDevice</code> and
-    every upload, commit and erase command are absent from the source. <code>USBDevice.reset()</code> is
+    every upload, commit and erase command are absent from this view. <code>USBDevice.reset()</code> is
     never called either; the retry path just closes and reopens the handle. Decryption happens entirely
     in memory on the copy in your browser and never touches the device.
+  </p>
+
+  <p class="note">
+    Writing to the camera lives on its own page, <a href="#flash">Firmware &amp; flashing</a>, which
+    lists the commands it adds. Nothing on <em>this</em> page can reach them, and no code path here
+    calls into that view.
   </p>
 
   <p class="note">
@@ -490,7 +738,20 @@ const OP = {
   GET_OPERATION_MODE: 0x3d,
   GET_FEATURED_FIRMWARE_DATA: 0x4f,
   BEGIN_FIRMWARE_UPGRADE: 0x52,
+  /* --- used by the #flash view only (see FLASH_OPS below) --- */
+  GET_FIRMWARE_INFO: 0x4e,
+  SET_FEATURED_FIRMWARE_DATA: 0x50,
+  COMPLETE_MEMORY_UPGRADE: 0x51,
+  SET_FIRMWARE_INFO_FEATURES: 0x55,
+  SET_RAM_DATA_FEATURES: 0x5a,
 };
+
+/* Every opcode the #dump view is allowed to touch. The write path asserts
+ * against this set so a stray call cannot leak into a read-only run. */
+const READ_ONLY_OPS = new Set([
+  OP.GET_ERROR_CODE, OP.SET_OPERATION_MODE, OP.GET_OPERATION_MODE,
+  OP.GET_FEATURED_FIRMWARE_DATA, OP.BEGIN_FIRMWARE_UPGRADE,
+]);
 
 const FLASH_BASE = 0x14000000;
 const FLASH_SIZE = 4 * 1024 * 1024;
@@ -498,6 +759,46 @@ const WINDOW_SIZE = 0x10000;
 const GAP_ADDRESS = 0x14060000;
 const INTERFACE_NUMBER = 0;
 const CONFIGURATION_VALUE = 1;
+
+/* 64 bytes is the EP0 max packet size, so a request never spans packets. Some
+ * firmware serves most of a window at 256 and then never answers the request
+ * that would empty it (seen on a 4.9.x PIR324, where the same bytes come back
+ * fine in 64-byte requests). Larger is faster; this is the size that works
+ * everywhere, and readArmed() falls back toward it on its own if a camera
+ * stalls at whatever you pick. */
+const DEFAULT_READ_CHUNK = 64;
+
+const USB_TIMEOUT_MS = 5000;          /* per control transfer */
+const USB_PROBE_TIMEOUT_MS = 1500;    /* the shrink retries: a camera that ignored one request for
+                                       * 5 s will not suddenly need 5 s more to ignore a smaller one,
+                                       * and this keeps a dead window from costing half a minute */
+const USB_COMMIT_TIMEOUT_MS = 20000;  /* CompleteMemoryUpgrade erases and programs inside the transfer */
+const MODE_SETTLE_MS = 3000;          /* how long to let a camera finish leaving imaging mode */
+
+/* ---- firmware slot / image layout (2018+ "4.x" family) ------------------ */
+const BOOT_CONFIG_BASE = 0x14010000;
+const SLOT_A_BASE = 0x14030000;
+const SLOT_B_BASE = 0x14050000;
+const SLOT_RECOVERY_BASE = 0x14070000;
+
+/* BeginFirmwareUpgrade selectors used by the flash view. Subcommand 0 is the
+ * one the camera resolves itself, to fw_update_slot_address() — the slot it did
+ * NOT boot from. It is the only selector this page ever writes through. */
+const SUBCMD_UPDATE_TARGET = 0;
+const SUBCMD_BOOTLOADER = 2;
+const SUBCMD_BOOT_CONFIG = 3;
+const SUBCMD_SLOT_A = 5;
+const SUBCMD_SLOT_B = 8;
+const SUBCMD_RECOVERY = 9;
+
+const EP0_BUF = 64;                 /* USB_CORE_CTRL_T.EP0Buf[64]: longer OUT chunks are truncated */
+const LEN_OFF = 0x204;              /* image_header_t.length, inside the verbatim header window */
+const ADJ_OFF = 0x238;              /* reserved adjust word, also inside the verbatim window */
+const FOOTER_TAG = 0x45444f43;      /* "CODE" */
+const FOOTER_SIZE = 0x40;
+const ACCEPT_SUM = 0x0000ffff;      /* bootloader's 32-bit acceptance target for this family */
+const TRY_KEYS_MAX_LEN = 0x10000;   /* image_try_keys() rejects header.length >= this */
+const ERR_BAD_CHECKSUM = 0x70000;   /* CompleteMemoryUpgrade transfer-checksum rejection */
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const yieldToUi = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -663,6 +964,22 @@ const ui = {
   barFill3: el("barFill3"),
   status3: el("status3"),
   log3: el("log3"),
+  viewNav: el("viewNav"),
+  btnReadFw: el("btnReadFw"),
+  btnCancelFw: el("btnCancelFw"),
+  fwInfo: el("fwInfo"),
+  barFill4: el("barFill4"),
+  status4: el("status4"),
+  log4: el("log4"),
+  btnPickFw: el("btnPickFw"),
+  btnFlash: el("btnFlash"),
+  btnCancelFlash: el("btnCancelFlash"),
+  filePickFw: el("filePickFw"),
+  optDumpFirst: el("optDumpFirst"),
+  flashPreview: el("flashPreview"),
+  barFill5: el("barFill5"),
+  status5: el("status5"),
+  log5: el("log5"),
 };
 
 /* The USB dump and the offline decryptor share log()/setProgress(); `out`
@@ -671,9 +988,17 @@ const PANELS = {
   dump: { barFill: ui.barFill, status: ui.status, log: ui.log },
   offline: { barFill: ui.barFill2, status: ui.status2, log: ui.log2 },
   legacy: { barFill: ui.barFill3, status: ui.status3, log: ui.log3 },
+  fwinfo: { barFill: ui.barFill4, status: ui.status4, log: ui.log4 },
+  flash: { barFill: ui.barFill5, status: ui.status5, log: ui.log5 },
 };
 let out = PANELS.dump;
 const useOutput = (which) => { out = PANELS[which]; };
+
+/* The Connect section is shared by both views, so its messages have to land in
+ * whichever log is actually on screen — otherwise "Test connection" writes into
+ * a hidden panel and looks like it did nothing. */
+const useViewOutput = () =>
+  useOutput(typeof currentView === "function" && currentView() === "flash" ? "fwinfo" : "dump");
 
 function log(msg, cls) {
   out.log.classList.remove("hidden");
@@ -821,15 +1146,29 @@ async function safeClose() {
   await closeDevice(device);
 }
 
+/* WebUSB has no timeout of its own: a camera that simply does not answer leaves
+ * the transfer pending forever, which shows up as the page freezing mid-dump
+ * with no error and no retry. Racing a timer turns that into an ordinary
+ * failure the retry path can reopen and recover from. */
+function withTimeout(promise, ms, what) {
+  let timer;
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(what + " did not answer within " + ms + " ms")), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /* WebUSB resolves on a stall instead of rejecting, so status must be checked
  * explicitly — otherwise a stalled read silently becomes a zero-length one. */
-async function rpcOut(dev, op, payload) {
-  const r = await dev.controlTransferOut(setupPacket(op), payload);
+async function rpcOut(dev, op, payload, timeoutMs) {
+  const r = await withTimeout(dev.controlTransferOut(setupPacket(op), payload),
+    timeoutMs || USB_TIMEOUT_MS, "control OUT " + hex(op));
   if (r.status !== "ok") throw new Error("control OUT " + hex(op) + " -> " + r.status);
 }
 
-async function rpcIn(dev, op, length) {
-  const r = await dev.controlTransferIn(setupPacket(op), length);
+async function rpcIn(dev, op, length, timeoutMs) {
+  const r = await withTimeout(dev.controlTransferIn(setupPacket(op), length),
+    timeoutMs || USB_TIMEOUT_MS, "control IN " + hex(op));
   if (r.status !== "ok") throw new Error("control IN " + hex(op) + " -> " + r.status);
   const d = r.data;
   if (!d) return new Uint8Array(0);
@@ -862,23 +1201,56 @@ async function setOperationMode(dev, mode) {
  * Window read
  * ==================================================================== */
 
-async function readWindow(dev, entry, chunk, onChunk) {
-  const { subcmd, address } = entry;
-
-  let opMode;
+/* Put the device in mode 0 and point its read/write window at `entry`. The
+ * window offset resets to 0 on every BeginFirmwareUpgrade, so reads after this
+ * start at the base of the selected 64 KiB block and advance sequentially. */
+/* Operation mode 0 is a hard precondition for the window commands on some
+ * firmware. The RPC dispatch table carries two permission bits per command —
+ * bit0 "allowed in mode 0", bit1 "allowed in mode 1" — and BeginFirmwareUpgrade
+ * and GetFeaturedFirmwareData are 3 (both modes) on 4.18.x but 1 (mode 0 only)
+ * on 4.9.x. A 4.9.x camera that is still imaging therefore refuses or ignores
+ * the very first window command.
+ *
+ * Leaving imaging mode is not instant either — the camera has a sensor and a
+ * shutter to park — so wait for mode 0 to actually read back instead of
+ * assuming a fixed delay covers it. */
+async function ensureMode0(dev) {
+  let mode;
   try {
-    opMode = await getOperationMode(dev);
+    mode = await getOperationMode(dev);
   } catch (e) {
     throw new Error("GetOperationMode failed: " + e.message);
   }
-  if (opMode !== 0) {
+  if (mode === 0) return;
+
+  try {
+    await setOperationMode(dev, 0);
+  } catch (e) {
+    throw new Error("SetOperationMode(0) failed: " + e.message);
+  }
+
+  const deadline = performance.now() + MODE_SETTLE_MS;
+  for (;;) {
+    await sleep(20);
     try {
-      await setOperationMode(dev, 0);
-      await sleep(20);
+      mode = await getOperationMode(dev);
     } catch (e) {
-      throw new Error("SetOperationMode(0) failed: " + e.message);
+      mode = null;                       /* still not answering; keep waiting */
+    }
+    if (mode === 0) return;
+    if (performance.now() > deadline) {
+      throw new Error("the camera did not enter operation mode 0 within " +
+        (MODE_SETTLE_MS / 1000) + " s (it reports " +
+        (mode === null ? "nothing" : hex(mode)) + "). Some firmware only accepts the flash-window " +
+        "commands in mode 0, so reading cannot start until it gets there");
     }
   }
+}
+
+async function armWindow(dev, entry) {
+  const { subcmd, address } = entry;
+
+  await ensureMode0(dev);
 
   try {
     await rpcOut(dev, OP.BEGIN_FIRMWARE_UPGRADE, entry.payload || u16Payload(subcmd));
@@ -894,40 +1266,114 @@ async function readWindow(dev, entry, chunk, onChunk) {
     throw new Error("GetErrorCode after BeginFirmwareUpgrade(" + hex(subcmd) + ") failed: " + e.message);
   }
   if (beginErr) {
-    throw new Error("BeginFirmwareUpgrade(" + hex(subcmd) + ") for " + hex(address, 8) +
-      " returned " + hex(beginErr));
+    throw new Error("BeginFirmwareUpgrade(" + hex(subcmd) + ")" +
+      (address == null ? "" : " for " + hex(address, 8)) + " returned " + hex(beginErr));
   }
+}
 
-  const raw = new Uint8Array(WINDOW_SIZE);
+/* Sequential read of `length` bytes from the window armed by armWindow(). May
+ * return short if the device stops handing data back. */
+/* Sequential read of `length` bytes from the window armed by armWindow().
+ *
+ * The request size adapts. Some cameras serve most of a window at 256 bytes a
+ * time and then never answer one particular request — on a 4.9.x PIR324 the
+ * last 256 bytes of every window behave that way, while the same bytes come
+ * back fine in 64-byte requests. So a failed request is retried once at the
+ * same size, then at progressively smaller ones, and whatever size works is
+ * KEPT for the rest of the window. Shrinking only for the stuck request and
+ * then going back to the big one just stalls again on the next.
+ *
+ * If a chunk still will not come at any size, the read stops and returns what
+ * it has: 65280 good bytes are worth keeping, and the caller records exactly
+ * what is missing. Throwing here would discard a whole 64 KiB window over one
+ * bad request.
+ *
+ * `stoppedAt`, `stopReason` and `chunkUsed` ride along on the returned array so
+ * the caller can report the shortfall instead of silently gap-filling it. */
+const MIN_READ_CHUNK = 32;
+
+async function readArmed(dev, chunk, length, onChunk) {
+  const raw = new Uint8Array(length);
   let got = 0;
-  while (got < WINDOW_SIZE) {
+  let stopReason = null;
+  let size = chunk;                    /* adapts downward and stays there */
+  let shrank = false;
+
+  while (got < length) {
     if (cancelRequested) throw new Error("cancelled");
-    const want = Math.min(chunk, WINDOW_SIZE - got);
-    let blk;
-    try {
-      blk = await rpcIn(dev, OP.GET_FEATURED_FIRMWARE_DATA, want);
-    } catch (e) {
-      throw new Error("GetFeaturedFirmwareData failed at offset " + hex(got, 4) + ": " + e.message);
+    const remaining = length - got;
+    let blk = null;
+    let lastError = null;
+
+    for (let attempt = 0; ; attempt++) {
+      try {
+        blk = await rpcIn(dev, OP.GET_FEATURED_FIRMWARE_DATA, Math.min(size, remaining),
+          attempt === 0 ? USB_TIMEOUT_MS : USB_PROBE_TIMEOUT_MS);
+        lastError = null;
+        break;
+      } catch (e) {
+        lastError = e;
+        if (cancelRequested) throw new Error("cancelled");
+        if (attempt === 0) { await sleep(50); continue; }   /* once more at this size */
+        if (size <= MIN_READ_CHUNK) break;
+        size >>= 1;
+        shrank = true;
+        await sleep(50);
+      }
     }
-    if (!blk.length) break;
+
+    if (lastError) {
+      stopReason = "GetFeaturedFirmwareData stopped at offset " + hex(got, 4) +
+        " even at " + size + "-byte requests: " + lastError.message;
+      break;
+    }
+    if (!blk.length) { stopReason = "device returned no more data at offset " + hex(got, 4); break; }
     raw.set(blk, got);
     got += blk.length;
     if (onChunk) onChunk(blk.length);
-    if (blk.length < want) break;
+    if (blk.length < Math.min(size, remaining)) {
+      stopReason = "short chunk at offset " + hex(got, 4);
+      break;
+    }
   }
 
-  let readErr;
+  const out = raw.subarray(0, got);
+  out.stoppedAt = got;
+  out.stopReason = got < length ? stopReason : null;
+  out.chunkUsed = size;
+  out.shrank = shrank;
+  return out;
+}
+
+async function readWindow(dev, entry, chunk, onChunk) {
+  const { subcmd, address } = entry;
+  await armWindow(dev, entry);
+  const got = await readArmed(dev, chunk, WINDOW_SIZE, onChunk);
+
+  /* Nothing at all means the window is genuinely unreadable — worth a full
+   * retry. A short read is not: the bytes we have are good, and re-reading the
+   * window from the start would only lose them again. */
+  if (!got.length) {
+    throw new Error("read " + hex(address, 8) + " subcmd " + hex(subcmd) + " returned nothing" +
+      (got.stopReason ? " (" + got.stopReason + ")" : ""));
+  }
+
+  let readErr = null;
   try {
     readErr = await getErrorCode(dev);
   } catch (e) {
-    throw new Error("GetErrorCode after reading " + hex(address, 8) + " failed: " + e.message);
+    /* The status read can time out on a camera that just stopped answering;
+     * that must not cost us the window we already have. */
+    if (got.length === WINDOW_SIZE) {
+      throw new Error("GetErrorCode after reading " + hex(address, 8) + " failed: " + e.message);
+    }
   }
-  if (readErr) {
+  if (readErr && got.length === WINDOW_SIZE) {
     throw new Error("read " + hex(address, 8) + " subcmd " + hex(subcmd) + " returned " +
-      hex(readErr) + " after " + got + " B");
+      hex(readErr) + " after " + got.length + " B");
   }
 
-  return raw.subarray(0, got);
+  return got;
 }
 
 /* ==================================================================== *
@@ -1107,6 +1553,69 @@ function recoverKeyInfo(dv, base, byteLen) {
   return { state, checksum, profile, sane, word13, selfConsistent, confidence, key, candidates };
 }
 
+/* ---- the application's own embedded key table ---------------------------- *
+ *
+ * A firmware image carries its own g_keyA/g_keyB, and once it runs THOSE are
+ * the keys it uses: Key A to decrypt an upload, Key B to re-encrypt it into
+ * flash. Flash an image whose table does not match the target bootloader and
+ * every later upgrade lands under a key the bootloader cannot try.
+ *
+ * The keys are locatable by value but not by offset — the pair was found at
+ * 0xf54, 0x9670, 0x9a3c and 0x9a40 across builds, with no constant word around
+ * them to anchor on. What makes a value search safe is uniqueness: each key
+ * must occur exactly once in the image, so there is no ambiguity about which
+ * bytes to rewrite. They are usually adjacent, but that is not required — a
+ * build is free to place them apart, and each is patched where it is found.
+ * ------------------------------------------------------------------------- */
+function countOccurrences(haystack, needle) {
+  const out = [];
+  outer:
+  for (let i = 0; i + needle.length <= haystack.length; i++) {
+    for (let j = 0; j < needle.length; j++) if (haystack[i + j] !== needle[j]) continue outer;
+    out.push(i);
+  }
+  return out;
+}
+
+function findEmbeddedKeyTable(plain, keyA, keyB) {
+  if (!plain || !keyA || !keyB || keyA.length !== 16 || keyB.length !== 16) return null;
+  const a = countOccurrences(plain, keyA);
+  if (a.length !== 1) return null;
+  const b = countOccurrences(plain, keyB);
+  if (b.length !== 1) return null;
+  return { offsetA: a[0], offsetB: b[0], adjacent: b[0] === a[0] + 16 };
+}
+
+/** Where the pair lives, for display: one offset when they are adjacent. */
+function keyTableWhere(at) {
+  return at.adjacent ? hexUp(at.offsetA)
+    : hexUp(at.offsetA) + " and " + hexUp(at.offsetB);
+}
+
+/** Why a named key pair is not this image's table. Refusal path only, so the
+ *  extra scan costs nothing in the normal case. */
+function describeKeyTableMismatch(plain, keyA, keyB) {
+  const a = countOccurrences(plain, keyA), b = countOccurrences(plain, keyB);
+  if (!a.length && !b.length) return "neither key is anywhere in the image";
+  if (!a.length) return "Key A is not in the image at all (Key B is, at " + hexUp(b[0]) + ")";
+  if (!b.length) return "Key B is not in the image at all (Key A is, at " + hexUp(a[0]) + ")";
+  if (a.length > 1) return "Key A appears " + a.length + " times, so there is no unambiguous place to rewrite it";
+  return "Key B appears " + b.length + " times, so there is no unambiguous place to rewrite it";
+}
+
+/** `-KeyA-<32 hex>-KeyB-<32 hex>` immediately before the extension. */
+const KEY_SUFFIX_RE = /-KeyA-([0-9a-fA-F]{32})-KeyB-([0-9a-fA-F]{32})(?=\.[^.]*$|$)/;
+
+function keyFilenameSuffix(keyA, keyB) {
+  return "-KeyA-" + bytesToHex(keyA) + "-KeyB-" + bytesToHex(keyB);
+}
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length >> 1);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
 /* Returns { files, summary } and never throws — decryption is a bonus stage,
  * so any failure must leave the flash dump itself untouched. */
 async function decryptDump(combined, stem, dumpPath) {
@@ -1135,6 +1644,27 @@ async function decryptDump(combined, stem, dumpPath) {
   const infoByCipher = new Map();
   const plainHashFirst = new Map();
   const keyLog = [];
+
+  /* Recover every slot up front so the dump's own bootloader key table can be
+   * identified before any filename is built. Results are cached by ciphertext,
+   * so the main loop below reuses them rather than solving twice. */
+  for (const im of images) {
+    if (cancelRequested) break;
+    const cHash = await sha256hex(combined.subarray(im.base, im.base + im.len));
+    if (!infoByCipher.has(cHash)) infoByCipher.set(cHash, recoverKeyInfo(dv, im.base, im.len));
+  }
+  let bootKeys = null;
+  try {
+    const cands = findKeyCandidates(combined.subarray(0, Math.min(0x8000, len)));
+    bootKeys = pickKeyTable(cands, Array.from(infoByCipher.values(), (r) => ({ recovered: r })));
+  } catch (e) { bootKeys = null; }
+  if (bootKeys) {
+    log("decrypt: this dump's bootloader keys — A " + bytesToHex(bootKeys.keyA) +
+      "  B " + bytesToHex(bootKeys.keyB), "l-dim");
+  }
+  summary.bootloaderKeys = bootKeys
+    ? { keyA: bytesToHex(bootKeys.keyA), keyB: bytesToHex(bootKeys.keyB), offset: hexUp(bootKeys.offset, 6) }
+    : null;
   const reportLines = [
     "Firmware decryption report",
     "==========================",
@@ -1173,7 +1703,13 @@ async function decryptDump(combined, stem, dumpPath) {
     const dupOf = plainHashFirst.has(pHash) ? plainHashFirst.get(pHash) : null;
     if (dupOf === null) plainHashFirst.set(pHash, flash);
 
-    const binName = stem + "_decrypted_" + addrTag(flash) + ".bin";
+    /* Only stamp the filename when the keys are genuinely inside this image.
+     * A build that derives its key at runtime has no table to find, and saying
+     * otherwise would make the flash-time substitution patch the wrong bytes. */
+    const embedded = bootKeys ? findEmbeddedKeyTable(plain, bootKeys.keyA, bootKeys.keyB) : null;
+    const keySuffix = embedded ? keyFilenameSuffix(bootKeys.keyA, bootKeys.keyB) : "";
+
+    const binName = stem + "_decrypted_" + addrTag(flash) + keySuffix + ".bin";
     const txtName = stem + "_decrypted_" + addrTag(flash) + ".txt";
     const keyName = stem + "_" + addrTag(flash) + ".key";
 
@@ -1219,6 +1755,16 @@ async function decryptDump(combined, stem, dumpPath) {
       "\n" +
       "Ciphertext SHA-256 : " + cHash + "\n" +
       "Plaintext  SHA-256 : " + pHash + "\n" +
+      "\n" +
+      "Embedded key table : " + (embedded
+        ? "yes, at image offset " + keyTableWhere(embedded) + "\n" +
+          "                     these are the keys this image will USE once it runs, and they are\n" +
+          "                     in the filename so the flash view can retarget them to another camera\n"
+        : (bootKeys
+            ? "not found — this image does not store this camera's key pair as plain bytes.\n" +
+              "                     It may belong to a different key family, or derive its key at runtime.\n" +
+              "                     No keys were added to the filename.\n"
+            : "not checked — this dump's bootloader key table could not be identified.\n")) +
       (dupOf !== null
         ? "Note            : identical decrypted image to slot " + hexUp(dupOf) + " (redundant copy)\n"
         : "") +
@@ -1235,6 +1781,11 @@ async function decryptDump(combined, stem, dumpPath) {
     log("         [" + confidence + "] " + (profile ? "key=" + keyHex : "state=" + stHex) +
       "  [" + profName + "]", "l-dim");
     log("         SP=" + hexUp(sp) + " entry=" + hexUp(entry) + " sha256=" + pHash.slice(0, 24), "l-dim");
+    if (embedded) {
+      log("         embedded keys at " + keyTableWhere(embedded) + " — added to the filename", "l-dim");
+    } else if (bootKeys) {
+      log("         no embedded key table for this camera's keys — filename left unstamped", "l-warn");
+    }
 
     reportLines.push(
       tag + ": [" + confidence + "] " + (profile ? "key=" + keyHex : "state=" + stHex) +
@@ -1258,6 +1809,10 @@ async function decryptDump(combined, stem, dumpPath) {
       sp: hexUp(sp),
       entry: hexUp(entry),
       duplicateOf: dupOf !== null ? hexUp(dupOf) : null,
+      embeddedKeyTable: embedded
+        ? { keyAOffset: hexUp(embedded.offsetA, 6), keyBOffset: hexUp(embedded.offsetB, 6),
+            adjacent: embedded.adjacent, keyA: bytesToHex(bootKeys.keyA), keyB: bytesToHex(bootKeys.keyB) }
+        : null,
       file: "decrypted/" + binName,
     });
 
@@ -1557,11 +2112,28 @@ async function readWindowsInto(entries, args, combined, files, manifest) {
           auth: !!entry.auth,
           requested: WINDOW_SIZE,
           lengthRead: copy.length,
+          shortBy: WINDOW_SIZE - copy.length,
+          shortfallFilled: copy.length === WINDOW_SIZE ? null : {
+            from: hex(entry.address + copy.length, 8),
+            to: hex(entry.address + WINDOW_SIZE - 1, 8),
+            length: WINDOW_SIZE - copy.length,
+            fill: hex(args.gapFill, 2),
+            reason: raw.stopReason || "read stopped early",
+          },
           file: "windows/" + name,
           preview: bytesToHex(copy, 32),
           ok: copy.length === WINDOW_SIZE,
         });
-        log(label + " ... " + copy.length + " B", copy.length === WINDOW_SIZE ? "l-ok" : "l-warn");
+        if (copy.length === WINDOW_SIZE) {
+          log(label + " ... " + copy.length + " B", "l-ok");
+        } else {
+          /* Keep the bytes and say exactly which ones are missing, rather than
+           * letting the gap-fill quietly stand in for real flash contents. */
+          log(label + " ... " + copy.length + " B — kept, short by " + (WINDOW_SIZE - copy.length) +
+            " B (" + hex(entry.address + copy.length, 8) + ".." + hex(entry.address + WINDOW_SIZE - 1, 8) +
+            " filled with " + hex(args.gapFill, 2) + ")", "l-warn");
+          if (raw.stopReason) log("    " + raw.stopReason, "l-dim");
+        }
       } else {
         const msg = lastError ? lastError.message : "no data read";
         bytesDone = startBytes;
@@ -1587,7 +2159,7 @@ async function readWindowsInto(entries, args, combined, files, manifest) {
 }
 
 function readOptions() {
-  const chunk = parseNum(ui.optChunk.value, 256);
+  const chunk = parseNum(ui.optChunk.value, 64);
   if (!Number.isInteger(chunk) || chunk <= 0 || chunk > WINDOW_SIZE) {
     throw new Error("chunk must be between 1 and 65536, got " + ui.optChunk.value);
   }
@@ -1953,9 +2525,12 @@ async function runSweep(mode) {
 
   try {
     try {
-      const m = await getOperationMode(dev());
-      if (m !== 0) { await setOperationMode(dev(), 0); await sleep(20); }
-    } catch (e) { /* proceed anyway */ }
+      await ensureMode0(dev());
+    } catch (e) {
+      /* The sweep is a probe: report it and carry on, since a selector that
+       * needs mode 0 will simply stall like any unmapped one. */
+      log("could not confirm operation mode 0: " + e.message, "l-warn");
+    }
 
     for (let subcmd = 0x00; subcmd <= 0xff; subcmd++) {
       if (cancelRequested) break;
@@ -2097,6 +2672,9 @@ function lockUi() {
   ui.btnTest.disabled = true;
   ui.btnConnect.disabled = true;
   ui.btnPick.disabled = true;
+  ui.btnReadFw.disabled = true;
+  ui.btnPickFw.disabled = true;
+  ui.btnFlash.disabled = true;
 }
 
 function unlockUi() {
@@ -2108,9 +2686,14 @@ function unlockUi() {
   ui.btnTest.disabled = off;
   ui.btnConnect.disabled = false;
   ui.btnPick.disabled = false;
+  ui.btnReadFw.disabled = off;
+  ui.btnPickFw.disabled = false;
+  refreshFlashButton();
 }
 
 function setConnected(d) {
+  /* Key A, the target slot and the footer template all belong to one camera. */
+  if (device !== d) resetFlashState("New device selected — read the device info again.");
   device = d;
   ui.devInfo.textContent = describeDevice(d);
   ui.btnForget.disabled = typeof d.forget !== "function";
@@ -2119,6 +2702,7 @@ function setConnected(d) {
 }
 
 function setDisconnected(reason) {
+  resetFlashState("Device disconnected — read the device info again.");
   device = null;
   claimed = false;
   ui.devInfo.textContent = reason || "No device selected.";
@@ -2128,6 +2712,7 @@ function setDisconnected(reason) {
 }
 
 ui.btnConnect.addEventListener("click", async () => {
+  useViewOutput();
   try {
     const d = await navigator.usb.requestDevice({ filters: [{ vendorId: VID }] });
     setConnected(d);
@@ -2142,6 +2727,7 @@ ui.btnConnect.addEventListener("click", async () => {
 });
 
 ui.btnForget.addEventListener("click", async () => {
+  useViewOutput();
   try {
     if (device && typeof device.forget === "function") await device.forget();
     setDisconnected("Permission revoked.");
@@ -2153,7 +2739,7 @@ ui.btnForget.addEventListener("click", async () => {
 
 ui.btnTest.addEventListener("click", async () => {
   ui.btnTest.disabled = true;
-  useOutput("dump");
+  useViewOutput();
   try {
     await openDevice(dev());
     log("opened; recipient=" + recipient + (claimed ? " (interface 0 claimed)" : " (no claim)"), "l-dim");
@@ -2161,7 +2747,9 @@ ui.btnTest.addEventListener("click", async () => {
     const err = await getErrorCode(dev());
     log("GetOperationMode -> " + (mode === null ? "no data" : hex(mode)) +
       ", GetErrorCode -> " + (err === null ? "no data" : hex(err)), err ? "l-warn" : "l-ok");
-    log("transport works — ready to dump", "l-ok");
+    log(currentView() === "flash"
+      ? "transport works — press \"Read device info\" to see what this camera is running"
+      : "transport works — ready to dump", "l-ok");
   } catch (e) {
     log("test failed: " + (e && e.message ? e.message : String(e)), "l-err");
   } finally {
@@ -2339,10 +2927,1206 @@ if (hasWebUsb) {
   navigator.usb.addEventListener("disconnect", (e) => {
     if (device && e.device === device) {
       setDisconnected("Device disconnected.");
+      useViewOutput();
       log("device disconnected", "l-err");
     }
   });
 }
+
+/* ==================================================================== *
+ * #flash view — read what the camera is running, and write a new image
+ *
+ * Everything here is grounded in the camera's own upgrade FSM and the
+ * first-stage bootloader:
+ *
+ *   BeginFirmwareUpgrade(0)   arms the descriptor at fw_update_slot_address(),
+ *                             i.e. the slot the camera did NOT boot from, with
+ *                             a 64 KiB cap.
+ *   SetFeaturedFirmwareData   appends <= 64 B per call into a RAM staging
+ *                             buffer (EP0Buf is 64 B; longer OUT chunks are
+ *                             silently truncated by the device).
+ *   CompleteMemoryUpgrade(s)  checks sum(staged bytes) & 0xFFFF == s, then
+ *                             decrypts with Key A, re-encrypts with Key B or
+ *                             the per-device key at 0x14000218, erases the
+ *                             64 KiB block, programs, verifies, and rewrites
+ *                             cfg[0] at 0x14010000 to point at that slot.
+ *
+ * The blob that has to be streamed is NOT just the image. Each slot holds
+ * image + 0xff pad + a 64-byte "CODE" footer at
+ * ((header.length>>14)+1)*0x4000 - 0x40, and the bootloader takes the
+ * monolithic boot path only if footer[0]=="CODE" && footer[1]==header.length.
+ * The camera erases the whole block and writes back only what the host sends,
+ * and never writes the footer itself — so a bare-image upload destroys the
+ * footer, the bootloader falls into its segmented loader, and the camera
+ * bricks. buildBankPayload() always emits the full bank.
+ * ==================================================================== */
+
+const FLASH_OPS = new Set([
+  OP.GET_FIRMWARE_INFO, OP.SET_FEATURED_FIRMWARE_DATA, OP.COMPLETE_MEMORY_UPGRADE,
+  OP.SET_FIRMWARE_INFO_FEATURES, OP.SET_RAM_DATA_FEATURES,
+]);
+/* Documents the split, and fails loudly if the two sets ever overlap. */
+for (const op of FLASH_OPS) {
+  if (READ_ONLY_OPS.has(op)) throw new Error("op " + hex(op) + " is in both command sets");
+}
+
+const SLOTS = [
+  { key: "a", name: "Slot A", subcmd: SUBCMD_SLOT_A, address: SLOT_A_BASE },
+  { key: "b", name: "Slot B", subcmd: SUBCMD_SLOT_B, address: SLOT_B_BASE },
+  { key: "r", name: "Recovery", subcmd: SUBCMD_RECOVERY, address: SLOT_RECOVERY_BASE },
+];
+
+/* The whitening constant and acceptance target of this device family. The 2016
+ * Compact Pro generation uses K=0 / target 0 and a different selector map, and
+ * is refused rather than guessed at. */
+const FLASH_K = 0x13579bdf;
+
+let deviceState = null;    /* last successful readDeviceInfo() result */
+let pendingFlash = null;   /* last successfully prepared payload */
+let flashing = false;
+
+/* ---- payload construction ---------------------------------------------- */
+
+/** Total slot payload size for a declared image length: the bootloader derives
+ *  the footer address from header.length the same way. */
+function bankPayloadSize(length) {
+  return (((length >>> 14) + 1) * 0x4000) >>> 0;
+}
+function footerOffsetFor(length) {
+  return bankPayloadSize(length) - FOOTER_SIZE;
+}
+
+/** prng_seed_from_key: state[3]=k0^K, state[0]=k1^K, state[1]=k2^K, state[2]=k3^K.
+ *  The exact inverse of keyFromState(), so the two round-trip. */
+function stateFromKey(key, K) {
+  const dv = new DataView(key.buffer, key.byteOffset, 16);
+  return Uint32Array.of(
+    (dv.getUint32(4, true) ^ K) >>> 0,
+    (dv.getUint32(8, true) ^ K) >>> 0,
+    (dv.getUint32(12, true) ^ K) >>> 0,
+    (dv.getUint32(0, true) ^ K) >>> 0,
+  );
+}
+
+function sameState(a, b) {
+  return a && b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
+}
+
+/** Self-inverse xorshift128 pass over a byte array, header words 128..143
+ *  verbatim. Same code path the dump view's decryption uses. */
+function cryptBytes(bytes, state) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const whole = bytes.length & ~3;
+  const out = new Uint8Array(bytes.length);
+  out.set(decryptImage(dv, 0, whole, Uint32Array.from(state)), 0);
+  if (whole !== bytes.length) out.set(bytes.subarray(whole), whole);   /* tail is never covered */
+  return out;
+}
+
+/** 32-bit little-endian word sum over the first `byteLen` bytes. */
+function wordSum32(bytes, byteLen) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let acc = 0;
+  for (let o = 0; o + 4 <= byteLen; o += 4) acc = (acc + dv.getUint32(o, true)) >>> 0;
+  return acc >>> 0;
+}
+
+/** Device-side transfer checksum: 16-bit sum of every byte of the blob. */
+function transferSum16(bytes) {
+  let s = 0;
+  for (let i = 0; i < bytes.length; i++) s = (s + bytes[i]) & 0xffff;
+  return s;
+}
+
+function parseImageHeader(bytes, base) {
+  base = base || 0;
+  if (bytes.length < base + HDR_OFF + 0x40) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const h = {
+    sp: dv.getUint32(base + 0, true),
+    reset: dv.getUint32(base + 4, true),
+    magic: dv.getUint32(base + HDR_OFF + 0, true),
+    length: dv.getUint32(base + HDR_OFF + 4, true),
+    imageId: dv.getUint32(base + HDR_OFF + 8, true),
+    version: dv.getUint32(base + HDR_OFF + 12, true),
+    entry: dv.getUint32(base + HDR_OFF + 16, true),
+    adjust: dv.getUint32(base + ADJ_OFF, true),
+  };
+  h.versionStr = versionString(h.version);
+  return h;
+}
+
+/** header.version is four bytes, low byte first: 0x00021204 -> "4.18.2.0". */
+function versionString(word) {
+  return [0, 8, 16, 24].map((sh) => (word >>> sh) & 0xff).join(".");
+}
+
+function parseFooter(bytes, offset) {
+  if (offset + FOOTER_SIZE > bytes.length) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return {
+    offset,
+    tag: dv.getUint32(offset, true),
+    length: dv.getUint32(offset + 4, true),
+    imageId: dv.getUint32(offset + 8, true),
+    version: dv.getUint32(offset + 12, true),
+    model: asciiz(bytes.subarray(offset + 16, offset + 16 + 32)),
+    raw: bytes.slice(offset, offset + FOOTER_SIZE),
+  };
+}
+
+function asciiz(bytes) {
+  let s = "";
+  for (const b of bytes) {
+    if (b === 0 || b === 0xff) break;
+    s += b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : ".";
+  }
+  return s;
+}
+
+/** Stamp header.length to the real size, then tune the reserved adjust word at
+ *  0x238 so the 32-bit word sum over header.length bytes == 0x0000FFFF. Both
+ *  fields sit inside the verbatim header window, so they survive encryption in
+ *  clear — which is exactly why the bootloader can read the length before it
+ *  has a key. Returns a new array; the caller's image is untouched. */
+function setAcceptSum(image) {
+  const out = image.slice();
+  const dv = new DataView(out.buffer);
+  if (dv.getUint32(LEN_OFF, true) !== out.length) dv.setUint32(LEN_OFF, out.length >>> 0, true);
+  const length = dv.getUint32(LEN_OFF, true);
+  dv.setUint32(ADJ_OFF, 0, true);
+  const adjust = (ACCEPT_SUM - wordSum32(out, length)) >>> 0;
+  dv.setUint32(ADJ_OFF, adjust, true);
+  return { image: out, length, adjust, sum: wordSum32(out, length) };
+}
+
+/** image + 0xff pad + "CODE" footer, encrypted with Key A. `footerTemplate` is
+ *  the 64-byte footer already on the device: its image_id, version and model
+ *  string are carried over and only footer[1] (length) is patched, so the blob
+ *  differs from a factory bank in exactly the bytes it has to. */
+function buildBankPayload(plain, keyA, footerTemplate) {
+  const { image, length, adjust, sum } = setAcceptSum(plain);
+  if (sum !== ACCEPT_SUM) throw new Error("could not balance the acceptance sum");
+
+  const enc = cryptBytes(image, stateFromKey(keyA, FLASH_K));
+  const total = bankPayloadSize(length);
+  const foff = footerOffsetFor(length);
+  if (foff < length) throw new Error("image of " + hex(length) + " B overruns its footer slot at " + hex(foff));
+  if (total > WINDOW_SIZE) throw new Error("bank payload " + hex(total) + " exceeds the 64 KiB upgrade window");
+
+  const payload = new Uint8Array(total).fill(0xff);
+  payload.set(enc, 0);
+  const footer = footerTemplate ? footerTemplate.slice(0, FOOTER_SIZE) : new Uint8Array(FOOTER_SIZE).fill(0xff);
+  const fdv = new DataView(footer.buffer, footer.byteOffset, FOOTER_SIZE);
+  fdv.setUint32(0, FOOTER_TAG, true);
+  fdv.setUint32(4, length >>> 0, true);
+  payload.set(footer, foff);
+
+  return { payload, image, length, adjust, footerOffset: foff, footer: parseFooter(payload, foff) };
+}
+
+/** Refuse to stream anything whose footer the bootloader would reject. This is
+ *  the guard that stands between a mistake here and a brick. */
+function assertBankPayload(payload) {
+  const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const length = dv.getUint32(LEN_OFF, true);
+  const foff = footerOffsetFor(length);
+  if (foff + FOOTER_SIZE > payload.length) {
+    throw new Error("payload is too short for a footer at " + hex(foff));
+  }
+  if (dv.getUint32(foff, true) !== FOOTER_TAG) {
+    throw new Error("footer at " + hex(foff) + " is not \"CODE\" — the bootloader would fall into its " +
+      "segmented loader and brick the camera");
+  }
+  if (dv.getUint32(foff + 4, true) !== length) {
+    throw new Error("footer length " + hex(dv.getUint32(foff + 4, true)) +
+      " != header.length " + hex(length) + " — the bootloader would reject this slot");
+  }
+}
+
+/* ---- key material ------------------------------------------------------- */
+
+/** Key A and Key B live in the bootloader's .data image, in clear, as
+ *  { g_boot_config_base = 0x14010000, keyA[16], keyB[16] }. The offset moves
+ *  between builds, so the 0x14010000 word is used as the anchor and every hit
+ *  is offered as a candidate; validate() picks the one that actually decrypts
+ *  a slot on this camera. */
+function findKeyCandidates(block) {
+  const dv = new DataView(block.buffer, block.byteOffset, block.byteLength);
+  const out = [];
+  for (let o = 0; o + 36 <= block.length; o += 4) {
+    if (dv.getUint32(o, true) !== BOOT_CONFIG_BASE) continue;
+    /* the other 0x14010000 in flash is the slot-address table, which is
+     * followed by more 0x14xxxxxx words rather than key material */
+    if ((dv.getUint32(o + 4, true) >>> 24) === 0x14) continue;
+    out.push({ offset: o, keyA: block.slice(o + 4, o + 20), keyB: block.slice(o + 20, o + 36) });
+  }
+  return out;
+}
+
+/** Pick the candidate whose Key A or Key B reproduces a state we already
+ *  recovered from a slot by GF(2) solve. That is an exact 128-bit match, so it
+ *  cannot be a coincidence, and it needs no trust in the offset. */
+function pickKeyTable(candidates, slots) {
+  const states = slots.filter((s) => s.recovered).map((s) => s.recovered.state);
+  for (const cand of candidates) {
+    const stateA = stateFromKey(cand.keyA, FLASH_K);
+    const stateB = stateFromKey(cand.keyB, FLASH_K);
+    const matchA = states.some((st) => sameState(st, stateA));
+    const matchB = states.some((st) => sameState(st, stateB));
+    if (matchA || matchB) return { ...cand, matchA, matchB };
+  }
+  return null;
+}
+
+/** prng_seed_keyB_or_device(): a real key programmed at 0x14000218 wins, and an
+ *  all-00 or all-FF slot means "blank", so Key B is used. This is the only other
+ *  key the bootloader will ever try besides Key A. */
+function storeKeyOf(info) {
+  const dk = info.deviceKeySlot;
+  const programmed = !!dk && dk.length === 16 &&
+    !dk.every((b) => b === 0xff) && !dk.every((b) => b === 0);
+  return programmed
+    ? { name: "per-device key", key: dk, programmed: true }
+    : { name: "Key B", key: info.keyTable ? info.keyTable.keyB : null, programmed: false };
+}
+
+/** Which key encrypted this slot, and — separately — whether the BOOTLOADER can
+ *  do anything with it.
+ *
+ *  These are not the same question, and conflating them is misleading. The GF(2)
+ *  solve recovers whatever keystream the slot was written with, so a slot always
+ *  "decrypts" and can pass the acceptance sum under its own key. image_try_keys()
+ *  is narrower: it tries the store key, then Key A, and nothing else. A slot
+ *  written under any third key checksums perfectly and is still dead weight —
+ *  the bootloader has no way to derive that key and skips the slot. */
+function identifyKey(slot, table, store) {
+  if (!slot.recovered) return { name: null, bootable: false };
+  const is = (k) => !!k && sameState(slot.recovered.state, stateFromKey(k, FLASH_K));
+  let name = null;
+  if (table && is(table.keyA)) name = "Key A";
+  else if (table && is(table.keyB)) name = "Key B";
+  else if (store && store.programmed && is(store.key)) name = "per-device key";
+  /* With no store key resolved we cannot say what the bootloader would try, so
+   * only Key A is provably usable. Never guess "bootable" — that is the claim
+   * this whole function exists to stop being made loosely. */
+  const storeName = store ? store.name : null;
+  const bootable = !!(slot.accepts && name && (name === "Key A" || name === storeName));
+  return { name: name || "unknown key", bootable };
+}
+
+/* ---- device reads ------------------------------------------------------- */
+
+/** SetFirmwareInfoFeatures(sel) then GetFirmwareInfo. The handler clears the
+ *  selector after every read, so it has to be set each time. */
+async function readFwInfo(dev, sel, length) {
+  await rpcOut(dev, OP.SET_FIRMWARE_INFO_FEATURES, u16Payload(sel));
+  await sleep(10);
+  const selErr = await getErrorCode(dev);
+  if (selErr) throw new Error("SetFirmwareInfoFeatures(" + sel + ") returned " + hex(selErr));
+  const raw = await rpcIn(dev, OP.GET_FIRMWARE_INFO, length);
+  const readErr = await getErrorCode(dev);
+  if (readErr) throw new Error("GetFirmwareInfo(" + sel + ") returned " + hex(readErr));
+  return raw;
+}
+
+/** Never throws — every one of these is a nice-to-have, and a camera running
+ *  older or reconstructed firmware may stall on any single selector. */
+async function tryFwInfo(dev, sel, length, label) {
+  try {
+    return await readFwInfo(dev, sel, length);
+  } catch (e) {
+    log("  " + label + ": unavailable (" + (e && e.message ? e.message : String(e)) + ")", "l-dim");
+    return null;
+  }
+}
+
+async function readSerial(dev) {
+  try {
+    const payload = new Uint8Array(6);
+    new DataView(payload.buffer).setUint16(0, 0, true);      /* case 0: device-id block */
+    new DataView(payload.buffer).setUint16(2, 124, true);
+    await rpcOut(dev, OP.SET_RAM_DATA_FEATURES, payload);
+    await sleep(10);
+    const err = await getErrorCode(dev);
+    if (err) throw new Error("returned " + hex(err));
+    const block = await readArmed(dev, DEFAULT_READ_CHUNK, 248);
+    if (block.length < 28) throw new Error("short read (" + block.length + " B)");
+    return asciiz(block.subarray(16, 28));
+  } catch (e) {
+    log("  serial: unavailable (" + (e && e.message ? e.message : String(e)) + ")", "l-dim");
+    return null;
+  }
+}
+
+/** Read one slot: enough for the header, then out to the end of its bank so the
+ *  "CODE" footer comes along too. Reads are sequential from the armed window,
+ *  so this is a single arm and two continuing reads. */
+async function readSlot(dev, slot, chunk, onChunk) {
+  await armWindow(dev, slot);
+  const head = await readArmed(dev, chunk, HDR_OFF + 0x40, onChunk);
+  if (head.length < HDR_OFF + 0x40) {
+    return { ...slot, present: false, reason: "short read (" + head.length + " B)" };
+  }
+  const header = parseImageHeader(head);
+  if (header.magic !== IMG_MAGIC) {
+    return { ...slot, present: false, header, reason: "no image header (magic " + hexUp(header.magic) + ")" };
+  }
+  if (header.length < HDR_OFF || header.length >= TRY_KEYS_MAX_LEN || (header.length & 3)) {
+    return { ...slot, present: false, header, reason: "header.length " + hexUp(header.length) + " is out of range" };
+  }
+
+  const total = bankPayloadSize(header.length);
+  const rest = await readArmed(dev, chunk, total - head.length, onChunk);
+  const raw = new Uint8Array(head.length + rest.length);
+  raw.set(head, 0);
+  raw.set(rest, head.length);
+  if (raw.length < total) {
+    return { ...slot, present: false, header, reason: "bank read stopped at " + raw.length + "/" + total + " B" };
+  }
+  return { ...slot, present: true, header, raw, footer: parseFooter(raw, footerOffsetFor(header.length)) };
+}
+
+/** Recover the slot's keystream state from its own ciphertext (the dump view's
+ *  GF(2) solve), decrypt it, and check the bootloader's acceptance sum. */
+async function analyseSlot(slot) {
+  if (!slot.present) return slot;
+  const dv = new DataView(slot.raw.buffer, slot.raw.byteOffset, slot.raw.byteLength);
+  const recovered = recoverKeyInfo(dv, 0, slot.header.length);
+  const plain = decryptImage(dv, 0, slot.header.length, Uint32Array.from(recovered.state));
+  const plainHeader = parseImageHeader(plain);
+  return {
+    ...slot,
+    recovered,
+    plain,
+    plainHeader,
+    accepts: recovered.checksum === ACCEPT_SUM,
+    footerOk: !!slot.footer && slot.footer.tag === FOOTER_TAG && slot.footer.length === slot.header.length,
+    sha256: await sha256hex(plain),
+  };
+}
+
+/** Replays the bootloader's select_boot_slot() over what we just read, so the
+ *  page can name the slot the camera booted from and the one an upgrade would
+ *  therefore overwrite. */
+function predictBoot(cfg0, byKey) {
+  /* bootable, NOT accepts: a slot the bootloader cannot key is skipped even
+   * though it decrypts perfectly under the key it was written with. */
+  const ok = (k) => !!(byKey[k] && byKey[k].bootable);
+  const explicit = cfg0 !== 0 && cfg0 !== 0xffffffff;
+  let booted;
+  if (!explicit) booted = ok("a") ? "a" : ok("b") ? "b" : "r";
+  else if (cfg0 === 1) booted = ok("b") ? "b" : ok("a") ? "a" : "r";
+  else booted = ok("r") ? "r" : ok("a") ? "a" : "b";
+  /* fw_update_slot_address(): booted A -> write B, otherwise write A */
+  return { booted, target: booted === "a" ? "b" : "a" };
+}
+
+/** Arm the selector an upgrade uses and read its first bytes back, then see
+ *  which slot those bytes came from. This is a plain read — the write only ever
+ *  happens at CompleteMemoryUpgrade — and it turns "which slot would be written"
+ *  from an inference into an observation. Returns null when it cannot tell,
+ *  which is the normal case on a camera whose slots hold identical images. */
+async function confirmUpgradeTarget(dev, chunk, byKey) {
+  const probeLen = HDR_OFF + 0x40;
+  let head;
+  try {
+    await armWindow(dev, { subcmd: SUBCMD_UPDATE_TARGET, address: null });
+    head = await readArmed(dev, chunk, probeLen);
+  } catch (e) {
+    log("  could not probe the upgrade window: " + (e && e.message ? e.message : String(e)), "l-dim");
+    return null;
+  }
+  if (head.length < probeLen) return null;
+  const matches = ["a", "b"].filter((k) => {
+    const s = byKey[k];
+    if (!s || !s.raw || s.raw.length < probeLen) return false;
+    for (let i = 0; i < probeLen; i++) if (s.raw[i] !== head[i]) return false;
+    return true;
+  });
+  if (matches.length !== 1) {
+    log("  selector 0's window matches " + (matches.length ? "both slots" : "neither slot") +
+      " — the slots are identical, so the target cannot be read off the wire", "l-dim");
+    return null;
+  }
+  return matches[0];
+}
+
+async function readDeviceInfo() {
+  const chunk = readOptions().chunk;
+  const d = dev();
+  const info = { readAt: new Date().toISOString() };
+
+  log(describeDevice(device), "l-dim");
+  log("");
+
+  log("firmware info selectors ...", "l-dim");
+  const build = await tryFwInfo(d, 0, 36, "build info");
+  if (build && build.length >= 4) {
+    info.version = [build[0], build[1], build[2], build[3]].join(".");
+    info.buildString = asciiz(build.subarray(4));
+  }
+  const boot = await tryFwInfo(d, 1, 36, "bootloader info");
+  if (boot && boot.length >= 4) {
+    info.bootloaderVersion = [boot[0], boot[1], boot[2], boot[3]].join(".");
+    info.bootloaderString = asciiz(boot.subarray(4));
+  }
+  const platform = await tryFwInfo(d, 20, 64, "platform string");
+  if (platform) info.platform = asciiz(platform);
+  const speed = await tryFwInfo(d, 17, 2, "USB port speed");
+  if (speed && speed.length >= 2) {
+    const bits = new DataView(speed.buffer, speed.byteOffset, speed.byteLength).getUint16(0, true);
+    info.usbSpeed = bits === 2 ? "high (480 Mbit/s)" : bits === 0 ? "full (12 Mbit/s)" : "code " + bits;
+  }
+  const roots = await tryFwInfo(d, 10, 64, "firmware info roots");
+  if (roots && roots.length >= 12) {
+    info.activeSlotWord = new DataView(roots.buffer, roots.byteOffset, roots.byteLength).getUint32(8, true);
+  }
+  info.serial = await readSerial(d);
+  if (info.version) log("  running firmware " + info.version + (info.buildString ? "  " + info.buildString : ""), "l-ok");
+  if (info.bootloaderString) log("  bootloader " + info.bootloaderString, "l-dim");
+  if (info.serial) log("  serial " + info.serial, "l-dim");
+
+  log("");
+  log("boot config at " + hex(BOOT_CONFIG_BASE, 8) + " ...", "l-dim");
+  await armWindow(d, { subcmd: SUBCMD_BOOT_CONFIG, address: BOOT_CONFIG_BASE });
+  const cfg = await readArmed(d, chunk, 0x120);
+  if (cfg.length >= 16) {
+    const cdv = new DataView(cfg.buffer, cfg.byteOffset, cfg.byteLength);
+    info.cfg0 = cdv.getUint32(0, true);
+    info.cfgSlots = [1, 2, 3].map((i) => cdv.getUint32(i * 4, true));
+    log("  cfg[0] = " + hexUp(info.cfg0) + " — " + describeCfg0(info.cfg0), "l-dim");
+  }
+
+  log("");
+  log("bootloader block at " + hex(FLASH_BASE, 8) + " (key material) ...", "l-dim");
+  await armWindow(d, { subcmd: SUBCMD_BOOTLOADER, address: FLASH_BASE });
+  const bootBlock = await readArmed(d, chunk, 0x8000);
+  info.deviceKeySlot = bootBlock.length >= 0x228 ? bootBlock.slice(0x218, 0x228) : null;
+  const candidates = findKeyCandidates(bootBlock);
+  log("  " + candidates.length + " key-table candidate(s)", "l-dim");
+
+  log("");
+  const slots = [];
+  const budget = SLOTS.length * WINDOW_SIZE;   /* upper bound; slots are usually 0xc000 each */
+  let done = 0;
+  for (const slot of SLOTS) {
+    setProgress(done, budget, "Reading " + slot.name + " ...");
+    log("reading " + slot.name + " at " + hex(slot.address, 8) + " ...", "l-dim");
+    const read = await readSlot(d, slot, chunk, (n) => { done += n; setProgress(done, budget); });
+    slots.push(await analyseSlot(read));
+  }
+  setProgress(1, 1, "Analysing ...");
+
+  info.keyTable = pickKeyTable(candidates, slots);
+  if (info.keyTable) {
+    log("");
+    log("key table at dump offset " + hexUp(info.keyTable.offset, 6) +
+      " — confirmed against a slot's recovered keystream state", "l-ok");
+    log("  Key A " + bytesToHex(info.keyTable.keyA), "l-dim");
+    log("  Key B " + bytesToHex(info.keyTable.keyB), "l-dim");
+  } else {
+    log("");
+    log("could not confirm this camera's key table — flashing is disabled", "l-err");
+  }
+
+  const store = storeKeyOf(info);
+  info.storeKey = store;
+  const byKey = {};
+  for (const s of slots) {
+    byKey[s.key] = s;
+    const id = identifyKey(s, info.keyTable, store);
+    s.keyName = id.name;
+    s.bootable = id.bootable && s.footerOk;
+    if (!s.present) {
+      log(s.name + ": " + s.reason, "l-warn");
+    } else {
+      log(s.name + ": firmware " + s.plainHeader.versionStr +
+        ", " + s.header.length + " B, " + s.keyName +
+        ", acceptance " + (s.accepts ? "ok" : "FAILS") +
+        ", footer " + (s.footerOk ? "ok" : "BAD") +
+        " -> " + (s.bootable ? "bootable" : "NOT bootable"),
+        s.bootable ? "l-ok" : "l-warn");
+      if (s.accepts && s.footerOk && !id.bootable) {
+        log("    it decrypts and checksums under its own key, but the bootloader only tries " +
+          store.name + " and Key A — so it will be skipped at boot", "l-err");
+      }
+    }
+  }
+  info.slots = slots;
+  info.byKey = byKey;
+
+  if (info.cfg0 != null) {
+    info.boot = predictBoot(info.cfg0, byKey);
+    log("");
+    log("boot config replay: booted " + byKey[info.boot.booted].name +
+      ", so an upgrade would write " + byKey[info.boot.target].name, "l-dim");
+
+    /* The replay above is inference. These two are the camera's own answer:
+     * active_slot is the word fw_update_slot_address() reads, and selector 0
+     * arms the very window a write would land in — so reading it back and
+     * matching it against the slots names the target from evidence. */
+    if (info.activeSlotWord != null) {
+      const fromDevice = info.activeSlotWord === 0 ? "b" : "a";
+      if (fromDevice !== info.boot.target) {
+        log("  the camera's active-slot word says " + byKey[fromDevice].name +
+          " instead — trusting the camera", "l-warn");
+        info.boot.target = fromDevice;
+      }
+    }
+    info.targetConfirmed = await confirmUpgradeTarget(d, chunk, byKey);
+    if (info.targetConfirmed) {
+      if (info.targetConfirmed !== info.boot.target) {
+        log("  the window selector 0 arms is " + byKey[info.targetConfirmed].name +
+          " — trusting that over the boot-config replay", "l-warn");
+        info.boot.target = info.targetConfirmed;
+      }
+    }
+
+    const targetSlot = byKey[info.boot.target];
+    log("an upgrade writes " + targetSlot.name + " at " + hex(targetSlot.address, 8) +
+      (info.targetConfirmed ? " (confirmed by reading the window selector 0 arms)" : ""), "l-dim");
+  }
+
+  /* The 2016 Compact Pro generation uses K=0 / acceptance sum 0 and a different
+   * BeginFirmwareUpgrade map. Nothing here is valid for it. */
+  info.familyOk = slots.some((s) => s.accepts);
+  if (!info.familyOk) {
+    log("");
+    log("no slot on this camera decrypts to the " + hexUp(ACCEPT_SUM) +
+      " acceptance sum this view expects — it is probably the 2016 generation. Flashing is disabled.",
+      "l-err");
+  }
+
+  info.canFlash = !!(info.keyTable && info.familyOk && info.boot);
+  deviceState = info;
+  renderDeviceInfo(info);
+  setProgress(1, 1, info.canFlash
+    ? "Read. " + slots.filter((s) => s.present).length + "/" + SLOTS.length + " slots readable."
+    : "Read, but this camera cannot be flashed from here — see the log.");
+  refreshFlashButton();
+}
+
+function describeCfg0(cfg0) {
+  if (cfg0 === 0 || cfg0 === 0xffffffff) return "blank/0: prefer slot A, then B, then recovery";
+  if (cfg0 === 1) return "prefer slot B, then A, then recovery";
+  return "prefer recovery, then A, then B";
+}
+
+/* ---- rendering ---------------------------------------------------------- */
+
+function esc(s) {
+  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+function kv(pairs) {
+  return "<dl class=\"kv\">" + pairs
+    .filter(([, v]) => v != null && v !== "")
+    .map(([k, v]) => "<dt>" + esc(k) + "</dt><dd>" + esc(v) + "</dd>")
+    .join("") + "</dl>";
+}
+
+function renderDeviceInfo(info) {
+  const parts = [];
+
+  parts.push("<div class=\"fwbox\"><h3>Running firmware</h3>" + kv([
+    ["Version", info.version],
+    ["Build", info.buildString],
+    ["Bootloader", info.bootloaderString
+      ? info.bootloaderString + (info.bootloaderVersion ? "  (" + info.bootloaderVersion + ")" : "")
+      : info.bootloaderVersion],
+    ["Platform", info.platform],
+    ["Serial", info.serial],
+    ["USB link", info.usbSpeed],
+    ["Boot config", info.cfg0 == null ? null : hexUp(info.cfg0) + " — " + describeCfg0(info.cfg0)],
+    ["Booted from", info.boot ? info.byKey[info.boot.booted].name : null],
+    ["Upgrade target", info.boot ? info.byKey[info.boot.target].name + " at " + hexUp(info.byKey[info.boot.target].address) : null],
+    ["Per-device key", info.deviceKeySlot
+      ? (info.deviceKeySlot.every((b) => b === 0xff) || info.deviceKeySlot.every((b) => b === 0)
+        ? "not programmed — the camera falls back to Key B"
+        : bytesToHex(info.deviceKeySlot))
+      : null],
+  ]) + "</div>");
+
+  if (info.keyTable) {
+    parts.push("<div class=\"fwbox\"><h3>Keys read from this camera</h3>" + kv([
+      ["Found at", "flash offset " + hexUp(info.keyTable.offset, 6)],
+      ["Key A", bytesToHex(info.keyTable.keyA)],
+      ["Key B", bytesToHex(info.keyTable.keyB)],
+    ]) + "<p class=\"note\" style=\"margin-bottom:0\">Confirmed by matching a slot's keystream state, " +
+      "recovered from the ciphertext itself. Key&nbsp;A is what an upload has to be encrypted with.</p></div>");
+  }
+
+  const rows = info.slots.map((s) => {
+    const cells = [
+      "<strong>" + esc(s.name) + "</strong><br><span class=\"mono note\">" + hexUp(s.address) + "</span>",
+    ];
+    if (!s.present) {
+      cells.push("<span class=\"l-warn\">" + esc(s.reason || "not readable") + "</span>", "", "", "");
+    } else {
+      const verdict = s.bootable
+        ? "<span class=\"l-ok\">the bootloader can boot this</span>"
+        : !s.accepts
+          ? "<span class=\"l-err\">fails the acceptance sum (" + hexUp(s.recovered.checksum) + ")</span>"
+          : !s.footerOk
+            ? "<span class=\"l-err\">no valid CODE footer</span>"
+            : "<span class=\"l-err\">key unknown to the bootloader &mdash; skipped at boot</span>";
+      cells.push(
+        esc(s.plainHeader.versionStr) + "<br><span class=\"note\">image " + hexUp(s.header.imageId) + "</span>",
+        s.header.length + " B<br><span class=\"note\">" + esc(s.footer && s.footer.model ? s.footer.model : "") + "</span>",
+        esc(s.keyName || "unknown") + "<br>" + verdict,
+        "<span class=\"mono note\">" + esc(s.sha256.slice(0, 16)) + "&hellip;</span>",
+      );
+    }
+    return "<tr>" + cells.map((c) => "<td>" + c + "</td>").join("") + "</tr>";
+  });
+
+  parts.push("<div class=\"fwbox\"><h3>Firmware slots</h3><div class=\"tablewrap\"><table>" +
+    "<thead><tr><th>Slot</th><th>Version</th><th>Size</th><th>Encryption</th><th>SHA-256 of plaintext</th></tr></thead>" +
+    "<tbody>" + rows.join("") + "</tbody></table></div>" +
+    "<p class=\"note\">Each slot was decrypted in the browser by solving for its keystream from its own " +
+    "known-zero reset vectors. Decrypting is not the same as booting: the bootloader only ever tries " +
+    esc(info.storeKey.name) + " and Key A, so a slot written under any other key checksums perfectly and " +
+    "is still skipped. Nothing was written.</p>" + renderBootWarning(info) + "</div>");
+
+  ui.fwInfo.innerHTML = parts.join("");
+  ui.fwInfo.classList.remove("hidden");
+}
+
+/** The state this camera is in when its application re-encrypts with a key the
+ *  bootloader does not have: every USB upgrade then lands a slot that is skipped
+ *  at boot, and the camera silently keeps running whatever else is bootable. */
+function renderBootWarning(info) {
+  const orphans = info.slots.filter((s) => s.present && s.accepts && s.footerOk && !s.bootable);
+  if (!orphans.length) return "";
+  const target = info.boot ? info.byKey[info.boot.target] : null;
+  const targetHit = target && orphans.indexOf(target) >= 0;
+  return "<div class=\"banner err\" style=\"margin:.9rem 0 0\">" +
+    "<p><strong>" + orphans.map((s) => esc(s.name)).join(" and ") +
+    (orphans.length > 1 ? " hold" : " holds") + " a valid firmware image encrypted with a key this " +
+    "camera's bootloader does not know.</strong> The image is intact and its checksum is correct, but " +
+    "<code>image_try_keys()</code> only tries " + esc(info.storeKey.name) + " and Key A, so the " +
+    "bootloader skips " + (orphans.length > 1 ? "them" : "it") + " and boots something else.</p>" +
+    (targetHit
+      ? "<p>That is the slot an upgrade writes. The application running on this camera re-encrypts " +
+        "with that unknown key, so <strong>flashing through this page will produce another slot the " +
+        "bootloader cannot boot</strong> &mdash; the camera will carry on running " +
+        (info.boot ? esc(info.byKey[info.boot.booted].name) : "the other slot") + ". Writing the slot " +
+        "directly with an SPI programmer or over SWD/J-Link is the way round it.</p>"
+      : "") + "</div>";
+}
+
+function renderFlashPreview(prep) {
+  const target = deviceState.byKey[deviceState.boot.target];
+  const risk = prep.rekeyRisk
+    ? "<div class=\"banner err\" style=\"margin:0 0 .9rem\"><p><strong>This write will not be booted.</strong> " +
+      esc(prep.targetName) + " already holds a valid image encrypted with a key this camera's bootloader " +
+      "does not know, which means the running application re-encrypts with that key. Your image will be " +
+      "stored the same way and skipped at boot, and the camera will carry on running " +
+      esc(prep.bootedName || "the other slot") + ".</p><p>Nothing here is damaged by trying &mdash; but to " +
+      "actually change what this camera runs you need an SPI programmer or SWD/J-Link.</p></div>"
+    : "";
+  const html = "<div class=\"fwbox\"><h3>Ready to write</h3>" + risk + kv([
+    ["Source file", prep.fileName + " — " + prep.originalSize + " B"],
+    ["Target", target.name + " at " + hexUp(target.address) + " (the slot the camera is not running)"],
+    ["Firmware version", prep.header.versionStr + "  image " + hexUp(prep.header.imageId)],
+    ["Initial SP / entry", hexUp(prep.header.sp) + " / " + hexUp(prep.header.entry)],
+    ["header.length", hexUp(prep.length) + (prep.lengthStamped ? "  (stamped — was " + hexUp(prep.declaredBefore) + ")" : "  (already correct)")],
+    ["Adjust word @0x238", hexUp(prep.adjust) + "  → acceptance sum " + hexUp(ACCEPT_SUM)],
+    ["Embedded key table", prep.keyPatch
+      ? (prep.keyPatch.changed
+          ? "retargeted at " + prep.keyPatch.where + ": " + prep.keyPatch.fromA.slice(0, 8) +
+            "\u2026/" + prep.keyPatch.fromB.slice(0, 8) + "\u2026 \u2192 this camera's " +
+            prep.keyPatch.toA.slice(0, 8) + "\u2026/" + prep.keyPatch.toB.slice(0, 8) + "\u2026"
+          : "already this camera's keys, at " + prep.keyPatch.where + " \u2014 left alone")
+      : (prep.carriesMine
+          ? "this camera's keys, found in the image \u2014 nothing to change"
+          : "not found in this image")],
+    ["Encrypted with", "Key A " + bytesToHex(prep.keyA)],
+    ["CODE footer", "at " + hexUp(prep.footerOffset) + ", length " + hexUp(prep.footer.length) +
+      (prep.footer.model ? ", model " + prep.footer.model : "") + (prep.footerFrom ? " (carried over from " + prep.footerFrom + ")" : " (synthesised)")],
+    ["Bank payload", prep.payload.length + " B = image + " + (prep.footerOffset - prep.length) + " B of 0xff + 64 B footer"],
+    ["Transfer checksum", hexUp(prep.sum16, 4)],
+    ["Payload SHA-256", prep.sha256],
+  ]) + renderKeyNote(prep) + renderComparison(prep) + "<p class=\"note\">First 64 bytes of the payload:</p>" +
+    "<pre class=\"block\">" + esc(hexDumpLines(prep.payload.subarray(0, 64))) + "</pre>" +
+    "<p class=\"note\" style=\"margin-bottom:0\">Nothing has been sent to the camera yet. " +
+    "<strong>Write to camera</strong> streams this payload and commits it.</p></div>";
+  ui.flashPreview.innerHTML = html;
+  ui.flashPreview.classList.remove("hidden");
+}
+
+/** How the chosen image differs from the one the camera is running. Advisory
+ *  only: every field here legitimately changes across builds. It exists because
+ *  picking the wrong decrypted file looks identical to picking the right one. */
+/** What the image will use for its own upgrades once it is running. */
+function renderKeyNote(prep) {
+  if (prep.keyPatch && prep.keyPatch.changed) {
+    return "<p class=\"note l-ok\" style=\"margin:.9rem 0 0\">The key table at " +
+      prep.keyPatch.where + " was rewritten to this camera's Key&nbsp;A and Key&nbsp;B, so once " +
+      "this image runs it will encrypt its own upgrades with keys this bootloader can read. The " +
+      "acceptance sum below is balanced over the patched image.</p>";
+  }
+  if (prep.keyPatch || prep.carriesMine) return "";
+  return "<p class=\"note l-warn\" style=\"margin:.9rem 0 0\"><strong>This image does not contain this " +
+    "camera's key pair.</strong> Either it belongs to a different key family, or it derives its key at " +
+    "runtime. It may still boot, but once it runs its upgrades will be encrypted with whatever keys it " +
+    "does carry &mdash; and if those are not this bootloader's, later flashes will land in slots that " +
+    "cannot be booted. Re-dump the image from a camera in this key family to get a filename carrying its " +
+    "keys, and this page will retarget them for you.</p>";
+}
+
+function renderComparison(prep) {
+  if (!prep.compare) return "";
+  if (!prep.compare.length) {
+    return "<p class=\"note l-ok\" style=\"margin:.9rem 0 0\">Header matches the firmware the camera " +
+      "is running now (" + esc(prep.runningSlot) + ") in every field &mdash; version, image id, stack " +
+      "pointer, reset vector and size.</p>";
+  }
+  const rows = prep.compare.map(([field, now, mine]) =>
+    "<tr><td>" + esc(field) + "</td><td class=\"mono\">" + esc(now) + "</td><td class=\"mono\">" +
+    esc(mine) + "</td></tr>").join("");
+  return "<p class=\"note\" style=\"margin:.9rem 0 .3rem\"><strong>This image is not what the camera " +
+    "is running.</strong> Expected if you meant to change firmware &mdash; worth a second look if you " +
+    "did not.</p><div class=\"tablewrap\"><table><thead><tr><th>Field</th>" +
+    "<th>On the camera now (" + esc(prep.runningSlot) + ")</th><th>Your image</th></tr></thead>" +
+    "<tbody>" + rows + "</tbody></table></div>" +
+    (prep.layoutMoved
+      ? "<p class=\"note l-warn\" style=\"margin:.3rem 0 0\">The stack pointer or reset vector moved. " +
+        "Those come from the image's own vector table, so this is a differently linked build &mdash; " +
+        "make sure it is a build for this camera.</p>"
+      : "");
+}
+
+function hexDumpLines(bytes) {
+  const lines = [];
+  for (let o = 0; o < bytes.length; o += 16) {
+    const row = bytes.subarray(o, Math.min(o + 16, bytes.length));
+    lines.push(o.toString(16).padStart(4, "0") + "  " +
+      Array.from(row).map((b) => b.toString(16).padStart(2, "0")).join(" "));
+  }
+  return lines.join("\n");
+}
+
+/* ---- prepare / write ---------------------------------------------------- */
+
+function prepareImage(bytes, fileName) {
+  if (!deviceState || !deviceState.canFlash) {
+    throw new Error("read the device info first — the camera's Key A and target slot come from it");
+  }
+  if (bytes.length < HDR_OFF + 0x40) throw new Error("file is too small to hold an image header");
+  if (bytes.length & 3) throw new Error("image size must be a multiple of 4 (got " + bytes.length + " B)");
+  if (bytes.length >= TRY_KEYS_MAX_LEN) {
+    throw new Error("image is " + bytes.length + " B; the bootloader rejects any header.length >= " +
+      hexUp(TRY_KEYS_MAX_LEN) + ", so it would never boot");
+  }
+
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const magic = dv.getUint32(HDR_OFF, true);
+  if (magic !== IMG_MAGIC) {
+    throw new Error("no image header at " + hexUp(HDR_OFF) + " (magic " + hexUp(magic) + ", expected " +
+      hexUp(IMG_MAGIC) + ") — this must be a decrypted Seek firmware image, not an encrypted slot or a flash dump");
+  }
+
+  const sp = dv.getUint32(0, true), entry = dv.getUint32(4, true);
+  if ((sp >>> 24) !== 0x10 && (sp >>> 24) !== 0x20) {
+    throw new Error("initial stack pointer " + hexUp(sp) + " is not in LPC43xx SRAM — this does not look decrypted");
+  }
+  if (sp & 3) throw new Error("initial stack pointer " + hexUp(sp) + " is not word-aligned");
+  if (!(entry & 1)) throw new Error("reset vector " + hexUp(entry) + " is not a Thumb address");
+
+  const declaredBefore = dv.getUint32(LEN_OFF, true);
+  const target = deviceState.byKey[deviceState.boot.target];
+  const myKeyA = deviceState.keyTable.keyA, myKeyB = deviceState.keyTable.keyB;
+
+  /* ---- retarget the image's own key table to this camera -------------------
+   * The keys inside the image are the ones it will use once it runs. If they
+   * belong to the camera it was dumped from rather than this one, every later
+   * upgrade lands under a key this bootloader cannot try. The dump view puts
+   * the source keys in the filename precisely so they can be found and
+   * replaced here. */
+  let keyPatch = null;
+  const named = KEY_SUFFIX_RE.exec(fileName || "");
+  if (!named) {
+    /* Without the keys in the name there is no way to tell whether this image
+     * embeds a table for this camera, for another one, or none at all — and the
+     * wrong pair silently stops the camera taking any future update. Refusing is
+     * the only answer that cannot be wrong. */
+    const mine = findEmbeddedKeyTable(bytes, myKeyA, myKeyB);
+    throw new Error("this file's name does not carry its key pair. " +
+      (mine
+        ? "The image does contain this camera's keys, at " + keyTableWhere(mine) + " — rename the file " +
+          "to end with \"" + keyFilenameSuffix(myKeyA, myKeyB) + ".bin\" to say so deliberately."
+        : "The image does not contain this camera's key pair either, so it carries another camera's " +
+          "keys or none at all. Re-dump it with this page — decrypted files come out named with the " +
+          "keys they actually contain."));
+  }
+  {
+    const srcA = hexToBytes(named[1].toLowerCase()), srcB = hexToBytes(named[2].toLowerCase());
+    const at = findEmbeddedKeyTable(bytes, srcA, srcB);
+    if (!at) {
+      throw new Error("the filename claims Key A " + named[1].toLowerCase() + " and Key B " +
+        named[2].toLowerCase() + ", but " + describeKeyTableMismatch(bytes, srcA, srcB) +
+        ". Both keys must be present, exactly once each — this file has been renamed, edited, or is " +
+        "not the one those keys came from");
+    }
+    for (const off of [at.offsetA, at.offsetB]) {
+      if (off < HDR_OFF + 0x40 && off + 16 > HDR_OFF) {
+        throw new Error("this image keeps a key at " + hexUp(off) + ", inside the cleartext header " +
+          "window — refusing to patch it");
+      }
+    }
+    const alreadyMine = countOccurrences(srcA, myKeyA).length === 1 && countOccurrences(srcB, myKeyB).length === 1;
+    keyPatch = {
+      offsetA: at.offsetA, offsetB: at.offsetB, adjacent: at.adjacent, where: keyTableWhere(at),
+      fromA: bytesToHex(srcA), fromB: bytesToHex(srcB),
+      toA: bytesToHex(myKeyA), toB: bytesToHex(myKeyB),
+      changed: !alreadyMine,
+    };
+    if (!alreadyMine) {
+      bytes = bytes.slice();
+      bytes.set(myKeyA, at.offsetA);
+      bytes.set(myKeyB, at.offsetB);
+    }
+  }
+
+  const carriesMine = !!findEmbeddedKeyTable(bytes, myKeyA, myKeyB);
+
+  /* Carry over a footer that is already on this camera: its image_id, version
+   * and model string stay whatever the camera shipped with, and only footer[1]
+   * gets patched. Prefer the target slot's own; fall back to any valid one. */
+  const hasFooter = (s) => s && s.footer && s.footer.tag === FOOTER_TAG;
+  const source = hasFooter(target) ? target : deviceState.slots.find(hasFooter);
+  const templateBytes = source ? source.footer.raw : null;
+  const footerFrom = source ? source.name : null;
+
+  const keyA = myKeyA;
+  const built = buildBankPayload(bytes, keyA, templateBytes);
+  assertBankPayload(built.payload);
+
+  /* Nothing here is blocking — a deliberate upgrade or downgrade changes all of
+   * these. It is here because picking the wrong decrypted file looks exactly
+   * like picking the right one, and the camera cannot tell you afterwards. */
+  const mine = parseImageHeader(built.image);
+  const running = deviceState.byKey[deviceState.boot.booted];
+  const now = running && running.plainHeader;
+  const compare = now ? [
+    ["Firmware version", now.versionStr, mine.versionStr],
+    ["Image id", hexUp(now.imageId), hexUp(mine.imageId)],
+    ["Initial SP", hexUp(now.sp), hexUp(mine.sp)],
+    ["Reset vector", hexUp(now.entry), hexUp(mine.entry)],
+    ["Size", now.length + " B", built.length + " B"],
+  ].filter(([, a, b]) => a !== b) : [];
+  const layoutMoved = now && (now.sp !== mine.sp || now.entry !== mine.entry);
+
+  /* If the slot an upgrade writes already holds a valid image under a key the
+   * bootloader cannot use, the application demonstrably re-encrypts with that
+   * key — so this write will land in the same unbootable state. */
+  const rekeyRisk = !!(target && target.present && target.accepts && target.footerOk && !target.bootable);
+
+  return {
+    compare,
+    layoutMoved,
+    keyPatch,
+    carriesMine,
+    rekeyRisk,
+    targetName: target ? target.name : null,
+    bootedName: running ? running.name : null,
+    runningSlot: running ? running.name : null,
+    fileName,
+    originalSize: bytes.length,
+    declaredBefore,
+    lengthStamped: declaredBefore !== bytes.length,
+    length: built.length,
+    adjust: built.adjust,
+    header: parseImageHeader(built.image),
+    keyA,
+    payload: built.payload,
+    footerOffset: built.footerOffset,
+    footer: built.footer,
+    footerFrom,
+    sum16: transferSum16(built.payload),
+  };
+}
+
+async function writeFirmware(prep) {
+  const d = dev();
+  if (!d.opened) await openDevice(d);        /* anything upstream may have closed it */
+  /* The analysis can go stale between preparing and writing — a disconnect
+   * during the rescue dump drops it — and a payload is only valid for the
+   * camera whose Key A built it. */
+  if (!deviceState || !deviceState.canFlash) {
+    throw new Error("the device analysis went stale before the write — read the device info again " +
+      "and re-pick your image. Nothing was written.");
+  }
+  assertBankPayload(prep.payload);            /* last gate before anything is sent */
+
+  const target = deviceState.byKey[deviceState.boot.target];
+  log("target: " + target.name + " at " + hex(target.address, 8) +
+    " (selector 0 — the camera resolves this itself)", "l-dim");
+
+  await armWindow(d, { subcmd: SUBCMD_UPDATE_TARGET, address: target.address });
+  log("upgrade window armed", "l-ok");
+
+  const total = prep.payload.length;
+  const t0 = performance.now();
+
+  /* Both staging failures the firmware can report are sticky — the "not armed"
+   * one because nothing re-arms it, the overflow one because it clears e8 and
+   * every later chunk then reports not-armed — so a single check at the end
+   * cannot miss one. Polling every 4 KiB just stops the stream near the fault
+   * instead of pushing the rest of the payload at a disarmed descriptor. */
+  const abort = (err, off) => {
+    throw new Error("the camera reported " + hex(err) + " while staging at offset " + hex(off) +
+      " — aborted before CompleteMemoryUpgrade, so nothing was written to flash");
+  };
+
+  for (let off = 0; off < total; off += EP0_BUF) {
+    if (cancelRequested) throw new Error("cancelled before commit — nothing was written to flash");
+    const end = Math.min(off + EP0_BUF, total);
+    await rpcOut(d, OP.SET_FEATURED_FIRMWARE_DATA, prep.payload.subarray(off, end));
+    if ((end & 0xfff) === 0 && end !== total) {
+      const err = await getErrorCode(d);
+      if (err) abort(err, end);
+    }
+    if ((off & 0x7ff) === 0 || end === total) {
+      const kbs = end / 1024 / Math.max(0.001, (performance.now() - t0) / 1000);
+      setProgress(end, total, "Streaming " + end + "/" + total + " B (" + kbs.toFixed(1) + " KiB/s) ...");
+    }
+  }
+  setProgress(total, total, "Streamed " + total + " B.");
+  log("streamed " + total + " B in " + ((performance.now() - t0) / 1000).toFixed(1) + " s", "l-ok");
+
+  const streamErr = await getErrorCode(d);
+  if (streamErr) abort(streamErr, total);
+
+  log("committing: CompleteMemoryUpgrade(" + hexUp(prep.sum16, 4) + ") ...", "l-warn");
+  await rpcOut(d, OP.COMPLETE_MEMORY_UPGRADE, u16Payload(prep.sum16), USB_COMMIT_TIMEOUT_MS);
+  await sleep(200);                            /* erase + program + verify runs inside this call */
+  const commitErr = await getErrorCode(d);
+  if (commitErr === ERR_BAD_CHECKSUM) {
+    /* This one is checked before anything is erased, so the camera is untouched
+     * and the prepared payload is still good to retry. */
+    throw new Error("the camera rejected the transfer checksum (" + hex(ERR_BAD_CHECKSUM) +
+      ") — nothing was committed");
+  }
+  if (commitErr) {
+    /* Any other code comes from the erase/program/verify chain, which means
+     * flash may already have changed. Drop the analysis so nothing is retried
+     * against a stale picture of the device. */
+    resetFlashState(null);
+    throw new Error("CompleteMemoryUpgrade returned " + hex(commitErr) +
+      " — the target slot may be partially written. Re-read the device info before doing anything else, " +
+      "and keep your rescue dump.");
+  }
+
+  log("committed — " + target.name + " programmed and cfg[0] repointed at it", "l-ok");
+
+  /* Not the readback compare — a 576-byte read of the vector table, which is all
+   * the GF(2) solve needs to name the key the camera just stored it under. That
+   * answers the only question that matters: will the bootloader take this slot?
+   * Committing without an error does NOT imply it. */
+  try {
+    await armWindow(d, { subcmd: SUBCMD_UPDATE_TARGET, address: target.address });
+    const head = await readArmed(d, DEFAULT_READ_CHUNK, HDR_OFF + 0x40);
+    if (head.length < HDR_OFF + 0x40) throw new Error("short read");
+    const hdv = new DataView(head.buffer, head.byteOffset, head.byteLength);
+    if (hdv.getUint32(HDR_OFF, true) !== IMG_MAGIC) throw new Error("no image header in the slot");
+    const stored = { recovered: { state: recoverState(hdv, 0) }, accepts: true, footer: prep.footer };
+    const id = identifyKey(stored, deviceState.keyTable, deviceState.storeKey);
+    if (id.bootable) {
+      log("stored under " + id.name + " — the bootloader will accept this slot", "l-ok");
+    } else {
+      log("the camera stored it under a key the bootloader does not know (" + id.name + ")", "l-err");
+      log("  it will be SKIPPED at boot and the camera will keep running whatever else is bootable. " +
+        "This is a property of the firmware currently running on the camera, not of the image you " +
+        "chose. Use an SPI programmer or SWD/J-Link to change what this camera runs.", "l-err");
+    }
+  } catch (e) {
+    log("could not check which key the camera stored it under: " +
+      (e && e.message ? e.message : String(e)) + " — re-read the device info after replugging", "l-warn");
+  }
+}
+
+async function runFlash() {
+  const prep = pendingFlash;
+  if (!prep) throw new Error("no prepared image");
+
+  /* This log is the record of what was flashed, so it has to name the file — the
+   * line written when the file was picked is cleared when this run starts. */
+  const target = deviceState.byKey[deviceState.boot.target];
+  log("image: " + prep.fileName, "l-ok");
+  log("  " + prep.originalSize.toLocaleString() + " B on disk, firmware " + prep.header.versionStr +
+    ", image " + hexUp(prep.header.imageId), "l-dim");
+  log("  header.length " + hexUp(prep.length) + (prep.lengthStamped ? " (stamped from " + hexUp(prep.declaredBefore) + ")" : "") +
+    ", adjust word " + hexUp(prep.adjust), "l-dim");
+  if (prep.keyPatch) {
+    log("  key table at " + prep.keyPatch.where + ": " +
+      (prep.keyPatch.changed
+        ? prep.keyPatch.fromA + " / " + prep.keyPatch.fromB + "  ->  " +
+          prep.keyPatch.toA + " / " + prep.keyPatch.toB
+        : "already this camera's keys, left alone"), "l-dim");
+  }
+  log("  payload " + prep.payload.length + " B, transfer checksum " + hexUp(prep.sum16, 4) +
+    ", sha256 " + prep.sha256, "l-dim");
+  log("  target " + target.name + " at " + hex(target.address, 8), "l-dim");
+  log("");
+
+  if (ui.optDumpFirst.checked) {
+    log("dumping the whole flash first — this is your rescue copy", "l-warn");
+    log("");
+    await runDump();
+    if (cancelRequested) throw new Error("cancelled during the rescue dump — nothing was written");
+    /* readWindowsInto() releases the interface and closes the handle when its
+     * sweep finishes — right for a standalone dump, but it leaves us with
+     * nothing to write through. Take the device back. */
+    await openDevice(dev());
+    log("");
+    log("rescue dump downloaded; continuing to the write", "l-ok");
+    log("");
+  } else {
+    log("rescue dump skipped at your request", "l-warn");
+  }
+
+  await writeFirmware(prep);
+
+  /* The banks have swapped roles and the written slot is now Key-B encrypted,
+   * so everything read before the commit is stale. Force a re-read rather than
+   * letting a second write run off it. */
+  resetFlashState(null);
+
+  log("");
+  log("NOW UNPLUG AND REPLUG THE CAMERA.", "l-warn");
+  log("Proven so far: the payload streamed, the camera accepted its checksum, and the commit returned " +
+    "no error. NOT proven: that the bootloader will select this slot, or that the image runs. The bank " +
+    "switch only takes effect on a real power cycle, so replug and press \"Read device info\" — the " +
+    "running version it reports is the only thing that settles it.", "l-dim");
+  setProgress(1, 1, "Written. Unplug and replug, then re-read — the reported version is the real answer.");
+}
+
+/* ---- wiring ------------------------------------------------------------- */
+
+/* Key A, the target slot and the footer template are all properties of ONE
+ * camera. Carrying them across a disconnect, a device swap, or a completed
+ * write would let a payload built for one unit be sent to another — so any
+ * change of device drops both the analysis and anything prepared from it. */
+function resetFlashState(reason) {
+  const had = deviceState || pendingFlash;
+  deviceState = null;
+  pendingFlash = null;
+  ui.fwInfo.innerHTML = "";
+  ui.fwInfo.classList.add("hidden");
+  ui.flashPreview.innerHTML = "";
+  ui.flashPreview.classList.add("hidden");
+  if (had && reason) {
+    ui.status4.textContent = reason;
+    ui.status5.textContent = reason;
+  }
+  refreshFlashButton();
+}
+
+function refreshFlashButton() {
+  ui.btnFlash.disabled = !(device && !running && !decrypting && !flashing &&
+    pendingFlash && deviceState && deviceState.canFlash);
+}
+
+ui.btnReadFw.addEventListener("click", () => {
+  resetFlashState(null);
+  ui.status5.textContent = "No image chosen.";
+  runDeviceOp("fwinfo", ui.btnCancelFw, readDeviceInfo);
+});
+
+ui.btnCancelFw.addEventListener("click", () => {
+  cancelRequested = true;
+  ui.btnCancelFw.disabled = true;
+  ui.status4.textContent = "Cancelling ...";
+});
+
+ui.btnPickFw.addEventListener("click", () => ui.filePickFw.click());
+
+ui.filePickFw.addEventListener("change", async () => {
+  const file = ui.filePickFw.files && ui.filePickFw.files[0];
+  ui.filePickFw.value = "";
+  if (!file || running || decrypting || flashing) return;
+
+  useOutput("flash");
+  ui.log5.textContent = "";
+  ui.flashPreview.classList.add("hidden");
+  pendingFlash = null;
+  refreshFlashButton();
+
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    log(file.name + " — " + bytes.length.toLocaleString() + " bytes", "l-dim");
+    const prep = prepareImage(bytes, file.name);
+    prep.sha256 = await sha256hex(prep.payload);
+    pendingFlash = prep;
+    renderFlashPreview(prep);
+    log("packaged " + prep.payload.length + " B bank payload, transfer checksum " +
+      hexUp(prep.sum16, 4), "l-ok");
+    log("nothing sent to the camera yet", "l-dim");
+    setProgress(0, 1, "Ready — review the plan above, then press \"Write to camera\".");
+  } catch (e) {
+    log("cannot use this file: " + (e && e.message ? e.message : String(e)), "l-err");
+    setProgress(0, 1, "Rejected — see the log above.");
+  }
+  refreshFlashButton();
+});
+
+ui.btnFlash.addEventListener("click", async () => {
+  if (!pendingFlash || running || decrypting || flashing) return;
+  const target = deviceState.byKey[deviceState.boot.target];
+  const ok = window.confirm(
+    "Write " + pendingFlash.fileName + " to " + target.name + " at " + hexUp(target.address) + "?\n\n" +
+    (pendingFlash.rekeyRisk
+      ? "WARNING: this camera stores upgrades under a key its bootloader does not know, so this " +
+        "slot will be skipped at boot and the camera will keep running " +
+        (pendingFlash.bootedName || "the other slot") + ".\n\n"
+      : "") +
+    "This erases a 64 KiB block of the camera's flash and repoints its boot config.\n" +
+    "If the image does not run, the camera cannot be recovered over USB — only with " +
+    "SWD/J-Link or an SPI programmer.");
+  if (!ok) return;
+
+  flashing = true;
+  refreshFlashButton();
+  try {
+    await runDeviceOp("flash", ui.btnCancelFlash, runFlash);
+  } finally {
+    flashing = false;
+    refreshFlashButton();
+  }
+});
+
+ui.btnCancelFlash.addEventListener("click", () => {
+  cancelRequested = true;
+  ui.btnCancelFlash.disabled = true;
+  ui.status5.textContent = "Cancelling — the write stops before the commit if it has not run yet ...";
+  log("cancel requested", "l-warn");
+});
+
+/* ---- view routing ------------------------------------------------------- */
+
+function currentView() {
+  return location.hash === "#flash" ? "flash" : "dump";
+}
+
+function applyView() {
+  const view = currentView();
+  for (const node of document.querySelectorAll("[data-view]")) {
+    node.classList.toggle("hidden", node.dataset.view !== view);
+  }
+  for (const link of ui.viewNav.querySelectorAll("a[data-nav]")) {
+    if (link.dataset.nav === view) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+  document.title = view === "flash"
+    ? "Seek Thermal Firmware & Flashing (WebUSB)"
+    : "Seek Thermal Firmware Dump (WebUSB)";
+}
+
+window.addEventListener("hashchange", applyView);
+applyView();
 
 async function init() {
   if (!checkSupport()) return;
