@@ -224,7 +224,11 @@ export async function decryptDump(
       slots,
       bootloaderKeys: null,
       detection,
-      cancelled: cancelled(),
+      /* `stoppedEarly`, not `cancelled()`: the scan found nothing to do and ran
+       * to the end, so an abort that landed before or during it cut no work
+       * short. Sampling the signal here would report a complete run as partial
+       * and tell a caller its dump was only half decrypted. */
+      cancelled: stoppedEarly,
     };
   }
   reporter.log(

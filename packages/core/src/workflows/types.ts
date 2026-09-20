@@ -201,6 +201,11 @@ export interface DecryptResult {
    * and offer an override.
    */
   readonly detection: DetectionResult | null;
+  /**
+   * True only where a cancel actually cut work short. A run that finished every
+   * slot it found is `false` even if the signal aborted while the artifacts
+   * were being written, and so is one that found no slots at all.
+   */
   readonly cancelled: boolean;
 }
 

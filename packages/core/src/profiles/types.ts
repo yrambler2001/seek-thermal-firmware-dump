@@ -131,10 +131,26 @@ export interface DeviceEvidence {
   readonly observedAcceptanceSums?: readonly number[];
   /** Image header version strings found in a dump or on the device. */
   readonly imageVersions?: readonly string[];
-  /** A plain 2-byte BeginFirmwareUpgrade armed a protected bank. */
+  /**
+   * A plain 2-byte BeginFirmwareUpgrade armed a protected bank.
+   *
+   * A real observation of the camera: `armWindow` throws on a refusal, so this
+   * is only ever set by an arm that came back clean, and the legacy firmware
+   * refuses the plain channel on exactly these banks.
+   */
   readonly plainSelectorWorks?: boolean;
-  /** A protected bank only armed after the 18-byte authenticated payload. */
-  readonly authSelectorRequired?: boolean;
+  /**
+   * The 18-byte authenticated BeginFirmwareUpgrade armed a protected bank.
+   *
+   * "Worked", NOT "was required". Whoever set this sent the authenticated
+   * payload because their own selector map said to, and never tried the plain
+   * 2-byte one on that bank; a firmware that reads the first two bytes of the
+   * setup packet and ignores the rest would arm on it too. Only a plain arm of
+   * a protected bank coming back REFUSED can establish that the authenticated
+   * channel is required, and no read path makes that observation today — so
+   * profiles score this as corroboration, never as a verdict.
+   */
+  readonly authSelectorWorks?: boolean;
   /** Byte offsets at which image-header magic was found in a dump. */
   readonly imageBaseOffsets?: readonly number[];
 }

@@ -6,14 +6,16 @@
  * Ctrl-C aborts through an `AbortSignal` that is handed to core, which stops
  * at the next loop boundary and throws `CancelledError` — the dump command
  * then writes the windows that were already read before the error propagates.
- * A second Ctrl-C gives up on that and quits immediately.
+ * A second Ctrl-C gives up on that and quits immediately. The handler itself,
+ * including its removal and the flush the hard exit waits for, is in
+ * `interrupt.ts`.
  */
 
 import { createInterface } from 'node:readline/promises';
 import { createRequire } from 'node:module';
 import { run, type Io } from './cli.js';
+import { installInterruptHandler } from './interrupt.js';
 import { streamSink } from './sink.js';
-import { EXIT_CANCELLED } from './errors.js';
 
 function packageVersion(): string {
   try {
@@ -42,18 +44,18 @@ async function confirm(question: string): Promise<boolean> {
 }
 
 const controller = new AbortController();
-let interrupts = 0;
-process.on('SIGINT', () => {
-  interrupts += 1;
-  if (interrupts > 1) {
-    process.stderr.write('\nquitting now\n');
-    process.exit(EXIT_CANCELLED);
-  }
-  process.stderr.write(
-    '\ninterrupted — stopping at the next safe point and keeping what has already been read ' +
-      '(Ctrl-C again to quit immediately)\n',
-  );
-  controller.abort();
+const interrupt = installInterruptHandler({
+  target: process,
+  stdout: process.stdout,
+  warn: (text) => {
+    process.stderr.write(text);
+  },
+  abort: () => {
+    controller.abort();
+  },
+  exit: (code) => {
+    process.exit(code);
+  },
 });
 
 const io: Io = {
@@ -66,4 +68,11 @@ const io: Io = {
   confirm,
 };
 
-process.exitCode = await run(process.argv.slice(2), io, controller.signal);
+try {
+  process.exitCode = await run(process.argv.slice(2), io, controller.signal);
+} finally {
+  /* The run is over. A Ctrl-C from here on belongs to whatever comes next — and
+   * the `--json` document is already on stdout, where a hard exit could have
+   * cut it in half. */
+  interrupt.release();
+}

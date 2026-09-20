@@ -71,6 +71,9 @@ describe('seek-fw decrypt', () => {
 
     const manifest: unknown = JSON.parse(await readFile(join(out, 'manifest.json'), 'utf8'));
     expect(manifest).toMatchObject({
+      /* Core's builder, with the host and the profile the web app also names —
+       * the two front ends write the same document. */
+      producer: 'seek-thermal-firmware-dump (seek-fw CLI, modern-4x)',
       flashBase: '0x14000000',
       source: { fileName: 'flash_4m_usb_partial_gap_ff.bin' },
       profile: { id: 'modern-4x' },

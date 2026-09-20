@@ -87,7 +87,10 @@ describe('downloadArchive', () => {
 
     expect(result.fileName).toBe('seek_flash4m_2026-09-20T15-00-00Z.zip');
     expect(result.fileCount).toBe(2);
-    expect(result.bytes).toBeGreaterThan(0);
+    /* Entries are stored, not deflated, so the ZIP is the payload plus its
+     * own bookkeeping — never smaller. */
+    expect(result.dataBytes).toBe(2 + 32);
+    expect(result.bytes).toBeGreaterThan(result.dataBytes);
     expect(rec.downloads[0]?.name).toBe('seek_flash4m_2026-09-20T15-00-00Z.zip');
     expect(rec.created[0]?.type).toBe('application/zip');
 

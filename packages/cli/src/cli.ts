@@ -64,8 +64,10 @@ export interface GlobalOptions {
 }
 
 export type ParsedCli =
-  | { readonly kind: 'help'; readonly command: CommandName | null }
-  | { readonly kind: 'version' }
+  /* `json` rides along on all three: `--json` means "stdout is a JSON
+   * document", and help and version are no exception. */
+  | { readonly kind: 'help'; readonly command: CommandName | null; readonly json: boolean }
+  | { readonly kind: 'version'; readonly json: boolean }
   | {
       readonly kind: 'run';
       readonly command: CommandName;
@@ -152,16 +154,16 @@ export function parseCli(argv: readonly string[]): ParsedCli {
   const positionals = parsed.positionals;
   const [commandWord, ...rest] = positionals;
 
-  if (values.version) return { kind: 'version' };
+  if (values.version) return { kind: 'version', json: values.json };
 
   if (commandWord === undefined) {
-    if (values.help) return { kind: 'help', command: null };
+    if (values.help) return { kind: 'help', command: null, json: values.json };
     throw new UsageError('no command given');
   }
   if (!isCommandName(commandWord)) {
     throw new UsageError(`unknown command '${commandWord}'`);
   }
-  if (values.help) return { kind: 'help', command: commandWord };
+  if (values.help) return { kind: 'help', command: commandWord, json: values.json };
 
   const takesFile = FILE_COMMANDS.has(commandWord);
   if (takesFile && rest.length === 0) {
@@ -279,6 +281,16 @@ const COMMANDS: Record<CommandName, Command> = {
 };
 
 /**
+ * The one JSON document `--json` is allowed to put on stdout.
+ *
+ * Every `--json` path goes through here, so "exactly one document per run" is
+ * a property of the code and not of a convention four call sites remember.
+ */
+function emitJson(stdout: Sink, document: Record<string, unknown>): void {
+  stdout.write(`${JSON.stringify(document, null, 2)}\n`);
+}
+
+/**
  * Runs one command line and returns the process exit code.
  *
  * Stream policy, which the `--json` contract depends on: under `--json`
@@ -297,21 +309,15 @@ export async function run(argv: readonly string[], io: Io, signal: AbortSignal):
      * stdout, so `seek-fw … --json | jq` broke on a typo'd flag while every
      * other failure produced a readable error document. */
     if (argv.includes('--json')) {
-      io.stdout.write(
-        `${JSON.stringify(
-          {
-            command: null,
-            ok: false,
-            error: {
-              code: 'cli/usage',
-              message: described.message,
-              ...(described.hint === undefined ? {} : { hint: described.hint }),
-            },
-          },
-          null,
-          2,
-        )}\n`,
-      );
+      emitJson(io.stdout, {
+        command: null,
+        ok: false,
+        error: {
+          code: 'cli/usage',
+          message: described.message,
+          ...(described.hint === undefined ? {} : { hint: described.hint }),
+        },
+      });
     }
     io.stderr.write(`${usageFor(null)}\n`);
     io.stderr.write(`error: ${described.message}\n`);
@@ -319,12 +325,21 @@ export async function run(argv: readonly string[], io: Io, signal: AbortSignal):
     return EXIT_USAGE;
   }
 
+  /* `--help` and `--version` are documents under `--json` like everything
+   * else. The alternative — two commands whose stdout is prose no matter what
+   * was asked for — is the one exception that makes `seek-fw ... --json | jq`
+   * unsafe to write in a script. */
   if (parsed.kind === 'version') {
-    io.stdout.write(`${io.version}\n`);
+    if (parsed.json) emitJson(io.stdout, { command: null, ok: true, version: io.version });
+    else io.stdout.write(`${io.version}\n`);
     return EXIT_OK;
   }
   if (parsed.kind === 'help') {
-    io.stdout.write(usageFor(parsed.command));
+    if (parsed.json) {
+      emitJson(io.stdout, { command: parsed.command, ok: true, help: usageFor(parsed.command) });
+    } else {
+      io.stdout.write(usageFor(parsed.command));
+    }
     return EXIT_OK;
   }
 
@@ -362,9 +377,7 @@ export async function run(argv: readonly string[], io: Io, signal: AbortSignal):
     const result = await COMMANDS[command](ctx);
     reporter.finish();
     const cancelled = result.cancelled === true;
-    if (options.json) {
-      io.stdout.write(`${JSON.stringify({ command, ok: !cancelled, ...result }, null, 2)}\n`);
-    }
+    if (options.json) emitJson(io.stdout, { command, ok: !cancelled, ...result });
     if (cancelled) {
       io.stderr.write('\ninterrupted — what had been read was saved; the result is partial\n');
       return EXIT_CANCELLED;
@@ -374,21 +387,15 @@ export async function run(argv: readonly string[], io: Io, signal: AbortSignal):
     reporter.finish();
     const described = describeError(error, io.platform);
     if (options.json) {
-      io.stdout.write(
-        `${JSON.stringify(
-          {
-            command,
-            ok: false,
-            error: {
-              code: described.code,
-              message: described.message,
-              ...(described.hint === undefined ? {} : { hint: described.hint }),
-            },
-          },
-          null,
-          2,
-        )}\n`,
-      );
+      emitJson(io.stdout, {
+        command,
+        ok: false,
+        error: {
+          code: described.code,
+          message: described.message,
+          ...(described.hint === undefined ? {} : { hint: described.hint }),
+        },
+      });
     }
     if (described.cancelled) {
       io.stderr.write('\ninterrupted\n');

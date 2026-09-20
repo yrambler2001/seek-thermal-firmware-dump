@@ -1,7 +1,7 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { buildZip, zipEntryCount } from '@seek-fw/core';
+import { buildZip, zipEntryCount, zipTotalDataSize } from '@seek-fw/core';
 import { CliError } from '../src/errors.js';
 import {
   defaultOutputDirectory,
@@ -117,6 +117,19 @@ describe('writeOutputs', () => {
     expect(both.files).toHaveLength(ARTIFACTS.length + 1);
     expect((await stat(join(dir, 'out.zip'))).isFile()).toBe(true);
     expect((await stat(join(dir, 'out', 'README.md'))).isFile()).toBe(true);
+  });
+
+  it('counts entries and bytes the way core counts them', async () => {
+    const directoryOnly = await writeOutputs({ directory: join(dir, 'd'), zip: null }, ARTIFACTS);
+    expect(directoryOnly.entries).toBe(zipEntryCount(ARTIFACTS));
+    expect(directoryOnly.bytes).toBe(zipTotalDataSize(ARTIFACTS));
+
+    /* A zip reports the archive's own size, headers included — but still one
+     * entry per artifact, not one per path written. */
+    const zipped = await writeOutputs({ directory: null, zip: join(dir, 'z.zip') }, ARTIFACTS);
+    expect(zipped.entries).toBe(zipEntryCount(ARTIFACTS));
+    expect(zipped.bytes).toBe(buildZip(ARTIFACTS).length);
+    expect(zipped.files).toHaveLength(1);
   });
 });
 

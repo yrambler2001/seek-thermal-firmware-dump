@@ -324,10 +324,29 @@ describe('detection', () => {
     expect(modernMatch?.score).toBe(0);
   });
 
-  it('reads a required authenticated selector as legacy-auth', () => {
-    const result = detectProfile({ authSelectorRequired: true });
+  it('treats an authenticated selector that worked as weak evidence for legacy-auth', () => {
+    /* It only says the 18-byte payload armed a bank; nothing tried the plain
+     * one there, so it points at the family without settling it — the mirror of
+     * what `plainSelectorWorks` alone does for modern-4x. */
+    const result = detectProfile({ authSelectorWorks: true });
+    expect(result.best.profile.id).toBe('legacy-auth');
+    expect(result.ambiguous).toBe(true);
+  });
+
+  it('lets a 1.x version and a working authenticated selector settle legacy-auth', () => {
+    const result = detectProfile({ authSelectorWorks: true, firmwareVersion: '1.0.3.0' });
     expect(result.best.profile.id).toBe('legacy-auth');
     expect(result.ambiguous).toBe(false);
+  });
+
+  it('does not rule modern-4x out on an authenticated selector that merely worked', () => {
+    /* The authenticated payload goes out because the ACTING profile's map
+     * carries a token, so ruling 4.x out on it would rule it out on the map the
+     * caller picked rather than on the camera. */
+    const result = detectProfile({ authSelectorWorks: true, observedAcceptanceSums: [0x0000ffff] });
+    const modernMatch = result.ranked.find((m) => m.profile.id === 'modern-4x');
+    expect(modernMatch?.score).toBeGreaterThan(0);
+    expect(result.best.profile.id).toBe('modern-4x');
   });
 
   it('rules legacy-auth out when a plain selector armed a protected bank', () => {
@@ -382,8 +401,13 @@ describe('detection', () => {
   });
 
   it('calls contradictory evidence ambiguous instead of picking a winner', () => {
-    // Auth channel says legacy; a zero acceptance sum says 2016. Neither wins.
-    const result = detectProfile({ authSelectorRequired: true, observedAcceptanceSums: [0] });
+    // A 1.x version on the authenticated channel says legacy; a zero acceptance
+    // sum says 2016. Neither wins.
+    const result = detectProfile({
+      authSelectorWorks: true,
+      firmwareVersion: '1.0.3.0',
+      observedAcceptanceSums: [0],
+    });
     expect(result.ambiguous).toBe(true);
   });
 

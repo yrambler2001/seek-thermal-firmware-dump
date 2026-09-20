@@ -204,13 +204,20 @@ function versionMajor(version: string | undefined): number | null {
 function detectModern(evidence: DeviceEvidence): DetectionVerdict {
   const reasons: string[] = [];
 
-  /* A protected bank that only opens on the 18-byte channel is the legacy
-   * firmware's signature; no 4.x build has that handler at all. */
-  if (evidence.authSelectorRequired === true) {
+  /* No 4.x build implements the 18-byte authenticated handler, but an
+   * authenticated arm that WORKED does not rule this family out: the flag says
+   * the payload armed a bank, not that the plain 2-byte one was refused, and a
+   * handler that reads the first two bytes of the setup packet and ignores the
+   * rest arms on it too. The payload is only ever sent because the ACTING
+   * profile's map carries a token, so zeroing this family on it would zero it
+   * on which map the caller picked. The observation that WOULD rule it out —
+   * a plain arm of a protected bank coming back refused — is not made anywhere
+   * yet, so the flag is recorded as a caveat and left out of the score. */
+  if (evidence.authSelectorWorks === true) {
     reasons.push(
-      'a protected bank only armed after the 18-byte authenticated selector, which no 4.x build implements',
+      'a protected bank armed on the 18-byte authenticated selector; nothing tried the plain ' +
+        'one there, so that does not place this camera off the 4.x line',
     );
-    return { score: 0, reasons };
   }
 
   const major = versionMajor(evidence.firmwareVersion);

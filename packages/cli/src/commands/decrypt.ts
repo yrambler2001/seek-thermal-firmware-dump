@@ -15,9 +15,9 @@
 import { basename } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import {
+  buildOfflineDecryptManifest,
   decryptDump,
   getProfile,
-  hex,
   hexUp,
   makeOfflineDecryptReadme,
   manifestToJson,
@@ -27,7 +27,6 @@ import {
   type Artifact,
   type DecryptOptions,
   type FirmwareProfile,
-  type OfflineDecryptManifest,
 } from '@seek-fw/core';
 import type { CommandContext, CommandResult } from '../cli.js';
 import { CliError } from '../errors.js';
@@ -74,15 +73,18 @@ export async function decryptCommand(ctx: CommandContext): Promise<CommandResult
   const detection = result.detection;
   const profile: FirmwareProfile = forced ?? detection?.best.profile ?? getProfile('generic');
 
-  const manifest: OfflineDecryptManifest = {
-    producer: `seek-thermal-firmware-dump (seek-fw CLI offline decrypt, ${profile.id})`,
+  /* Core's builder, not a literal: the web app decrypts offline too, and the
+   * two manifests have to be the same document whichever front end wrote it.
+   * Only the host inside `producer` differs. */
+  const manifest = buildOfflineDecryptManifest({
+    producer: `seek-thermal-firmware-dump (seek-fw CLI, ${profile.id})`,
     startedAt,
     finishedAt: new Date().toISOString(),
     source: { fileName, size: bytes.length, sha256: await sha256hex(bytes) },
-    flashBase: hex(profile.memory.flashBase, 8),
+    flashBase: profile.memory.flashBase,
     decryption: result.summary,
     profile: profileInfoOf(profile, detection),
-  };
+  });
 
   const extra: Artifact[] = [
     { name: 'manifest.json', data: utf8(manifestToJson(manifest)) },

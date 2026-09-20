@@ -34,6 +34,7 @@ import {
   type WorkflowContext,
 } from '@seek-fw/core';
 import { downloadArchive, mib } from '../lib/download';
+import { logHint } from '../lib/hints';
 import {
   asOptionsFailure,
   readOptions,
@@ -210,6 +211,7 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
             infoReporter.setStatus('Cancelled.');
           } else {
             infoReporter.log(`ERROR: ${errorMessage(error)}`, 'error');
+            logHint(infoReporter.log, error);
             infoReporter.setStatus('Failed — see the log above.');
           }
         } finally {
@@ -258,6 +260,7 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
           );
         } catch (error) {
           flashReporter.log(`cannot use this file: ${errorMessage(error)}`, 'error');
+          logHint(flashReporter.log, error);
           flashReporter.setStatus('Rejected — see the log above.');
         } finally {
           flashReporter.flush();
@@ -412,6 +415,7 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
             flashReporter.setStatus('Cancelled — see the log above.');
           } else {
             flashReporter.log(`ERROR: ${errorMessage(error)}`, 'error');
+            logHint(flashReporter.log, error);
             flashReporter.setStatus('Failed — see the log above.');
           }
         } finally {

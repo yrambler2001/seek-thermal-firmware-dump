@@ -30,7 +30,7 @@ const COMMON_OPTIONS = `Options
   --recipient <r>        interface | device | auto (default auto)
   --serial <id>          pick one camera when several are attached
   --no-decrypt           dump the flash but skip the decryption stage
-  --json                 machine-readable output on stdout
+  --json                 one JSON document on stdout (--help and --version too)
   --quiet                no progress bar and no log lines
   --verbose              show detail lines and full stack traces
   --no-color             never emit ANSI colour
@@ -62,6 +62,9 @@ Examples
   seek-fw info --json | jq .firmware
   seek-fw decrypt flash_4m.bin --out ./decrypted
   seek-fw flash image-KeyA-....-KeyB-....bin --out ./rescue
+
+Under --json stdout carries exactly one JSON document, --help and --version
+included, and every human line goes to stderr.
 
 Exit codes: 0 success, 1 the operation failed, 2 bad usage, 130 interrupted.
 `;

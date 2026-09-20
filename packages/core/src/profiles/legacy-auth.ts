@@ -211,9 +211,15 @@ const CAPABILITIES: ProfileCapabilities = {
 
 /* ---- detection ---------------------------------------------------------- */
 
-const SCORE_DECISIVE = 0.97;
-const SCORE_CORROBORATED = 0.98;
+/** A 1.x version and the authenticated channel, agreeing. */
+const SCORE_CORROBORATED = 0.85;
+/** One strong but indirect signal (a version string the camera reported). */
 const SCORE_STRONG = 0.75;
+/**
+ * The authenticated channel alone. Deliberately under the registry's confidence
+ * threshold: see `detectLegacy`.
+ */
+const SCORE_WEAK = 0.3;
 
 /** Major component of a dotted version string, or null when there is none. */
 function versionMajor(version: string | undefined): number | null {
@@ -246,11 +252,22 @@ function detectLegacy(evidence: DeviceEvidence): DetectionVerdict {
   }
 
   let score = 0;
-  const authRequired = evidence.authSelectorRequired === true;
-  if (authRequired) {
-    score = SCORE_DECISIVE;
+  /* "The authenticated channel worked" is not "the plain channel was refused".
+   * The 18-byte payload is only ever sent because the ACTING profile's map
+   * carries a token, so on its own this evidence says as much about the map the
+   * caller picked as about the camera — and a firmware that ignores the extra
+   * 16 bytes arms on it too. Weak on purpose, and below `CONFIDENT_SCORE`, so
+   * it can corroborate a version but never name this family by itself: the
+   * mirror of how `modern-4x` treats `plainSelectorWorks`. What would make it
+   * decisive again is the measurement nothing takes today — a plain 2-byte arm
+   * of a protected bank, refused. */
+  const authWorks = evidence.authSelectorWorks === true;
+  if (authWorks) {
+    score = SCORE_WEAK;
     reasons.push(
-      "a protected bank only armed after the 18-byte authenticated selector — the legacy firmware's signature",
+      'a protected bank armed on the 18-byte authenticated selector, which is this ' +
+        "firmware's channel — though nothing tried the plain one there, so this does not " +
+        'prove the plain channel is refused',
     );
   }
   if (major === 1) {
@@ -259,9 +276,9 @@ function detectLegacy(evidence: DeviceEvidence): DetectionVerdict {
         '1.0.3.x / 1.3.0.x line, which is a different numbering line from the 4.x ' +
         'application versions, not an older 4.x',
     );
-    score = authRequired ? SCORE_CORROBORATED : Math.max(score, SCORE_STRONG);
+    score = authWorks ? SCORE_CORROBORATED : Math.max(score, SCORE_STRONG);
   }
-  if (score === 0) reasons.push('nothing observed requires the authenticated read channel');
+  if (score === 0) reasons.push('nothing observed points at the authenticated read channel');
   return { score, reasons };
 }
 

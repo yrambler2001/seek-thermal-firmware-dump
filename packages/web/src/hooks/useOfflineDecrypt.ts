@@ -16,10 +16,10 @@ import { useCallback, useMemo, useState } from 'react';
 import {
   CancelledError,
   HEADER_OFFSET,
+  buildOfflineDecryptManifest,
   decryptDump,
   errorMessage,
   getProfile,
-  hex,
   isoStamp,
   makeOfflineDecryptReadme,
   manifestToJson,
@@ -28,9 +28,9 @@ import {
   utf8,
   type Artifact,
   type DetectionResult,
-  type OfflineDecryptManifest,
 } from '@seek-fw/core';
 import { downloadArchive, mib } from '../lib/download';
+import { logHint } from '../lib/hints';
 import { yieldToUi } from '../lib/yield-to-ui';
 import { useReporter, type ReporterHandle } from './useReporter';
 import type { Runner } from './useRunner';
@@ -95,26 +95,32 @@ export function useOfflineDecrypt(params: OfflineDecryptParams): OfflineDecryptA
         return;
       }
 
-      if (result.slots.length === 0) {
+      /* A file nothing decrypts out of is still worth an archive, and the
+       * CLI has always written one: the manifest names the file, its SHA-256
+       * and the profile that was tried, which is the citable evidence that
+       * this dump holds no recoverable image. Only "too small to hold a
+       * header" and a cancel package nothing. */
+      const nothingDecrypted = result.slots.length === 0;
+      if (nothingDecrypted) {
         reporter.reporter.log('');
         reporter.reporter.log(
-          'nothing to package — no firmware image in this file could be decrypted',
+          'no firmware image in this file could be decrypted — packaging the manifest anyway',
           'error',
         );
-        reporter.reporter.progress(1, 1, 'No images decrypted — see the log for why.');
-        return;
       }
 
       const profile = result.detection?.best.profile ?? getProfile('generic');
-      const manifest: OfflineDecryptManifest = {
-        producer: 'seek-thermal-firmware-dump (offline decrypt)',
+      const manifest = buildOfflineDecryptManifest({
+        /* Same shape as the CLI's, differing only in the host, so two archives
+         * of the same dump can be told apart and neither drifts. */
+        producer: `seek-thermal-firmware-dump (web, ${profile.id})`,
         startedAt,
         finishedAt: new Date().toISOString(),
         source: { fileName: file.name, size: file.size, sha256: inputSha },
-        flashBase: hex(profile.memory.flashBase, 8),
+        flashBase: profile.memory.flashBase,
         decryption: result.summary,
         profile: profileInfoOf(profile, result.detection),
-      };
+      });
 
       const outFiles: Artifact[] = [
         ...result.artifacts,
@@ -138,8 +144,10 @@ export function useOfflineDecrypt(params: OfflineDecryptParams): OfflineDecryptA
       reporter.reporter.progress(
         1,
         1,
-        `Done — ${String(result.slots.length)}/${String(total)} slot(s) decrypted. ` +
-          'Check your downloads.',
+        nothingDecrypted
+          ? 'No images decrypted — see the log for why. The manifest is in your downloads.'
+          : `Done — ${String(result.slots.length)}/${String(total)} slot(s) decrypted. ` +
+              'Check your downloads.',
       );
     },
     [reporter],
@@ -159,6 +167,7 @@ export function useOfflineDecrypt(params: OfflineDecryptParams): OfflineDecryptA
             return;
           }
           reporter.log(`ERROR: ${errorMessage(error)}`, 'error');
+          logHint(reporter.log, error);
           reporter.setStatus('Failed — see the log above.');
         } finally {
           reporter.flush();

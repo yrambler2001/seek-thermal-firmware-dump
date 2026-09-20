@@ -15,6 +15,7 @@ import {
   OP,
   bytesToHex,
   cryptImage,
+  hexDump,
   keyFilenameSuffix,
   modern4x,
   stateFromKey,
@@ -186,6 +187,14 @@ describe('seek-fw flash', () => {
      * was built with. */
     const at = slotOffsetOf('b');
     const bank = camera.flash.subarray(at, at + IMAGE_LENGTH);
+
+    /* The plan showed the head of those very bytes before the prompt: a
+     * checksum says two things differ, the hex says what is being written. */
+    expect(stdout.text).toContain('First 64 bytes of the payload');
+    for (const row of hexDump(camera.flash.subarray(at, at + 64)).split('\n')) {
+      expect(stdout.text).toContain(row);
+    }
+
     const plain = cryptImage(
       viewOf(bank),
       0,
@@ -216,6 +225,7 @@ describe('seek-fw flash', () => {
     expect(questions).toHaveLength(1);
     expect(stdout.text).toContain('Flash plan');
     expect(stdout.text).toContain('transfer checksum');
+    expect(stdout.text).toContain('First 64 bytes of the payload');
   });
 
   it('--no-rescue-dump skips the backup and says what that costs', async () => {

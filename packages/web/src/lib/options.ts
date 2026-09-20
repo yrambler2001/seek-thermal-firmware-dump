@@ -8,11 +8,7 @@
  * field name rides along so the UI can point at the input that is wrong.
  */
 
-import { isSeekError } from '@seek-fw/core';
-
-/** Every BeginFirmwareUpgrade selector exposes exactly one 64 KiB block.
- *  Mirrors core's `WINDOW_SIZE`; kept local so the parsing stays pure. */
-const WINDOW_SIZE = 0x10000;
+import { DEFAULT_DUMP_OPTIONS, WINDOW_SIZE, isSeekError } from '@seek-fw/core';
 
 export type RecipientChoice = 'auto' | 'interface' | 'device';
 
@@ -27,7 +23,9 @@ export interface OptionsForm {
   readonly decrypt: boolean;
 }
 
-/** The original page's `value=` attributes, exactly. */
+/** The original page's `value=` attributes, exactly. They are strings
+ *  because the form is; `options.test.ts` checks that they parse to core's
+ *  `DEFAULT_DUMP_OPTIONS`, so the two cannot drift apart unnoticed. */
 export const DEFAULT_OPTIONS_FORM: OptionsForm = {
   chunk: '64',
   gapFill: '0xff',
@@ -111,19 +109,24 @@ export function parseNum(text: string | null | undefined, fallback: number): num
  * obvious ("got 0x1ff" rather than "got 511").
  */
 export function readOptions(form: OptionsForm): ResolvedOptions {
-  const chunk = parseNum(form.chunk, 64);
+  const chunk = parseNum(form.chunk, DEFAULT_DUMP_OPTIONS.chunk);
   if (!Number.isInteger(chunk) || chunk <= 0 || chunk > WINDOW_SIZE) {
-    throw new OptionsError('chunk', `chunk must be between 1 and 65536, got ${form.chunk}`);
+    throw new OptionsError(
+      'chunk',
+      /* The ceiling is core's window size, not a copy of it: a form that
+       * accepted a chunk core rejects would fail in the middle of a run. */
+      `chunk must be between 1 and ${String(WINDOW_SIZE)}, got ${form.chunk}`,
+    );
   }
-  const gapFill = parseNum(form.gapFill, 0xff);
+  const gapFill = parseNum(form.gapFill, DEFAULT_DUMP_OPTIONS.gapFill);
   if (!Number.isInteger(gapFill) || gapFill < 0 || gapFill > 0xff) {
     throw new OptionsError('gapFill', `gap-fill must be a single byte, got ${form.gapFill}`);
   }
-  const retries = parseNum(form.retries, 2);
+  const retries = parseNum(form.retries, DEFAULT_DUMP_OPTIONS.retries);
   if (!Number.isInteger(retries) || retries < 0) {
     throw new OptionsError('retries', `retries must be zero or more, got ${form.retries}`);
   }
-  const retryDelayMs = parseNum(form.retryDelay, 500);
+  const retryDelayMs = parseNum(form.retryDelay, DEFAULT_DUMP_OPTIONS.retryDelayMs);
   if (!Number.isInteger(retryDelayMs) || retryDelayMs < 0) {
     throw new OptionsError(
       'retryDelay',

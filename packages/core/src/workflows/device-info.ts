@@ -241,12 +241,16 @@ export async function readDeviceInfo(
   const entries = profile.windowMap();
   const readAt = new Date().toISOString();
 
-  /* Whether a PROTECTED bank opened on the plain 2-byte channel or only on the
-   * 18-byte authenticated one is the single most decisive piece of detection
-   * evidence there is, and it falls out of doing the reads anyway. */
-  const armedProtectedBanks: WindowEntry[] = [];
+  /* Which channel each bank actually armed on, which falls out of doing the
+   * reads anyway. Only SUCCESSES land here — `armWindow` throws on a refusal
+   * rather than returning — so nothing built from this list can say a channel
+   * was refused, only that one worked. The banks that reach it are the ones the
+   * legacy firmware locks behind the authenticated channel (boot config, the
+   * image slots) plus the bootloader block at flashBase, which that firmware
+   * blocks on every channel. */
+  const armedBanks: WindowEntry[] = [];
   const noteArmed = (entry: WindowEntry): void => {
-    armedProtectedBanks.push(entry);
+    armedBanks.push(entry);
   };
 
   reporter.log('firmware info selectors ...', 'detail');
@@ -319,6 +323,11 @@ export async function readDeviceInfo(
   } else {
     reporter.log(`bootloader block at ${hex(bootEntry.address, 8)} (key material) ...`, 'detail');
     await device.armWindow(bootEntry);
+    /* Counts as evidence like the other two arms do. No shipped profile puts
+     * this block on a different channel from its boot config, so today it can
+     * only confirm what the boot-config arm already said; a family that splits
+     * them is exactly the case this was silently missing. */
+    noteArmed(bootEntry);
     const bootBlock = await device.readArmed(chunk, BOOT_BLOCK_BYTES);
     const keyAt = profile.memory.deviceKeySlotOffset;
     const keyLen = profile.memory.deviceKeySlotLength;
@@ -570,12 +579,25 @@ export async function readDeviceInfo(
     imageVersions: slots
       .map((slot) => slot.plainHeader?.versionStr)
       .filter((v): v is string => v !== undefined),
-    ...(armedProtectedBanks.some((entry) => entry.auth !== true)
-      ? { plainSelectorWorks: true }
-      : {}),
-    ...(armedProtectedBanks.some((entry) => entry.auth === true)
-      ? { authSelectorRequired: true }
-      : {}),
+    /* Both flags say which channel WORKED; neither says the other was refused.
+     * Every arm above used the channel this profile's own map names for that
+     * bank, and the other channel is never tried.
+     *
+     * `plainSelectorWorks` survives that as an observation about the camera:
+     * the legacy firmware refuses the plain 2-byte channel on these banks, so a
+     * plain arm of one rules that family out.
+     *
+     * `authSelectorWorks` does not, and is named for what it is. Under
+     * `legacy-auth` every protected bank carries `auth: true`, so it is set on
+     * every run and describes the map we chose more than the camera — which is
+     * why no profile treats it as decisive. The stronger claim, "the
+     * authenticated channel is REQUIRED", needs the one measurement nothing
+     * here takes: arm a protected bank with the plain 2-byte payload and see it
+     * refused. `runSweep` under a profile whose map carries no token already
+     * probes precisely that (every selector, plain channel, armed or stalled);
+     * its table is simply not fed back into evidence. */
+    ...(armedBanks.some((entry) => entry.auth !== true) ? { plainSelectorWorks: true } : {}),
+    ...(armedBanks.some((entry) => entry.auth === true) ? { authSelectorWorks: true } : {}),
   };
   const detection = detectProfile(evidence);
 
@@ -613,6 +635,19 @@ export async function readDeviceInfo(
     /* The evidence names a different family than the one we are acting under.
      * Key A would be this camera's, but the selector map, the cipher and the
      * boot policy would not — so refuse and let the user pick deliberately.
+     *
+     * Honestly: with the families that ship here this refusal cannot be the
+     * first one to fire, and is kept as defence in depth rather than as
+     * protection anyone relies on. `modern-4x` is the only profile that
+     * declares `flash` supported, and every entry in `buildModernWindowMap()`
+     * is plain — so any arm at all sets `plainSelectorWorks`, which zeroes
+     * `legacy-auth`; the only other family that can then win is `compact-2016`,
+     * and it wins only on a slot summing to 0 with none summing to 0xFFFF,
+     * which is `familyOk === false` and therefore already in `blocked`. Under
+     * every other profile `capabilities.flash` is unsupported and blocks above.
+     * It stays because that chain is a property of today's four profiles, not
+     * of the design: a family added later can win on evidence the family check
+     * cannot see, and this is the only check that would catch it.
      *
      * This is deliberately NOT an auto-adopt. Detection needs the slots, and
      * which addresses the slots live at is itself a property of the profile,

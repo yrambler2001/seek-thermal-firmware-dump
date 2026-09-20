@@ -26,9 +26,14 @@ export class CliError extends Error {
   ) {
     super(message);
     this.name = 'CliError';
-    this.exitCode = options.exitCode ?? EXIT_FAILED;
     this.hint = options.hint;
     this.code = options.code ?? 'cli/failed';
+    /* `cli/usage` is the one code whose exit status is not the caller's to
+     * choose: `run` prints the usage block for it, and the documented contract
+     * is that a usage error exits 2. Commands that name the code without the
+     * number — `decrypt` and `flash` both do — would otherwise print usage and
+     * exit 1. */
+    this.exitCode = this.code === 'cli/usage' ? EXIT_USAGE : (options.exitCode ?? EXIT_FAILED);
   }
 }
 

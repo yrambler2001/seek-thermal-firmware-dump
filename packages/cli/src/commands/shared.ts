@@ -163,7 +163,7 @@ export async function writeRun(
   const written = await writeOutputs(target, artifacts);
   if (ctx.human) {
     if (written.directory !== null) {
-      ctx.out(`wrote ${String(artifacts.length)} file(s) to ${written.directory}`);
+      ctx.out(`wrote ${String(written.entries)} file(s) to ${written.directory}`);
     }
     if (written.zip !== null) ctx.out(`wrote ${written.zip} (${String(written.bytes)} B)`);
   }

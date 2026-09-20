@@ -12,6 +12,7 @@ import { act } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { OP, WINDOW_SIZE, WebUsbTransport, type Artifact, type WebUsbDevice } from '@seek-fw/core';
 import { renderHook } from '../test-helpers';
+import { permissionHint } from '../lib/hints';
 import { DEFAULT_OPTIONS_FORM, type OptionsFailure } from '../lib/options';
 import { useDumpPanel } from './useDumpPanel';
 import { useRunner } from './useRunner';
@@ -22,7 +23,12 @@ const downloads: { dirName: string; artifacts: readonly Artifact[] }[] = [];
 vi.mock('../lib/download', () => ({
   downloadArchive: (dirName: string, artifacts: readonly Artifact[]) => {
     downloads.push({ dirName, artifacts });
-    return { fileName: `${dirName}.zip`, fileCount: artifacts.length, bytes: 4096 };
+    return {
+      fileName: `${dirName}.zip`,
+      fileCount: artifacts.length,
+      bytes: 4096,
+      dataBytes: 2048,
+    };
   },
   mib: (bytes: number, digits = 1) => (bytes / (1024 * 1024)).toFixed(digits),
 }));
@@ -173,6 +179,29 @@ describe('useDumpPanel', () => {
     expect(result.current.panel.reporter.progress.text).toContain('Check your downloads.');
     unmount();
   }, 30_000);
+
+  it('tells the user how to get the camera back when the claim fails', async () => {
+    /* The browser's commonest failure, and the one whose remedy is off the
+     * page entirely: a udev rule, Zadig, or quitting whatever holds it. */
+    const camera = fakeCamera();
+    const denied: WebUsbDevice = {
+      ...camera,
+      claimInterface: () => Promise.reject(new Error('Access denied.')),
+    };
+    const { result, unmount } = renderHook(() => useHarness(denied));
+
+    await act(async () => {
+      await result.current.panel.start('dump');
+    });
+
+    expect(downloads).toHaveLength(0);
+    const lines = result.current.panel.reporter.lines;
+    /* Which remedy is right depends on the machine, so compare against the
+     * one this test run's own user agent earns. */
+    expect(lines.map((line) => line.text)).toContain(permissionHint(navigator.userAgent));
+    expect(lines.at(-1)?.level).toBe('warn');
+    unmount();
+  });
 
   it('rejects an out-of-range option with the original message and packages nothing', async () => {
     const camera = fakeCamera();

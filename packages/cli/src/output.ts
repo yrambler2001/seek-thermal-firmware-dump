@@ -11,7 +11,7 @@
 
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { buildZip, type Artifact } from '@seek-fw/core';
+import { buildZip, zipEntryCount, zipTotalDataSize, type Artifact } from '@seek-fw/core';
 import { CliError } from './errors.js';
 
 function reject(name: string, why: string): never {
@@ -61,6 +61,8 @@ export interface WrittenOutput {
   readonly directory: string | null;
   /** The zip written, when one was. */
   readonly zip: string | null;
+  /** Artifacts written — which is one per zip entry, not one per path. */
+  readonly entries: number;
   readonly bytes: number;
 }
 
@@ -110,7 +112,9 @@ export async function writeOutputs(
   artifacts: readonly Artifact[],
 ): Promise<WrittenOutput> {
   const files: string[] = [];
-  let bytes = artifacts.reduce((total, artifact) => total + artifact.data.length, 0);
+  /* Core's own accounting of what a store-only archive holds, so the number
+   * reported for a directory and the number reported for a zip cannot drift. */
+  let bytes = zipTotalDataSize(artifacts);
 
   if (target.directory !== null) {
     files.push(...(await writeArtifactsToDirectory(target.directory, artifacts)));
@@ -123,6 +127,7 @@ export async function writeOutputs(
     files,
     directory: target.directory === null ? null : resolve(target.directory),
     zip: target.zip === null ? null : resolve(target.zip),
+    entries: zipEntryCount(artifacts),
     bytes,
   };
 }

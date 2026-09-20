@@ -4,7 +4,7 @@
  * the only module that knows what a `Blob` is.
  */
 
-import { buildZip, type Artifact } from '@seek-fw/core';
+import { buildZip, zipEntryCount, zipTotalDataSize, type Artifact } from '@seek-fw/core';
 
 /** The original revoked after a minute, which is long enough for the browser
  *  to have started writing the file and short enough not to leak a 4 MiB blob
@@ -55,7 +55,11 @@ export function downloadBytes(
 export interface ArchiveResult {
   readonly fileName: string;
   readonly fileCount: number;
+  /** The ZIP as downloaded. */
   readonly bytes: number;
+  /** What the same files weigh unpacked — the entries are stored, not
+   *  deflated, so the gap between the two is pure ZIP bookkeeping. */
+  readonly dataBytes: number;
 }
 
 /**
@@ -72,7 +76,12 @@ export function downloadArchive(
   );
   const fileName = `${dirName}.zip`;
   downloadBlob(new Blob([zip as BlobPart], { type: 'application/zip' }), fileName, deps);
-  return { fileName, fileCount: artifacts.length, bytes: zip.length };
+  return {
+    fileName,
+    fileCount: zipEntryCount(artifacts),
+    bytes: zip.length,
+    dataBytes: zipTotalDataSize(artifacts),
+  };
 }
 
 export function mib(bytes: number, digits = 1): string {

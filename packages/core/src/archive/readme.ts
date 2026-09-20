@@ -223,8 +223,18 @@ export function makeOfflineDecryptReadme(manifest: OfflineDecryptManifest): stri
     ...producedByLines(),
     '',
     'The source image was not modified and no device was contacted.',
-    'See `decrypted/decryption_report.txt` for the key, its location in the dump,',
-    'the cipher profile, and per-slot SP/entry/SHA-256 details.',
+    /* Both front ends now package an archive even when nothing decrypted, so
+     * this cannot point at a report that was never written. */
+    ...(manifest.decryption.attempted && manifest.decryption.images.length > 0
+      ? [
+          'See `decrypted/decryption_report.txt` for the key, its location in the dump,',
+          'the cipher profile, and per-slot SP/entry/SHA-256 details.',
+        ]
+      : [
+          'No firmware image slot was decrypted from this file, so there is no',
+          '`decrypted/` directory. `manifest.json` records the file it was given, its',
+          'SHA-256 and the firmware profile that was tried.',
+        ]),
     '',
   ].join('\n');
 }

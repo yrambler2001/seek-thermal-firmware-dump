@@ -6,6 +6,7 @@
 
 import { useCallback, useMemo } from 'react';
 import { SeekDevice, errorMessage, hex } from '@seek-fw/core';
+import { logHint } from '../lib/hints';
 import { readOptions, type OptionsForm } from '../lib/options';
 import type { DeviceHandle } from './useDevice';
 import type { ReporterHandle } from './useReporter';
@@ -64,7 +65,11 @@ export function useConnectionTest(params: ConnectionTestParams): ConnectionTestA
             'ok',
           );
         } catch (error) {
+          /* The likeliest failure here is a claim the browser cannot make,
+           * and that one is fixed off the page — by a udev rule, by Zadig, or
+           * by quitting whatever else holds the camera. */
           reporter.log(`test failed: ${errorMessage(error)}`, 'error');
+          logHint(reporter.log, error);
         } finally {
           if (transport !== null) await transport.close();
         }

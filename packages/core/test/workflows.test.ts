@@ -748,10 +748,14 @@ describe('readDeviceInfo', () => {
     expect(state.slots.every((s) => !s.present)).toBe(true);
     expect(state.cfg0).not.toBeNull();
 
-    /* the authenticated channel is what the evidence saw, and detection agrees */
-    expect(state.evidence.authSelectorRequired).toBe(true);
+    /* the authenticated channel is what the evidence saw — "it armed the bank",
+     * not "the plain one was refused", because nothing tried the plain one */
+    expect(state.evidence.authSelectorWorks).toBe(true);
     expect(state.evidence.plainSelectorWorks).toBeUndefined();
     expect(state.detection.best.profile.id).toBe('legacy-auth');
+    /* and on evidence that weak the family is a lead, not a verdict: the flag
+     * is set by this profile's own map, so it cannot confirm the profile */
+    expect(state.detection.ambiguous).toBe(true);
 
     /* nothing in the flash command set was ever sent */
     const flashOps = new Set([0x50, 0x51]);
@@ -767,6 +771,23 @@ describe('readDeviceInfo', () => {
     const camera = cameraFor(legacyAuth);
     const ctx = await contextFor(legacyAuth, camera);
     await expect(readDeviceInfo(ctx, { chunk: 4096 })).resolves.toBeDefined();
+  }, 60_000);
+
+  it('records the plain channel on a profile whose map never sends a token', async () => {
+    /* Every arm the 4.x map makes — boot config, bootloader block, slots — is
+     * plain, so a run that got anywhere at all has observed the plain channel
+     * working on banks the legacy firmware locks, and cannot have observed the
+     * authenticated one. */
+    const camera = cameraFor(modern4x);
+    const ctx = await contextFor(modern4x, camera);
+
+    const state = await readDeviceInfo(ctx, { chunk: 4096 });
+
+    expect(state.evidence.plainSelectorWorks).toBe(true);
+    expect(state.evidence.authSelectorWorks).toBeUndefined();
+    /* legacy-auth is ruled out by that, not by which profile we acted under */
+    const legacyMatch = state.detection.ranked.find((m) => m.profile.id === 'legacy-auth');
+    expect(legacyMatch?.score).toBe(0);
   }, 60_000);
 });
 

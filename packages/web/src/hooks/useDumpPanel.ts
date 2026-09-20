@@ -27,6 +27,7 @@ import {
   type WorkflowContext,
 } from '@seek-fw/core';
 import { downloadArchive, mib } from '../lib/download';
+import { logHint } from '../lib/hints';
 import {
   asOptionsFailure,
   readOptions,
@@ -152,6 +153,7 @@ export function useDumpPanel(params: DumpPanelParams): DumpPanelApi {
             return;
           }
           reporter.log(`ERROR: ${errorMessage(error)}`, 'error');
+          logHint(reporter.log, error);
           reporter.setStatus('Failed — see the log above.');
         } finally {
           reporter.flush();

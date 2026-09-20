@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveDumpOptions } from '@seek-fw/core';
+import { DEFAULT_DUMP_OPTIONS, WINDOW_SIZE, resolveDumpOptions } from '@seek-fw/core';
 import {
   DEFAULT_OPTIONS_FORM,
   OptionsError,
@@ -44,6 +44,25 @@ describe('readOptions', () => {
       decrypt: true,
       recipient: 'auto',
     });
+  });
+
+  it("parses the form defaults to exactly core's defaults", () => {
+    /* The form holds the original page's `value=` strings and core holds
+     * numbers, so nothing but this test stops the two drifting apart. */
+    const parsed = readOptions(form());
+    expect({
+      chunk: parsed.chunk,
+      gapFill: parsed.gapFill,
+      retries: parsed.retries,
+      retryDelayMs: parsed.retryDelayMs,
+      decrypt: parsed.decrypt,
+    }).toEqual(DEFAULT_DUMP_OPTIONS);
+  });
+
+  it('accepts a chunk of exactly one window, and nothing past it', () => {
+    /* The ceiling is core's WINDOW_SIZE, not a 65536 written twice. */
+    expect(readOptions(form({ chunk: String(WINDOW_SIZE) })).chunk).toBe(WINDOW_SIZE);
+    expect(failure({ chunk: String(WINDOW_SIZE + 1) }).field).toBe('chunk');
   });
 
   it('produces something core also accepts', () => {

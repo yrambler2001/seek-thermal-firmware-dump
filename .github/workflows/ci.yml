@@ -31,17 +31,19 @@ jobs:
         run: npm run typecheck
 
       - name: Test
-        run: npm run test -- --coverage
+        run: npm run test:coverage
 
       - name: Build
         run: npm run build
 
       # GitHub Pages serves this repo from docs/, so a stale build is a broken
-      # site. Rebuilding in CI and diffing catches a forgotten `npm run build`.
+      # site. Rebuilding in CI and comparing catches a forgotten `npm run build`.
+      # `git status`, not `git diff`: a bundle whose content hash changed leaves
+      # an UNTRACKED asset next to the old one, which a diff does not report.
       - name: docs/ is up to date with source
         run: |
-          if ! git diff --quiet -- docs; then
+          if [ -n "$(git status --porcelain -- docs)" ]; then
             echo "::error::docs/ is out of date. Run 'npm run build' and commit the result."
-            git diff --stat -- docs
+            git status --porcelain -- docs
             exit 1
           fi

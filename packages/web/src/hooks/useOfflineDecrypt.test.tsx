@@ -28,7 +28,7 @@ const downloads: { dirName: string; artifacts: readonly Artifact[] }[] = [];
 vi.mock('../lib/download', () => ({
   downloadArchive: (dirName: string, artifacts: readonly Artifact[]) => {
     downloads.push({ dirName, artifacts });
-    return { fileName: `${dirName}.zip`, fileCount: artifacts.length, bytes: 1024 };
+    return { fileName: `${dirName}.zip`, fileCount: artifacts.length, bytes: 1024, dataBytes: 512 };
   },
   mib: (bytes: number, digits = 1) => (bytes / (1024 * 1024)).toFixed(digits),
 }));
@@ -143,7 +143,7 @@ describe('useOfflineDecrypt', () => {
     if (manifest === undefined) throw new Error('no manifest');
     const parsed: unknown = JSON.parse(new TextDecoder().decode(manifest.data));
     expect(parsed).toMatchObject({
-      producer: 'seek-thermal-firmware-dump (offline decrypt)',
+      producer: 'seek-thermal-firmware-dump (web, modern-4x)',
       source: { fileName: 'dump.bin', size: bytes.length },
       flashBase: '0x14000000',
       decryption: { attempted: true },
@@ -173,14 +173,44 @@ describe('useOfflineDecrypt', () => {
     unmount();
   });
 
-  it('says so when a well-formed file holds no firmware image', async () => {
-    const file = new File([new Uint8Array(0x20000).fill(0xff)], 'blank.bin');
+  it('still packages a manifest when a well-formed file holds no image', async () => {
+    /* The archive is the point. "Nothing was found in this file, here is its
+     * SHA-256 and the profile that was tried" is a citable result, and the CLI
+     * has always written one for the same input — only a file too small to
+     * hold a header, or a cancel, packages nothing. */
+    const bytes = new Uint8Array(0x20000).fill(0xff);
+    const file = new File([bytes], 'blank.bin');
     const { result, unmount } = renderHook(useHarness);
     await decrypt(result, file);
 
-    expect(downloads).toHaveLength(0);
+    expect(downloads).toHaveLength(1);
+    const [archive] = downloads;
+    if (archive === undefined) throw new Error('no archive');
+    expect(archive.artifacts.map((file_) => file_.name).sort()).toEqual([
+      'README.md',
+      'manifest.json',
+    ]);
+
+    const manifest = archive.artifacts.find((file_) => file_.name === 'manifest.json');
+    if (manifest === undefined) throw new Error('no manifest');
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(manifest.data));
+    expect(parsed).toMatchObject({
+      producer: 'seek-thermal-firmware-dump (web, generic)',
+      source: { fileName: 'blank.bin', size: bytes.length },
+      /* The search ran and came up empty — which is the finding, and the
+       * manifest says so rather than the archive simply not existing. */
+      decryption: { attempted: true, images: [], note: 'no image slots found' },
+    });
+    /* The SHA-256 of the file that was searched is the whole evidentiary
+     * value of a no-images manifest. */
+    expect((parsed as { source: { sha256: string } }).source.sha256).toMatch(/^[0-9a-f]{64}$/);
+
+    /* The log and the status stay honest about what was found. */
+    expect(result.current.reporter.lines.map((line) => line.text)).toContain(
+      'no firmware image in this file could be decrypted — packaging the manifest anyway',
+    );
     expect(result.current.reporter.progress.text).toBe(
-      'No images decrypted — see the log for why.',
+      'No images decrypted — see the log for why. The manifest is in your downloads.',
     );
     unmount();
   });

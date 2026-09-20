@@ -19,6 +19,7 @@ import { basename } from 'node:path';
 import {
   CancelledError,
   getProfile,
+  hexDump,
   hexUp,
   prepareImage,
   requireCapability,
@@ -43,6 +44,16 @@ import {
   workflowContext,
   writeRun,
 } from './shared.js';
+
+/**
+ * How much of the payload the plan shows.
+ *
+ * Four rows of sixteen: the stack pointer, the reset vector and the first
+ * exception vectors — the bytes that say at a glance whether this is a
+ * plausible image for this camera, and the same window the web app's preview
+ * shows. The rest is a 4 MiB bank and belongs in a file, not in a prompt.
+ */
+const PREVIEW_BYTES = 64;
 
 /** A reporter that shows `detail` lines too: during a write, nothing is noise. */
 function loud(inner: Reporter): Reporter {
@@ -131,6 +142,14 @@ function renderPlan(ctx: CommandContext, prep: PreparedFlash, payloadSha256: str
       ['  payload sha256', payloadSha256],
     ]),
   );
+
+  /* The hex head, as the original page showed before asking. A checksum says
+   * two things are different; these bytes say what is about to be written. */
+  say('');
+  say(heading(`First ${String(PREVIEW_BYTES)} bytes of the payload`, ctx.color));
+  for (const line of hexDump(prep.payload.subarray(0, PREVIEW_BYTES)).split('\n')) {
+    say(`  ${line}`);
+  }
 
   if (prep.compare.length > 0) {
     say('');

@@ -780,4 +780,57 @@ describe('README generation', () => {
     expect(readme).toContain('4194304 bytes');
     expect(readme).toContain('deadbeef'.repeat(8));
   });
+
+  it('does not cite a decryption report it did not write', () => {
+    /* Both front ends now package an archive even when nothing decrypted, so a
+     * README that always pointed at `decrypted/decryption_report.txt` would be
+     * naming a file that is not in the zip. */
+    const base = {
+      producer: 'p',
+      startedAt: 't0',
+      finishedAt: '2024-03-05T10:25:00.000Z',
+      source: { fileName: 'empty.bin', size: 1024, sha256: 'ab'.repeat(32) },
+      flashBase: 0x14000000,
+      profile: sampleProfile(),
+    };
+
+    const nothing = makeOfflineDecryptReadme(
+      buildOfflineDecryptManifest({
+        ...base,
+        decryption: buildDecryptionNotAttempted('no images found'),
+      }),
+    );
+    expect(nothing).not.toContain('decryption_report.txt');
+    expect(nothing).toContain('No firmware image slot was decrypted');
+    expect(nothing).toContain('manifest.json');
+
+    const something = makeOfflineDecryptReadme(
+      buildOfflineDecryptManifest({
+        ...base,
+        decryption: buildDecryptionSummary({
+          images: [
+            buildImageSummary({
+              flash: 0x14030000,
+              fileOffset: 0x30000,
+              length: 0xaf08,
+              cipherSha256: 'c'.repeat(64),
+              plainSha256: 'p'.repeat(64),
+              confidence: 'VERIFIED(profile)',
+              key: new Uint8Array(16),
+              state: [1, 2, 3, 4],
+              derivedTarget: 0x0000ffff,
+              profile: 'modern',
+              sp: 0x1001f800,
+              entry: 0x10000409,
+              duplicateOf: null,
+              embeddedKeyTable: null,
+              file: 'decrypted/x.bin',
+            }),
+          ],
+          keys: [],
+        }),
+      }),
+    );
+    expect(something).toContain('decryption_report.txt');
+  });
 });
