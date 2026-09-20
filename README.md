@@ -11,9 +11,10 @@ No drivers on macOS or Linux, no SDK, no J-Link. Nothing is uploaded anywhere: t
 runs entirely on your machine, and the CLI talks to the camera directly.
 
 ```sh
-npx @seek-fw/cli dump --out ./my-camera     # whole flash + decrypted images
-npx @seek-fw/cli info                       # what is this camera running?
-npx @seek-fw/cli decrypt flash_4m.bin       # works with no camera attached
+npm ci && npm run build
+node packages/cli/dist/bin.js dump --out ./my-camera   # whole flash + decrypted images
+node packages/cli/dist/bin.js info                     # what is this camera running?
+node packages/cli/dist/bin.js decrypt flash_4m.bin     # works with no camera attached
 ```
 
 ## What it does
@@ -51,10 +52,18 @@ WebUSB needs Chrome, Edge, or another Chromium browser on Windows, macOS, Linux 
 
 ### CLI
 
+The packages are not published to npm, so the CLI runs from a clone:
+
 ```sh
-npm install -g @seek-fw/cli
-seek-fw --help
+git clone https://github.com/yrambler2001/seek-thermal-firmware-dump
+cd seek-thermal-firmware-dump
+npm ci && npm run build
+node packages/cli/dist/bin.js --help
 ```
+
+To get a `seek-fw` on your `PATH`, link it once with
+`npm link --workspace @seek-fw/cli`. The examples below use `seek-fw` for
+brevity; substitute `node packages/cli/dist/bin.js` if you have not linked it.
 
 | Command                  | What it does                                                             |
 | ------------------------ | ------------------------------------------------------------------------ |
@@ -75,7 +84,10 @@ Common options:
 --chunk <n>          control-IN request size (default 64)
 --gap-fill <byte>    fill byte for unreachable blocks (default 0xff)
 --retries <n>        per-window retry count (default 2)
+--retry-delay <ms>   pause between window retries (default 500)
 --recipient <r>      interface | device | auto (default auto)
+--serial <id>        pick one camera when several are attached
+--no-decrypt         dump the flash but skip the decryption stage
 --json               machine-readable output on stdout
 --quiet, --verbose, --no-color
 ```

@@ -30,6 +30,9 @@ export function dumpOptionsFrom(options: GlobalOptions): Partial<DumpOptions> {
     ...(options.gapFill === null ? {} : { gapFill: options.gapFill }),
     ...(options.retries === null ? {} : { retries: options.retries }),
     ...(options.retryDelayMs === null ? {} : { retryDelayMs: options.retryDelayMs }),
+    /* Always forwarded: `--no-decrypt` has to be able to turn off a default
+     * that is `true`, which an "only if set" spread could never express. */
+    decrypt: options.decrypt,
   };
 }
 

@@ -29,6 +29,7 @@ const COMMON_OPTIONS = `Options
   --retry-delay <ms>     pause between window retries (default 500)
   --recipient <r>        interface | device | auto (default auto)
   --serial <id>          pick one camera when several are attached
+  --no-decrypt           dump the flash but skip the decryption stage
   --json                 machine-readable output on stdout
   --quiet                no progress bar and no log lines
   --verbose              show detail lines and full stack traces

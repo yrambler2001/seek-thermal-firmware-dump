@@ -52,6 +52,8 @@ export interface GlobalOptions {
   readonly retryDelayMs: number | null;
   readonly recipient: RecipientPreference;
   readonly serial: string | null;
+  /** False when `--no-decrypt` was passed: dump the flash but skip decryption. */
+  readonly decrypt: boolean;
   readonly json: boolean;
   readonly quiet: boolean;
   readonly verbose: boolean;
@@ -131,6 +133,7 @@ export function parseCli(argv: readonly string[]): ParsedCli {
         'retry-delay': { type: 'string' },
         recipient: { type: 'string' },
         serial: { type: 'string' },
+        decrypt: { type: 'boolean', default: true },
         json: { type: 'boolean', default: false },
         quiet: { type: 'boolean', default: false },
         verbose: { type: 'boolean', default: false },
@@ -196,6 +199,7 @@ export function parseCli(argv: readonly string[]): ParsedCli {
         : bounded('retry-delay', parseInteger('retry-delay', values['retry-delay']), 0, 600_000),
     recipient: recipient as RecipientPreference,
     serial: values.serial ?? null,
+    decrypt: values.decrypt,
     json: values.json,
     quiet: values.quiet,
     verbose: values.verbose,
@@ -288,6 +292,27 @@ export async function run(argv: readonly string[], io: Io, signal: AbortSignal):
     parsed = parseCli(argv);
   } catch (error) {
     const described = describeError(error, io.platform);
+    /* `--json` is read straight off argv here because parsing is what failed.
+     * Without this, a usage error was the one outcome that wrote nothing to
+     * stdout, so `seek-fw … --json | jq` broke on a typo'd flag while every
+     * other failure produced a readable error document. */
+    if (argv.includes('--json')) {
+      io.stdout.write(
+        `${JSON.stringify(
+          {
+            command: null,
+            ok: false,
+            error: {
+              code: 'cli/usage',
+              message: described.message,
+              ...(described.hint === undefined ? {} : { hint: described.hint }),
+            },
+          },
+          null,
+          2,
+        )}\n`,
+      );
+    }
     io.stderr.write(`${usageFor(null)}\n`);
     io.stderr.write(`error: ${described.message}\n`);
     if (described.hint !== undefined) io.stderr.write(`${described.hint}\n`);

@@ -189,6 +189,7 @@ function slot(
     address,
     present: true,
     reason: null,
+    unread: false,
     header: RUNNING_HEADER,
     raw: null,
     footer: footerTemplate(IMAGE_SIZE),

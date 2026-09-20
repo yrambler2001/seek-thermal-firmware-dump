@@ -10,6 +10,15 @@ function runOptions(argv: readonly string[]) {
 }
 
 describe('parseCli', () => {
+  it('turns decryption off with --no-decrypt, which a default of true needs', () => {
+    /* `decrypt` defaults to true in core, so "only forward what was set"
+     * could never express turning it off — the web UI has always had this
+     * control and the CLI silently did not. */
+    expect(runOptions(['dump']).options.decrypt).toBe(true);
+    expect(runOptions(['dump', '--no-decrypt']).options.decrypt).toBe(false);
+    expect(runOptions(['dump', '--decrypt']).options.decrypt).toBe(true);
+  });
+
   it('defaults every option that was not given', () => {
     const parsed = runOptions(['dump']);
     expect(parsed.command).toBe('dump');
@@ -28,6 +37,7 @@ describe('parseCli', () => {
       quiet: false,
       verbose: false,
       colorFlag: true,
+      decrypt: true,
       yes: false,
       rescueDump: true,
     });

@@ -10,6 +10,8 @@ import { createRoot } from 'react-dom/client';
 
 export interface HookHandle<T> {
   readonly result: { current: T };
+  /** Re-renders the probe, for asserting how a hook reacts to changed inputs. */
+  rerender: () => void;
   unmount: () => void;
 }
 
@@ -30,6 +32,11 @@ export function renderHook<T>(hook: () => T): HookHandle<T> {
 
   return {
     result,
+    rerender: () => {
+      act(() => {
+        root.render(<Probe />);
+      });
+    },
     unmount: () => {
       act(() => {
         root.unmount();

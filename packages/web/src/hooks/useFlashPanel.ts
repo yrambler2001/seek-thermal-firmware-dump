@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CancelledError,
+  SeekError,
   SeekDevice,
   errorMessage,
   flashInvalidatesAnalysis,
@@ -107,6 +108,17 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
   const stateRef = useRef<DeviceState | null>(null);
   const preparedRef = useRef<PreparedImage | null>(null);
 
+  /* Depend on the two stable callbacks, NOT on the reporter handles.
+   *
+   * A reporter handle is a fresh object on every log line and every progress
+   * tick — it has to be, since it carries the current lines and progress for
+   * rendering. Closing over the handles here made `dropAnalysis` change
+   * identity constantly, which re-fired the device-changed effect below on
+   * every log line and wiped the analysis the read had just produced. The
+   * `setStatus` functions are `useCallback(..., [])`, so this is stable. */
+  const { setStatus: setInfoStatus } = infoReporter;
+  const { setStatus: setFlashStatus } = flashReporter;
+
   const dropAnalysis = useCallback(
     (reason: string | null): void => {
       const had = stateRef.current !== null || preparedRef.current !== null;
@@ -115,11 +127,11 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
       setDeviceState(null);
       setPrepared(null);
       if (had && reason !== null) {
-        infoReporter.setStatus(reason);
-        flashReporter.setStatus(reason);
+        setInfoStatus(reason);
+        setFlashStatus(reason);
       }
     },
-    [flashReporter, infoReporter],
+    [setFlashStatus, setInfoStatus],
   );
 
   /* The whole point of `generation`: a new or vanished camera invalidates
@@ -353,6 +365,20 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
             log.log('');
           } else {
             log.log('rescue dump skipped at your request', 'warn');
+          }
+
+          /* The analysis can go stale between preparing and writing — a
+           * disconnect during the rescue dump drops it, and that dump runs for
+           * minutes. `state` was captured when the run started, so re-check the
+           * live one: a payload is only valid for the camera whose Key A built
+           * it. This is the original's guard at the top of writeFirmware(),
+           * which checked a module global that a disconnect nulled. */
+          if (stateRef.current !== state || preparedRef.current !== ready) {
+            throw new SeekError(
+              'flash/refused',
+              'the device analysis went stale before the write — read the device info again ' +
+                'and re-pick your image. Nothing was written.',
+            );
           }
 
           await writeFirmware(ctx, state, prep);

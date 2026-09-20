@@ -223,6 +223,13 @@ export interface SlotState {
   readonly present: boolean;
   /** Why the slot holds no usable image, when it does not. */
   readonly reason: string | null;
+  /**
+   * The READ failed — the window would not arm, or the transfer died — as
+   * opposed to a window that read back cleanly and simply holds no image.
+   * The difference matters: an unread slot means the picture of the camera is
+   * incomplete, so nothing may be written on the strength of it.
+   */
+  readonly unread: boolean;
   /** Header as read. It lives in the cleartext window, so it is readable as-is. */
   readonly header: ImageHeader | null;
   /** The whole bank as read: image + pad + footer. */

@@ -222,14 +222,14 @@ export async function flashCommand(ctx: CommandContext): Promise<CommandResult> 
     const prep = prepareImage(state, image, fileName);
     const payloadSha256 = await sha256hex(prep.payload);
 
-    /* (3) The rescue dump, before anything is written. */
-    const rescue = await takeRescueDump(ctx, session, state);
-
     /* Always rendered, even under --json (where it lands on stderr): nobody
      * should be asked to confirm a write they were not shown. */
     renderPlan(ctx, prep, payloadSha256);
 
-    /* (4) The confirmation. */
+    /* (3) The confirmation, BEFORE the rescue dump — as the original page did.
+     * Asking first costs nothing and saves a user who answers "n" from sitting
+     * through a full 4 MiB read and finding a rescue archive they never asked
+     * for in their output directory. */
     if (!ctx.options.yes) {
       const question =
         `Write ${prep.fileName} to ${prep.targetName ?? 'the upgrade slot'} on ` +
@@ -245,6 +245,10 @@ export async function flashCommand(ctx: CommandContext): Promise<CommandResult> 
     } else {
       ctx.reporter.log('--yes given: skipping the confirmation', 'warn');
     }
+
+    /* (4) The rescue dump, after the user has committed and before anything is
+     * written. This is the copy that makes the write recoverable. */
+    const rescue = await takeRescueDump(ctx, session, state);
 
     const workflow = {
       ...workflowContext(session, state.profile, state.detection, ctx),

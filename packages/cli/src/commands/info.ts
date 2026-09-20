@@ -269,8 +269,11 @@ export async function analyseCamera(
     (analyseOptions.rereadOnAnyBetter === true || cipherDiffers(state.profile, better));
   if (better !== null && mustReread) {
     ctx.reporter.log(
-      `the evidence identifies this camera as ${better.id} (${better.name}), whose cipher ` +
-        'differs from the one this read used — re-reading under it',
+      `the evidence identifies this camera as ${better.id} (${better.name})` +
+        (cipherDiffers(state.profile, better)
+          ? ', whose cipher differs from the one this read used'
+          : '') +
+        ' — re-reading under it',
       'warn',
     );
     state = await readDeviceInfo(workflowContext(session, better, state.detection, ctx), options);

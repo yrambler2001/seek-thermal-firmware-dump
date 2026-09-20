@@ -221,6 +221,25 @@ export function prepareImage(
     }
   }
 
+  /* The two keys must occupy DISTINCT bytes.
+   *
+   * `findEmbeddedKeyTable` checks each key occurs exactly once, independently,
+   * so a filename naming the same key twice satisfies it with
+   * `offsetA === offsetB` — and the patch below then writes Key A and Key B to
+   * the same 16 bytes, leaving Key A nowhere in the image. The original
+   * accepted that and offered the payload anyway, which is exactly the "every
+   * later upgrade lands under a key the bootloader cannot try" outcome this
+   * whole mechanism exists to prevent. */
+  if (at.offsetA < at.offsetB + 16 && at.offsetB < at.offsetA + 16) {
+    throw new SeekError(
+      'image/key-table',
+      `the filename's Key A and Key B resolve to overlapping bytes at ${hexUp(at.offsetA)} ` +
+        `and ${hexUp(at.offsetB)} — they must be two distinct 16-byte values, so this is ` +
+        'either the same key named twice or a file that does not carry a real key pair',
+      { detail: { offsetA: at.offsetA, offsetB: at.offsetB } },
+    );
+  }
+
   /* The original expressed this as "the source key occurs exactly once inside
    * the 16 bytes of my key", which is equality with extra steps. */
   const alreadyMine = equalBytes(srcA, myKeyA) && equalBytes(srcB, myKeyB);
@@ -243,6 +262,18 @@ export function prepareImage(
     changed: !alreadyMine,
   };
   const carriesMine = findEmbeddedKeyTable(image, myKeyA, myKeyB) !== null;
+  if (!carriesMine) {
+    /* The patch is the whole point: after it, the image must carry THIS
+     * camera's pair. If it does not, the keys did not land where they were
+     * meant to and the camera would re-encrypt its next upgrade under a key
+     * its bootloader cannot try. The original computed this and never looked
+     * at it. */
+    throw new SeekError(
+      'image/key-table',
+      "after retargeting, the image does not carry this camera's key pair exactly once — " +
+        'refusing to build a payload whose later upgrades the bootloader could not key',
+    );
+  }
 
   /* Carry over a footer that is already on this camera: its image_id, version
    * and model string stay whatever the camera shipped with, and only footer[1]
@@ -334,7 +365,11 @@ export async function writeFirmware(
   state: DeviceState,
   prep: PreparedFlash,
 ): Promise<void> {
-  requireCapability(ctx.profile, 'flash');
+  /* `state.profile`, NOT `ctx.profile`: everything below — the update-target
+   * selector, the cipher that built `prep` — comes from the analysed state, so
+   * a gate that inspected a different object than the one it protects would be
+   * worth nothing. They are normally the same; this is the last line. */
+  requireCapability(state.profile, 'flash');
   const { device, reporter } = ctx;
 
   if (!device.transport.isOpen) await device.transport.open(); /* a dump closes it */
@@ -421,7 +456,25 @@ export async function writeFirmware(
   if (streamError) abort(streamError, total);
 
   reporter.log(`committing: CompleteMemoryUpgrade(${hexUp(prep.sum16, 4)}) ...`, 'warn');
-  await device.completeMemoryUpgrade(prep.sum16, USB_COMMIT_TIMEOUT_MS);
+  try {
+    await device.completeMemoryUpgrade(prep.sum16, USB_COMMIT_TIMEOUT_MS);
+  } catch (error) {
+    /* The erase/program/verify chain runs INSIDE this transfer, so a transfer
+     * that times out or stalls says nothing about whether flash was touched —
+     * the camera may be part-way through programming the block. Treat it like
+     * any other post-erase failure and invalidate the analysis, so a caller
+     * cannot press Write again against a picture that may now be wrong. The
+     * plain rejection carried no such marker, and the front ends kept their
+     * state. */
+    if (error instanceof CancelledError) throw error;
+    throw new SeekError(
+      'flash/commit',
+      `CompleteMemoryUpgrade did not complete (${errorMessage(error)}) — the camera may be ` +
+        'part-way through erasing or programming the target slot. Re-read the device info ' +
+        'before doing anything else, and keep your rescue dump.',
+      { cause: error, detail: { dropAnalysis: true, safeToRetry: false } },
+    );
+  }
   await sleep(200); /* erase + program + verify runs inside this call */
   const commitError = await device.getErrorCode();
   if (commitError === ERR_BAD_CHECKSUM) {

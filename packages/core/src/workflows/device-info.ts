@@ -43,7 +43,7 @@ import {
 } from '../image/header.js';
 import { WINDOW_SIZE } from '../protocol/ops.js';
 import type { SeekDevice } from '../protocol/client.js';
-import { detectProfile, hasCapability, requireCapability } from '../profiles/registry.js';
+import { detectProfile, requireCapability } from '../profiles/registry.js';
 import type {
   BootPrediction,
   DeviceEvidence,
@@ -71,6 +71,8 @@ const BOOT_CONFIG_BYTES = 0x120;
 interface RawSlot {
   readonly present: boolean;
   readonly reason: string | null;
+  /** True only when the read threw; a clean read of an empty slot is false. */
+  readonly unread?: boolean;
   readonly header: ImageHeader | null;
   readonly raw: Uint8Array | null;
   readonly footer: ImageFooter | null;
@@ -352,6 +354,7 @@ export async function readDeviceInfo(
       read = {
         present: false,
         reason: errorMessage(error),
+        unread: true,
         header: null,
         raw: null,
         footer: null,
@@ -430,6 +433,7 @@ export async function readDeviceInfo(
       address: descriptor.address,
       present: slot.present,
       reason: slot.reason,
+      unread: slot.unread === true,
       header: slot.header,
       raw: slot.raw,
       footer: slot.footer,
@@ -584,11 +588,20 @@ export async function readDeviceInfo(
     );
   }
   if (prediction === null) blocked.push('the slot an upgrade would write could not be determined');
-  if (!hasCapability(profile, 'flash')) {
-    const support = profile.capabilities.flash;
-    blocked.push(
-      `${profile.name} does not support flashing: ${support.supported ? '' : support.reason}`,
-    );
+  /* The original threw out of readDeviceInfo the moment any slot's window
+   * refused to arm, so a partial picture could never reach the write path at
+   * all. Reporting the rest of the read is more useful than throwing it away,
+   * but the refusal has to survive: a slot that was never read could be the
+   * one an upgrade overwrites, and `confirmUpgradeTarget` cannot match a
+   * window against bytes it does not have. */
+  for (const slot of slots) {
+    if (slot.unread) {
+      blocked.push(`${slot.name} could not be read (${slot.reason ?? 'unknown error'})`);
+    }
+  }
+  const flashSupport = profile.capabilities.flash;
+  if (!flashSupport.supported) {
+    blocked.push(`${profile.name} does not support flashing: ${flashSupport.reason}`);
   }
   if (keyWhiteningK !== profile.cipher.whiteningK) {
     blocked.push(

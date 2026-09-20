@@ -172,6 +172,10 @@ export async function decryptDump(
   const dumpPath = options.dumpPath;
   const clock = options.now ?? ((): Date => new Date());
   const cancelled = (): boolean => options.signal?.aborted === true;
+  /* Set only where a cancel actually cut work short. Sampling `signal.aborted`
+   * at the end instead would report a run that finished every slot as partial
+   * just because the abort landed while the artifacts were being written. */
+  let stoppedEarly = false;
 
   /* With no profile given there is no device evidence either, so the dump has
    * to speak for itself. The choice is logged and written into the summary —
@@ -234,7 +238,10 @@ export async function decryptDump(
    * so the main loop below reuses them rather than solving twice. */
   const infoByCipher = new Map<string, RecoveredKey>();
   for (const image of images) {
-    if (cancelled()) break;
+    if (cancelled()) {
+      stoppedEarly = true;
+      break;
+    }
     const cipherHash = await sha256hex(bytes.subarray(image.base, image.base + image.len));
     if (!infoByCipher.has(cipherHash)) {
       infoByCipher.set(
@@ -284,7 +291,10 @@ export async function decryptDump(
   const plainHashFirst = new Map<string, number>();
 
   for (let index = 0; index < images.length; index++) {
-    if (cancelled()) break;
+    if (cancelled()) {
+      stoppedEarly = true;
+      break;
+    }
     const image = images[index];
     if (image === undefined) continue;
 
@@ -554,7 +564,7 @@ export async function decryptDump(
     slots,
     bootloaderKeys: bootKeys,
     detection,
-    cancelled: cancelled(),
+    cancelled: stoppedEarly,
   };
 }
 

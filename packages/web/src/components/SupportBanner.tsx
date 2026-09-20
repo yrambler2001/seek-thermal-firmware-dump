@@ -7,9 +7,14 @@ export interface SupportBannerProps {
   readonly status: SupportStatus;
 }
 
+/**
+ * Deliberately NOT a live region: support is detected once at mount and never
+ * changes, and a live region's initial content is not announced anyway. It is
+ * ordinary page content that a screen reader meets in document order.
+ */
 export function SupportBanner({ status }: SupportBannerProps): ReactElement {
   return (
-    <Banner tone={status.tone} role="status">
+    <Banner tone={status.tone}>
       <RichParagraphs paragraphs={status.paragraphs} />
     </Banner>
   );
