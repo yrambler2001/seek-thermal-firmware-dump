@@ -129,7 +129,7 @@ export async function runSweep(
         cancelled = true;
         break;
       }
-      reporter.progress(subcmd - first, span, `probe selector ${hex(subcmd)} ...`);
+      reporter.progress(subcmd - first, span, `probe selector ${hex(subcmd)} ...`, 'items');
 
       const payload =
         legacy && unlockToken !== null ? authPayloadFrom(unlockToken, subcmd) : u16Payload(subcmd);
@@ -204,7 +204,7 @@ export async function runSweep(
           ...(readError !== undefined ? { readError } : {}),
         }),
       );
-      reporter.progress(subcmd - first + 1, span);
+      reporter.progress(subcmd - first + 1, span, undefined, 'items');
     }
   } finally {
     await device.transport.close();
@@ -282,6 +282,7 @@ export async function runSweep(
     1,
     1,
     `Done — ${String(armedCount)}/${String(span)} selectors armed, ${String(withData)} with data.`,
+    'items',
   );
 
   return {

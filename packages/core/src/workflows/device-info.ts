@@ -599,7 +599,16 @@ export async function readDeviceInfo(
   if (!detection.ambiguous && detection.best.profile.id !== profile.id) {
     /* The evidence names a different family than the one we are acting under.
      * Key A would be this camera's, but the selector map, the cipher and the
-     * boot policy would not — so refuse and let the user pick deliberately. */
+     * boot policy would not — so refuse and let the user pick deliberately.
+     *
+     * This is deliberately NOT an auto-adopt. Detection needs the slots, and
+     * which addresses the slots live at is itself a property of the profile,
+     * so a read always commits to one family before it can judge the family.
+     * Switching silently at this point would make this very refusal vacuous
+     * and would change what the tool acts under without the user asking. A
+     * caller that wants the detected family re-reads under it explicitly —
+     * one extra read is a cheap price for the adoption being a decision
+     * somebody made rather than one the code made quietly. */
     blocked.push(
       `the evidence says this camera is ${detection.best.profile.name}, not ${profile.name} ` +
         `(${detection.best.reasons.join('; ')})`,

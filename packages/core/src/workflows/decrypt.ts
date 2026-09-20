@@ -292,6 +292,7 @@ export async function decryptDump(
       index,
       images.length,
       `decrypt: recovering key for ${hexUp(flashBase + image.base)} ...`,
+      'items',
     );
 
     const source = bytes.subarray(image.base, image.base + image.len);

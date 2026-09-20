@@ -38,13 +38,14 @@ export { CancelledError, SeekError, errorMessage, isSeekError } from './errors.j
 export type { SeekErrorCode, SeekErrorOptions } from './errors.js';
 
 /* ---- progress, logging and outputs ------------------------------------ */
-export { collectingReporter, prefixed, silentReporter } from './events.js';
+export { collectingReporter, prefixed, silentReporter, withLevelMap } from './events.js';
 export type {
   Artifact,
   ArtifactEvent,
   LogEvent,
   LogLevel,
   ProgressEvent,
+  ProgressUnit,
   Reporter,
   RunEvent,
 } from './events.js';

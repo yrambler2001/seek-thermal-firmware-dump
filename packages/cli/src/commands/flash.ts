@@ -26,8 +26,8 @@ import {
   sha256hex,
   writeFirmware,
   type DeviceState,
-  type LogLevel,
   type PreparedFlash,
+  withLevelMap,
   type Reporter,
 } from '@seek-fw/core';
 import type { CommandContext, CommandResult } from '../cli.js';
@@ -46,17 +46,7 @@ import {
 
 /** A reporter that shows `detail` lines too: during a write, nothing is noise. */
 function loud(inner: Reporter): Reporter {
-  return {
-    log: (message: string, level: LogLevel = 'info'): void => {
-      inner.log(message, level === 'detail' ? 'info' : level);
-    },
-    progress: (done: number, total: number, text?: string): void => {
-      inner.progress(done, total, text);
-    },
-    artifact: (artifact) => {
-      inner.artifact(artifact);
-    },
-  };
+  return withLevelMap(inner, (level) => (level === 'detail' ? 'info' : level));
 }
 
 function planJson(prep: PreparedFlash, payloadSha256: string): Record<string, unknown> {
