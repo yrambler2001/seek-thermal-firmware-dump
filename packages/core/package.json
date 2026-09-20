@@ -1,0 +1,22 @@
+{
+  "name": "@seek-fw/core",
+  "version": "2.0.0",
+  "description": "Isomorphic core for Seek Thermal firmware dumping, decryption and flashing. Zero dependencies.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc --build tsconfig.build.json",
+    "clean": "rm -rf dist tsconfig.build.tsbuildinfo"
+  }
+}

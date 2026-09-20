@@ -1,52 +1,153 @@
-# Seek Thermal Firmware Dump
+# Seek Thermal Firmware Toolkit
 
-Read the 4 MiB SPIFI flash of a Seek Thermal camera **from your browser**, over WebUSB, and decrypt
-any firmware images found in it. A second view reports the firmware the camera is running and flashes
-a new plaintext image to it.
+Read the 4 MiB SPIFI flash of a Seek Thermal camera, decrypt the firmware images inside it, and
+flash a new plaintext image back — **from a browser over WebUSB, or from the command line**.
 
-**→ [Open the tool](https://yrambler2001.github.io/seek-thermal-firmware-dump/)**
+**→ [Open the web tool](https://yrambler2001.github.io/seek-thermal-firmware-dump/)**
 &nbsp;·&nbsp;
-**[Firmware and flashing](https://yrambler2001.github.io/seek-thermal-firmware-dump/#flash)**
+**[Firmware and flashing](https://yrambler2001.github.io/seek-thermal-firmware-dump/#/flash)**
 
-No install, no drivers on macOS or Linux, no SDK, no J-Link. Everything runs locally in the browser —
-the dump never leaves your machine.
+No drivers on macOS or Linux, no SDK, no J-Link. Nothing is uploaded anywhere: the browser build
+runs entirely on your machine, and the CLI talks to the camera directly.
+
+```sh
+npx @seek-fw/cli dump --out ./my-camera     # whole flash + decrypted images
+npx @seek-fw/cli info                       # what is this camera running?
+npx @seek-fw/cli decrypt flash_4m.bin       # works with no camera attached
+```
 
 ## What it does
 
 1. Walks the device's `BeginFirmwareUpgrade` selector map, reading each 64 KiB block of
    `0x14000000..0x143fffff` with `GetFeaturedFirmwareData` over EP0 vendor control transfers.
 2. Assembles the blocks into one 4 MiB image.
-3. Scans that image for firmware slots and decrypts them, recovering the key from the dump itself.
-4. Hands you a single `.zip`.
+3. Scans that image for firmware slots and decrypts them, recovering the key from the dump itself —
+   by cryptanalysis, not by searching for a stored key.
+4. Hands you a directory or a single `.zip`.
 
-There is also an **offline mode**: pick a flash image you already have — from this page, from J-Link,
-or from an SPI programmer — and get back a zip of the decrypted firmware. That path touches no device
-and needs no WebUSB, so it works in **every** browser, including Safari, Firefox, and iOS.
+There is also an **offline mode**: point it at a flash image you already have — from this tool, from
+J-Link, or from an SPI programmer — and get back the decrypted firmware. That path touches no device
+and needs no WebUSB, so in the browser it works in **every** browser, including Safari, Firefox and
+iOS.
 
 ### Archive contents
 
-| Path | What it is |
-| --- | --- |
-| `flash_4m_usb_partial_gap_ff.bin` | the assembled 4 MiB flash image |
-| `windows/*.bin` | each 64 KiB block exactly as it came off the wire |
-| `decrypted/*.bin` | each firmware image slot, decrypted — named `…-KeyA-<32 hex>-KeyB-<32 hex>` when the image embeds that key pair (see below) |
-| `decrypted/*.txt` | per-slot report: key, key location, cipher profile, SP, entry, SHA-256 |
-| `decrypted/decryption_report.txt` | summary across all slots |
-| `manifest.json` | exact read, gap and decryption metadata |
-| `README.md` | what the capture is and what its limits are |
+| Path                              | What it is                                                                                                                  |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `flash_4m_usb_partial_gap_ff.bin` | the assembled 4 MiB flash image                                                                                             |
+| `windows/*.bin`                   | each 64 KiB block exactly as it came off the wire                                                                           |
+| `decrypted/*.bin`                 | each firmware image slot, decrypted — named `…-KeyA-<32 hex>-KeyB-<32 hex>` when the image embeds that key pair (see below) |
+| `decrypted/*.txt`                 | per-slot report: key, key location, cipher profile, SP, entry, SHA-256                                                      |
+| `decrypted/decryption_report.txt` | summary across all slots                                                                                                    |
+| `manifest.json`                   | exact read, gap and decryption metadata, including the firmware profile used                                                |
+| `README.md`                       | what the capture is and what its limits are                                                                                 |
+
+## Install and use
+
+### Web
+
+Nothing to install — [open the page](https://yrambler2001.github.io/seek-thermal-firmware-dump/).
+WebUSB needs Chrome, Edge, or another Chromium browser on Windows, macOS, Linux or Android.
+
+### CLI
+
+```sh
+npm install -g @seek-fw/cli
+seek-fw --help
+```
+
+| Command                  | What it does                                                             |
+| ------------------------ | ------------------------------------------------------------------------ |
+| `seek-fw devices`        | list connected Seek cameras                                              |
+| `seek-fw info`           | firmware version, slots, key table, boot config, detected profile        |
+| `seek-fw dump`           | read the whole 4 MiB flash and decrypt it                                |
+| `seek-fw sweep`          | probe every `BeginFirmwareUpgrade` selector and report what each exposes |
+| `seek-fw decrypt <file>` | decrypt a dump or image you already have — no camera needed              |
+| `seek-fw flash <image>`  | write a decrypted image to the camera                                    |
+| `seek-fw profiles`       | list the supported firmware families                                     |
+
+Common options:
+
+```
+--out <dir>          write files to a directory (default)
+--zip <file>         write a single archive instead
+--profile <id>       force a firmware profile instead of detecting one
+--chunk <n>          control-IN request size (default 64)
+--gap-fill <byte>    fill byte for unreachable blocks (default 0xff)
+--retries <n>        per-window retry count (default 2)
+--recipient <r>      interface | device | auto (default auto)
+--json               machine-readable output on stdout
+--quiet, --verbose, --no-color
+```
+
+`seek-fw flash` additionally takes `--yes` to skip the confirmation prompt and `--no-rescue-dump` to
+skip the full-flash backup taken before writing. Skipping that backup is not recommended: if the
+image does not boot, the dump is the only way back.
+
+On Linux the CLI needs permission to talk to the device — see [the udev rule](#linux-udev-rule)
+below, which applies to both the CLI and the browser.
+
+## Firmware version profiles
+
+Seek cameras do not all speak the same protocol, and the differences are not cosmetic — they change
+which selector exposes which block, how a stored key maps to the cipher state, and what the
+bootloader will accept. A **profile** captures one firmware family:
+
+| Profile        | Family                                                            | Dump | Decrypt | Flash   |
+| -------------- | ----------------------------------------------------------------- | ---- | ------- | ------- |
+| `modern-4x`    | 2018+ 4.x (Compact Pro, Compact Pro FF, Compact XR, Nano 300)     | yes  | yes     | **yes** |
+| `legacy-auth`  | older builds whose protected banks need an authenticated selector | yes  | yes     | no      |
+| `compact-2016` | the 2016 Compact Pro generation                                   | yes  | yes     | no      |
+| `generic`      | fallback when the family cannot be identified                     | yes  | yes     | no      |
+
+The profile is detected from evidence — the acceptance sum a slot decrypts to, whether a bank
+required the authenticated selector, the reported firmware version — and never guessed. When the
+evidence is weak the tool lands on `generic`, which keeps the camera dumpable and decryptable while
+refusing the one operation that can destroy it. `--profile <id>` overrides detection.
+
+Three properties that older versions of this tool conflated are kept independent, because measurement
+showed they are:
+
+- the **selector map** (which subcommand exposes which window),
+- the **whitening constant K** (how a stored key maps to the keystream state),
+- the **acceptance sum TARGET** (what the decrypted word sum must equal).
+
+A real 1.3.0.8 Compact build has `TARGET = 0x0000FFFF` and yet **no whitening at all**. Pairing the
+two, as the original single-file page did, reports that build's key wrongly — and a wrong Key A
+poisons the upgrade path on a real camera. The tool now resolves K by looking for each candidate key
+form in the image's own plaintext and keeping the one that actually occurs.
+
+Adding a family is one file in `packages/core/src/profiles/` plus one `registerProfile()` call.
+
+## Project layout
+
+```
+packages/
+  core/    @seek-fw/core   isomorphic, zero-dependency: cipher, key recovery,
+                           image packaging, USB protocol, firmware profiles
+  cli/     @seek-fw/cli    Node CLI, talks to the camera through `usb` v3
+  web/     @seek-fw/web    React app, talks to the camera through WebUSB
+legacy/index.html          the original single-file page, kept for reference
+docs/                      the built web app — GitHub Pages serves this folder
+scripts/                   the differential test against the legacy page
+```
+
+`core` knows nothing about React, Node or the DOM: it takes a `UsbTransport` and a `Reporter` and
+does the work. Both front ends are thin. That is what makes the CLI and the browser genuinely the
+same tool rather than two implementations that drift.
 
 ## Read-only by design
 
 The dump view — the default page — can issue exactly five vendor commands. That is its entire
 vocabulary, and there is no code path to anything else:
 
-| Opcode | Name | Dir | Why |
-| --- | --- | --- | --- |
-| `0x35` | GetErrorCode | IN | check status after each step |
-| `0x3c` | SetOperationMode | OUT | only to select mode 0, and only if not already there |
-| `0x3d` | GetOperationMode | IN | read the current mode |
-| `0x4f` | GetFeaturedFirmwareData | IN | the actual flash read |
-| `0x52` | BeginFirmwareUpgrade | OUT | volatile read-window selector only — it selects which block subsequent reads return, and writes nothing |
+| Opcode | Name                    | Dir | Why                                                                                                     |
+| ------ | ----------------------- | --- | ------------------------------------------------------------------------------------------------------- |
+| `0x35` | GetErrorCode            | IN  | check status after each step                                                                            |
+| `0x3c` | SetOperationMode        | OUT | only to select mode 0, and only if not already there                                                    |
+| `0x3d` | GetOperationMode        | IN  | read the current mode                                                                                   |
+| `0x4f` | GetFeaturedFirmwareData | IN  | the actual flash read                                                                                   |
+| `0x52` | BeginFirmwareUpgrade    | OUT | volatile read-window selector only — it selects which block subsequent reads return, and writes nothing |
 
 `SetFeaturedFirmwareData`, `CompleteMemoryUpgrade`, `ResetDevice` and every upload, commit and erase
 command are absent from this view. `USBDevice.reset()` is never called either; the retry path just
@@ -61,18 +162,18 @@ command set. Nothing in the dump view reaches it.
 Each RPC carries two permission bits in the firmware's dispatch table: bit 0 "allowed in operation
 mode 0", bit 1 "allowed in mode 1". They are not the same across builds:
 
-| Command | 4.18.x | 4.9.x |
-| --- | --- | --- |
-| `BeginFirmwareUpgrade` | `3` — either mode | `1` — **mode 0 only** |
-| `GetFeaturedFirmwareData` | `3` — either mode | `1` — **mode 0 only** |
-| `GetFirmwareInfo`, `SetFirmwareInfoFeatures`, `SetRamDataFeatures` | `3` | `3` |
+| Command                                                            | 4.18.x            | 4.9.x                 |
+| ------------------------------------------------------------------ | ----------------- | --------------------- |
+| `BeginFirmwareUpgrade`                                             | `3` — either mode | `1` — **mode 0 only** |
+| `GetFeaturedFirmwareData`                                          | `3` — either mode | `1` — **mode 0 only** |
+| `GetFirmwareInfo`, `SetFirmwareInfoFeatures`, `SetRamDataFeatures` | `3`               | `3`                   |
 
 So on a 4.9.x camera the two commands the dump is built from are refused while the camera is still
 imaging, and the page has to get it into mode 0 first. Leaving imaging is not instant — there is a
 sensor and a shutter to park — so the page now waits for mode 0 to actually read back rather than
 assuming a fixed delay covers it, and says so plainly if the camera never gets there.
 
-This is also why *reading device info first made dumping work*: the info selectors are allowed in
+This is also why _reading device info first made dumping work_: the info selectors are allowed in
 either mode, and the mode switch that happens on the way settles the camera before the dump starts.
 
 Separately, WebUSB control transfers have no timeout of their own. A camera that simply never answers
@@ -105,17 +206,17 @@ The USB command set exposes a read-window selector for every 64 KiB block of the
 **In practice this costs you nothing.** On most cameras that block is just erased flash, which reads
 as `0xff` anyway — so the filler matches the real contents and the dump is complete.
 
-And when the block *is* in use, what it holds is a redundant copy. These cameras keep the same
+And when the block _is_ in use, what it holds is a redundant copy. These cameras keep the same
 firmware image in several 64 KiB slots. Across every multi-slot dump checked while building this
 page, all slots decrypted to byte-identical firmware — in one case across four slots that had been
 written with two different keys:
 
-| Dump | Slots | Decrypted firmware |
-| --- | --- | --- |
-| Compact_Android_CW | `14030000` `14050000` `14070000` | all identical |
-| Compact_Pro_Android_UQ-AAA | `14050000` **`14060000`** `14070000` | all identical |
-| Nano_300_CQ_ABAX | `14030000` `14040000` `14050000` `14070000` | all identical (2 different keys) |
-| Restore_20260801 | `14030000` `14050000` `14070000` | all identical |
+| Dump                       | Slots                                       | Decrypted firmware               |
+| -------------------------- | ------------------------------------------- | -------------------------------- |
+| Compact_Android_CW         | `14030000` `14050000` `14070000`            | all identical                    |
+| Compact_Pro_Android_UQ-AAA | `14050000` **`14060000`** `14070000`        | all identical                    |
+| Nano_300_CQ_ABAX           | `14030000` `14040000` `14050000` `14070000` | all identical (2 different keys) |
+| Restore_20260801           | `14030000` `14050000` `14070000`            | all identical                    |
 
 On the one unit with a real image at `0x14060000`, it was byte-for-byte the same as the copies at
 `0x14050000` and `0x14070000` — so the archive still contains that firmware, just read from a
@@ -142,14 +243,14 @@ command vocabulary, and nothing on the dump page can reach it.
 **Read device info** asks the camera what it is, then reads all three firmware slots and decrypts them
 locally:
 
-| | |
-| --- | --- |
-| Running firmware | version and build string from `GetFirmwareInfo`, plus the bootloader's own build string |
-| Serial, platform, USB link | from the device-id RAM block and the info selectors |
-| Boot config | `cfg[0]` at `0x14010000`, which slot the camera booted, and which slot an upgrade would write |
-| Keys | Key A and Key B, read out of the camera's bootloader block and confirmed against a slot's recovered keystream |
-| Per-device key | whether `0x14000218` is programmed |
-| Each slot | firmware version, image id, size, model string, which key encrypts it, whether it passes the bootloader's acceptance sum and `CODE` footer check, and the SHA-256 of its plaintext |
+|                            |                                                                                                                                                                                    |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Running firmware           | version and build string from `GetFirmwareInfo`, plus the bootloader's own build string                                                                                            |
+| Serial, platform, USB link | from the device-id RAM block and the info selectors                                                                                                                                |
+| Boot config                | `cfg[0]` at `0x14010000`, which slot the camera booted, and which slot an upgrade would write                                                                                      |
+| Keys                       | Key A and Key B, read out of the camera's bootloader block and confirmed against a slot's recovered keystream                                                                      |
+| Per-device key             | whether `0x14000218` is programmed                                                                                                                                                 |
+| Each slot                  | firmware version, image id, size, model string, which key encrypts it, whether it passes the bootloader's acceptance sum and `CODE` footer check, and the SHA-256 of its plaintext |
 
 All of that is reads only.
 
@@ -191,20 +292,20 @@ and balances the sum over that exact range.
 
 The dump view's five, plus these — that is the entire additional vocabulary:
 
-| Opcode | Name | Dir | Why |
-| --- | --- | --- | --- |
-| `0x4e` | GetFirmwareInfo | IN | running version, bootloader string, platform, USB speed, boot state |
+| Opcode | Name                    | Dir | Why                                                                     |
+| ------ | ----------------------- | --- | ----------------------------------------------------------------------- |
+| `0x4e` | GetFirmwareInfo         | IN  | running version, bootloader string, platform, USB speed, boot state     |
 | `0x55` | SetFirmwareInfoFeatures | OUT | selects which of those to return — a selector register, writes no flash |
-| `0x5a` | SetRamDataFeatures | OUT | arms the 248-byte RAM device-id block so the serial can be read |
-| `0x50` | SetFeaturedFirmwareData | OUT | streams the payload into the camera's RAM staging buffer |
-| `0x51` | CompleteMemoryUpgrade | OUT | the commit — the only command that erases or programs flash |
+| `0x5a` | SetRamDataFeatures      | OUT | arms the 248-byte RAM device-id block so the serial can be read         |
+| `0x50` | SetFeaturedFirmwareData | OUT | streams the payload into the camera's RAM staging buffer                |
+| `0x51` | CompleteMemoryUpgrade   | OUT | the commit — the only command that erases or programs flash             |
 
 `ResetDevice` (`0x59`) is still never sent. There is no raw-block write path, and no code path writes
 the bootloader at `0x14000000` or the recovery slot at `0x14070000`.
 
 ### The keys inside the image, and why the filename carries them
 
-A firmware image contains its own `g_keyA` / `g_keyB`, and once it runs *those* are the keys it uses:
+A firmware image contains its own `g_keyA` / `g_keyB`, and once it runs _those_ are the keys it uses:
 Key A to decrypt an upload, Key B to re-encrypt it into flash. Flash an image whose table belongs to a
 different camera and you have quietly changed which keys your camera will use from then on — every
 later upgrade lands under a key the bootloader cannot try, and the camera stops taking updates.
@@ -240,7 +341,7 @@ The acceptance sum is balanced after the substitution, so the patch costs nothin
 ### When a flash lands but the camera keeps running the old firmware
 
 The bootloader's `image_try_keys()` tries exactly two keys: the store key (the per-device key at
-`0x14000218` if one is programmed, otherwise Key B) and Key A. A slot written under any *third* key
+`0x14000218` if one is programmed, otherwise Key B) and Key A. A slot written under any _third_ key
 decrypts perfectly, passes its acceptance sum, has a valid footer — and is still skipped at boot,
 because the bootloader has no way to derive that key.
 
@@ -306,14 +407,14 @@ Without a camera on the bench, the packaging was checked against real hardware a
 
 ## Browser and platform support
 
-| Platform | Dumping a camera | Decrypting a file |
-| --- | --- | --- |
-| **macOS** | Works out of the box in Chrome/Edge/Chromium. No driver, no admin rights. | ✅ |
-| **Linux** | Needs a one-line udev rule (below). | ✅ |
-| **Windows** | Needs WinUSB bound to the camera, via [Zadig](https://zadig.akeo.ie/) — pick the entry named after your camera, e.g. `CompactPRO FF`. | ✅ |
-| **Android** | Works in Chrome with a USB-OTG cable, if the phone can power the camera. | ✅ |
-| **iPhone / iPad** | **Not possible.** See below. | ✅ |
-| **Firefox / Safari** | Not possible — no WebUSB. | ✅ |
+| Platform             | Dumping a camera                                                                                                                      | Decrypting a file |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ----------------- |
+| **macOS**            | Works out of the box in Chrome/Edge/Chromium. No driver, no admin rights.                                                             | ✅                |
+| **Linux**            | Needs a one-line udev rule (below).                                                                                                   | ✅                |
+| **Windows**          | Needs WinUSB bound to the camera, via [Zadig](https://zadig.akeo.ie/) — pick the entry named after your camera, e.g. `CompactPRO FF`. | ✅                |
+| **Android**          | Works in Chrome with a USB-OTG cable, if the phone can power the camera.                                                              | ✅                |
+| **iPhone / iPad**    | **Not possible.** See below.                                                                                                          | ✅                |
+| **Firefox / Safari** | Not possible — no WebUSB.                                                                                                             | ✅                |
 
 WebUSB is a Chromium feature; Firefox and Safari have both declined to implement it. Only the dumping
 half depends on it — offline decryption works everywhere.
@@ -366,21 +467,21 @@ Because the pre-filter is only an optimisation — the checksum is the real acce
 it can never yield a wrong key, only a slower scan. So the search runs in stages and stops at the
 first one that finds a key:
 
-| Stage | SP constraint |
-| --- | --- |
-| `reset-vector` | top byte equals the dump's own word 0 — fastest, and what a naive scan does |
-| `sram-region` | any LPC43xx SRAM region (`0x10` or `0x20`) |
-| `alignment-only` | none; alignment and the entry vector alone |
+| Stage            | SP constraint                                                               |
+| ---------------- | --------------------------------------------------------------------------- |
+| `reset-vector`   | top byte equals the dump's own word 0 — fastest, and what a naive scan does |
+| `sram-region`    | any LPC43xx SRAM region (`0x10` or `0x20`)                                  |
+| `alignment-only` | none; alignment and the entry vector alone                                  |
 
 Dumps that the first stage already handles resolve identically and at identical speed. The stage that
 succeeded is recorded per key as `keySearch` in `manifest.json` and in the per-slot report.
 
 Two cipher profiles are known:
 
-| Builds | `K` | checksum target |
-| --- | --- | --- |
-| 2018.07.05 / 2019.01.07 / 2021.08.12 | `0x13579BDF` | `0x0000FFFF` |
-| 2016.06.26 | `0x00000000` | `0x00000000` |
+| Builds                               | `K`          | checksum target |
+| ------------------------------------ | ------------ | --------------- |
+| 2018.07.05 / 2019.01.07 / 2021.08.12 | `0x13579BDF` | `0x0000FFFF`    |
+| 2016.06.26                           | `0x00000000` | `0x00000000`    |
 
 Decryption is best-effort. A unit whose bootloader derives its key from chip OTP cannot be decrypted
 from a flash dump alone, because the OTP is not in the dump. Those slots are skipped and listed in
@@ -390,23 +491,47 @@ The implementation is a direct port of `decrypt_firmware.js` and produces byte-i
 verified against it on real dumps covering both cipher profiles, multi-key devices, duplicate slots,
 and the no-key-found path.
 
-## Running it locally
-
-WebUSB needs a secure context, which means HTTPS or `localhost`:
+## Development
 
 ```sh
 git clone https://github.com/yrambler2001/seek-thermal-firmware-dump
 cd seek-thermal-firmware-dump
-python3 -m http.server 8000
-# open http://localhost:8000
+npm ci
+
+npm run dev        # web app on http://localhost:5173
+npm run test       # vitest, all packages
+npm run check      # format + lint + typecheck + test
+npm run build      # builds core, cli, and the web app into docs/
 ```
 
-Opening `index.html` straight from disk also works in Chrome, but the origin is opaque, so the browser
-will not remember the device between reloads.
+Requires Node 22.13 or newer.
 
+The web app is built into `docs/`, which GitHub Pages serves, so **a change to the web app is not
+released until `npm run build` is run and `docs/` is committed**. CI fails if the two are out of
+sync.
+
+### Running the web app locally
+
+WebUSB needs a secure context, which means HTTPS or `localhost`. `npm run dev` gives you the latter.
 To reach it from an Android phone over USB, forward the port so the phone sees `localhost`:
 
 ```sh
-adb reverse tcp:8000 tcp:8000
+adb reverse tcp:5173 tcp:5173
 ```
 
+### Verifying a change against the original
+
+`legacy/index.html` is the only version of this code that has ever driven real hardware, so it is the
+reference. `scripts/verify-against-legacy.mjs` loads that page's own `<script>` into a stub-DOM `vm`
+context, runs both implementations over real flash dumps, and requires identical results — recovered
+keystream state, acceptance checksum, decrypted plaintext, and the rebuilt bank payload byte for
+byte.
+
+```sh
+npm run build
+node scripts/verify-against-legacy.mjs ~/path/to/SEEK_DUMPS
+```
+
+The dumps are real camera images and are deliberately not in this repository, so this is a local
+audit tool rather than a CI gate. Run it before changing anything in `packages/core/src/crypto` or
+`packages/core/src/image` — a bad payload bricks a camera whose bootloader has no USB recovery.

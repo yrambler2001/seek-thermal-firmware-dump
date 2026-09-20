@@ -1,0 +1,440 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import { equalBytes, utf8 } from '../src/bytes.js';
+import { CancelledError, SeekError } from '../src/errors.js';
+import { collectingReporter } from '../src/events.js';
+import { SeekDevice, u16Payload } from '../src/protocol/client.js';
+import {
+  assertOpSetsDisjoint,
+  FLASH_OPS,
+  MIN_READ_CHUNK,
+  OP,
+  READ_ONLY_OPS,
+  WINDOW_SIZE,
+} from '../src/protocol/ops.js';
+import type { WindowEntry } from '../src/profiles/types.js';
+import {
+  WebUsbTransport,
+  type WebUsbDevice,
+  type WebUsbInTransferResult,
+  type WebUsbOutTransferResult,
+} from '../src/protocol/webusb.js';
+import { fakeCamera, FAKE_ERR, type FakeCamera } from './fake-transport.js';
+
+const TOKEN = new Uint8Array([
+  0x53, 0x16, 0x10, 0x31, 0x80, 0xdd, 0x00, 0xb7, 0x4a, 0xf9, 0xe4, 0x17, 0xc5, 0x94, 0xbe, 0xd4,
+]);
+
+function entry(subcmd: number, address = 0x14000000 + subcmd * WINDOW_SIZE): WindowEntry {
+  return { subcmd, address, note: 'test window' };
+}
+
+function authEntry(subcmd: number, token: Uint8Array): WindowEntry {
+  const payload = new Uint8Array(2 + token.length);
+  payload.set(u16Payload(subcmd), 0);
+  payload.set(token, 2);
+  return { ...entry(subcmd), auth: true, payload };
+}
+
+async function opened(camera: FakeCamera): Promise<SeekDevice> {
+  await camera.open();
+  return new SeekDevice(camera);
+}
+
+describe('ops', () => {
+  it('keeps the read-only and flash command sets disjoint', () => {
+    expect(() => {
+      assertOpSetsDisjoint();
+    }).not.toThrow();
+    for (const op of FLASH_OPS) expect(READ_ONLY_OPS.has(op)).toBe(false);
+    expect(READ_ONLY_OPS.has(OP.GET_FEATURED_FIRMWARE_DATA)).toBe(true);
+    expect(FLASH_OPS.has(OP.SET_FEATURED_FIRMWARE_DATA)).toBe(true);
+  });
+});
+
+describe('readWindow', () => {
+  it('reads a whole 64 KiB window', async () => {
+    const camera = fakeCamera();
+    const dev = await opened(camera);
+
+    const seen: number[] = [];
+    const got = await dev.readWindow(entry(5), 64, (n) => seen.push(n));
+
+    expect(got.data.length).toBe(WINDOW_SIZE);
+    expect(got.stoppedAt).toBe(WINDOW_SIZE);
+    expect(got.stopReason).toBeNull();
+    expect(got.chunkUsed).toBe(64);
+    expect(got.shrank).toBe(false);
+    expect(equalBytes(got.data, camera.flash.subarray(5 * WINDOW_SIZE, 6 * WINDOW_SIZE))).toBe(
+      true,
+    );
+    expect(seen.length).toBe(WINDOW_SIZE / 64);
+  });
+
+  it('rearms at offset 0, so two reads of the same window agree', async () => {
+    const camera = fakeCamera();
+    const dev = await opened(camera);
+
+    const first = await dev.readWindow(entry(2), 256);
+    const second = await dev.readWindow(entry(2), 256);
+    expect(equalBytes(first.data, second.data)).toBe(true);
+  });
+
+  it('touches only read-only opcodes', async () => {
+    const camera = fakeCamera();
+    const dev = await opened(camera);
+    await dev.readWindow(entry(3), 256);
+
+    for (const call of camera.calls) expect(READ_ONLY_OPS.has(call.op as never)).toBe(true);
+  });
+
+  it('keeps a short window and reports why it stopped', async () => {
+    const camera = fakeCamera({ stallAt: [{ subcmd: 5, offset: 0x8000 }] });
+    const dev = await opened(camera);
+
+    const got = await dev.readWindow(entry(5), 64);
+
+    expect(got.data.length).toBe(0x8000);
+    expect(got.stoppedAt).toBe(0x8000);
+    expect(got.stopReason).toMatch(/GetFeaturedFirmwareData stopped at offset 0x8000/);
+    expect(got.stopReason).toMatch(new RegExp(`even at ${String(MIN_READ_CHUNK)}-byte requests`));
+    expect(got.chunkUsed).toBe(MIN_READ_CHUNK);
+    expect(got.shrank).toBe(true);
+    expect(
+      equalBytes(got.data, camera.flash.subarray(5 * WINDOW_SIZE, 5 * WINDOW_SIZE + 0x8000)),
+    ).toBe(true);
+  });
+
+  it('throws when the window yields nothing at all', async () => {
+    const camera = fakeCamera({ stallAt: [{ subcmd: 5, offset: 0 }] });
+    const dev = await opened(camera);
+
+    const error = await dev.readWindow(entry(5), 64).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SeekError);
+    expect((error as SeekError).code).toBe('device/window');
+    expect((error as SeekError).message).toMatch(/returned nothing/);
+  });
+
+  it('stops on a short chunk rather than treating it as end-of-window', async () => {
+    const camera = fakeCamera({ maxChunk: 48 });
+    const dev = await opened(camera);
+    await dev.ensureMode0();
+    await dev.armWindow(entry(7));
+
+    const got = await dev.readArmed(64, 256);
+
+    expect(got.data.length).toBe(48);
+    expect(got.stopReason).toMatch(/short chunk at offset 0x0030/);
+    expect(got.shrank).toBe(false);
+  });
+});
+
+describe('adaptive chunk shrinking', () => {
+  it('shrinks past the stuck request and keeps the smaller size', async () => {
+    const camera = fakeCamera({ stallAt: [{ subcmd: 6, offset: 0x8000, minSize: 128 }] });
+    const dev = await opened(camera);
+
+    const got = await dev.readWindow(entry(6), 256);
+
+    expect(got.data.length).toBe(WINDOW_SIZE);
+    expect(got.stopReason).toBeNull();
+    expect(got.shrank).toBe(true);
+    expect(got.chunkUsed).toBe(64);
+    expect(equalBytes(got.data, camera.flash.subarray(6 * WINDOW_SIZE, 7 * WINDOW_SIZE))).toBe(
+      true,
+    );
+
+    /* The size that worked is kept: nothing goes back up to 256 afterwards. */
+    const reads = camera.calls.filter((c) => c.op === OP.GET_FEATURED_FIRMWARE_DATA);
+    const afterStall = reads.slice(reads.findIndex((c) => c.length === 64));
+    expect(afterStall.every((c) => c.length <= 64)).toBe(true);
+  });
+});
+
+describe('ensureMode0', () => {
+  it('leaves imaging mode and waits for mode 0 to read back', async () => {
+    const camera = fakeCamera({ requireMode0: true, initialMode: 1, modeSettleMs: 60 });
+    const dev = await opened(camera);
+
+    const got = await dev.readWindow(entry(4), 256);
+
+    expect(got.data.length).toBe(WINDOW_SIZE);
+    expect(camera.operationMode).toBe(0);
+    expect(camera.calls.some((c) => c.op === OP.SET_OPERATION_MODE)).toBe(true);
+  });
+
+  it('is the reason the window command works at all', async () => {
+    const camera = fakeCamera({ requireMode0: true, initialMode: 1 });
+    await camera.open();
+    const dev = new SeekDevice(camera);
+
+    /* Arming without the mode transition is exactly what a 4.9.x camera refuses. */
+    await dev.rpcOut(OP.BEGIN_FIRMWARE_UPGRADE, u16Payload(4));
+    expect(await dev.getErrorCode()).toBe(FAKE_ERR.MODE);
+
+    await dev.armWindow(entry(4));
+    expect(await dev.getErrorCode()).toBe(FAKE_ERR.NONE);
+  });
+
+  it('gives up with an explanatory error when the camera never gets there', async () => {
+    const camera = fakeCamera({ requireMode0: true, initialMode: 1, modeSettleMs: 10_000 });
+    const dev = await opened(camera);
+
+    const error = await dev.ensureMode0().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SeekError);
+    expect((error as SeekError).code).toBe('device/mode');
+    expect((error as SeekError).message).toMatch(/did not enter operation mode 0/);
+  }, 10_000);
+});
+
+describe('authenticated banks', () => {
+  it('refuses the plain 2-byte selector and accepts the 18-byte token', async () => {
+    const camera = fakeCamera({ authBanks: [3], authToken: TOKEN });
+    const dev = await opened(camera);
+
+    const refused = await dev.readWindow(entry(3), 256).catch((e: unknown) => e);
+    expect(refused).toBeInstanceOf(SeekError);
+    expect((refused as SeekError).code).toBe('device/error-code');
+    expect((refused as SeekError).deviceCode).toBe(FAKE_ERR.AUTH);
+
+    const got = await dev.readWindow(authEntry(3, TOKEN), 256);
+    expect(got.data.length).toBe(WINDOW_SIZE);
+    expect(equalBytes(got.data, camera.flash.subarray(3 * WINDOW_SIZE, 4 * WINDOW_SIZE))).toBe(
+      true,
+    );
+  });
+
+  it('rejects a token that does not match this build', async () => {
+    const camera = fakeCamera({ authBanks: [3], authToken: TOKEN });
+    const dev = await opened(camera);
+
+    const wrong = new Uint8Array(TOKEN);
+    wrong[0] = (wrong[0] ?? 0) ^ 0xff;
+
+    const error = await dev.readWindow(authEntry(3, wrong), 256).catch((e: unknown) => e);
+    expect((error as SeekError).deviceCode).toBe(FAKE_ERR.AUTH);
+  });
+});
+
+describe('cancellation', () => {
+  it('throws CancelledError at the next loop boundary', async () => {
+    const camera = fakeCamera();
+    await camera.open();
+    const controller = new AbortController();
+    const dev = new SeekDevice(camera, { signal: controller.signal });
+
+    let chunks = 0;
+    const error = await dev
+      .readWindow(entry(5), 64, () => {
+        chunks += 1;
+        if (chunks === 4) controller.abort();
+      })
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(CancelledError);
+    expect((error as SeekError).code).toBe('cancelled');
+    expect(chunks).toBe(4);
+  });
+
+  it('reports the signal through `cancelled`', async () => {
+    const camera = fakeCamera();
+    await camera.open();
+    const controller = new AbortController();
+    const dev = new SeekDevice(camera, { signal: controller.signal });
+
+    expect(dev.cancelled).toBe(false);
+    controller.abort();
+    expect(dev.cancelled).toBe(true);
+    expect(() => {
+      dev.assertNotCancelled();
+    }).toThrow(CancelledError);
+  });
+});
+
+describe('firmware info', () => {
+  it('reads a selector and never throws for one the camera lacks', async () => {
+    const payload = new Uint8Array(36).fill(0x41);
+    const camera = fakeCamera({ fwInfo: new Map([[0, payload]]) });
+    const reporter = collectingReporter();
+    await camera.open();
+    const dev = new SeekDevice(camera, { reporter });
+
+    const build = await dev.readFwInfo(0, 36);
+    expect(build.length).toBe(36);
+
+    expect(await dev.tryFwInfo(99, 36, 'missing info')).toBeNull();
+    expect(
+      reporter.events.some((e) => e.type === 'log' && e.message.includes('missing info')),
+    ).toBe(true);
+  });
+
+  it('reads the serial out of the RAM device-id block', async () => {
+    const ram = new Uint8Array(248);
+    ram.set(utf8('0E1CA0Z16D19'), 16);
+    const camera = fakeCamera({ ramData: ram });
+    const dev = await opened(camera);
+
+    expect(await dev.readSerial()).toBe('0E1CA0Z16D19');
+  });
+
+  it('returns null rather than throwing when the serial is unavailable', async () => {
+    const camera = fakeCamera();
+    const dev = await opened(camera);
+    expect(await dev.readSerial()).toBeNull();
+  });
+});
+
+describe('write primitives', () => {
+  it('stages and commits, and refuses a bad transfer checksum', async () => {
+    const camera = fakeCamera({ flashSize: 2 * WINDOW_SIZE });
+    const dev = await opened(camera);
+
+    const payload = new Uint8Array(WINDOW_SIZE).fill(0xa5);
+    let sum = 0;
+    for (const b of payload) sum = (sum + b) & 0xffff;
+
+    await dev.armWindow(entry(1));
+    for (let off = 0; off < payload.length; off += 64) {
+      await dev.setFeaturedFirmwareData(payload.subarray(off, off + 64));
+    }
+    await dev.completeMemoryUpgrade((sum + 1) & 0xffff);
+    expect(await dev.getErrorCode()).toBe(FAKE_ERR.BAD_CHECKSUM);
+    expect(camera.flash[WINDOW_SIZE]).not.toBe(0xa5);
+
+    await dev.armWindow(entry(1));
+    for (let off = 0; off < payload.length; off += 64) {
+      await dev.setFeaturedFirmwareData(payload.subarray(off, off + 64));
+    }
+    await dev.completeMemoryUpgrade(sum);
+    expect(await dev.getErrorCode()).toBe(FAKE_ERR.NONE);
+    expect(camera.flash.subarray(WINDOW_SIZE, 2 * WINDOW_SIZE).every((b) => b === 0xa5)).toBe(true);
+  });
+});
+
+/* ---- WebUsbTransport ------------------------------------------------- */
+
+interface StubOptions {
+  readonly inResult?: WebUsbInTransferResult;
+  readonly outResult?: WebUsbOutTransferResult;
+  /** Never settles, like a camera that has simply stopped answering. */
+  readonly hang?: boolean;
+  readonly claimFails?: boolean;
+}
+
+function stubDevice(options: StubOptions = {}): WebUsbDevice & { setups: unknown[] } {
+  const setups: unknown[] = [];
+  let isOpen = false;
+  return {
+    setups,
+    vendorId: 0x289d,
+    productId: 0x0011,
+    manufacturerName: 'Seek Thermal',
+    productName: 'Compact PRO',
+    serialNumber: null,
+    configuration: { configurationValue: 1 },
+    get opened(): boolean {
+      return isOpen;
+    },
+    open: () => {
+      isOpen = true;
+      return Promise.resolve();
+    },
+    close: () => {
+      isOpen = false;
+      return Promise.resolve();
+    },
+    selectConfiguration: () => Promise.resolve(),
+    claimInterface: () =>
+      options.claimFails === true ? Promise.reject(new Error('Access denied')) : Promise.resolve(),
+    releaseInterface: () => Promise.resolve(),
+    controlTransferIn: (setup) => {
+      setups.push(setup);
+      if (options.hang === true) return new Promise<WebUsbInTransferResult>(() => undefined);
+      return Promise.resolve(
+        options.inResult ?? { status: 'ok', data: new DataView(new ArrayBuffer(4)) },
+      );
+    },
+    controlTransferOut: (setup) => {
+      setups.push(setup);
+      if (options.hang === true) return new Promise<WebUsbOutTransferResult>(() => undefined);
+      return Promise.resolve(options.outResult ?? { status: 'ok', bytesWritten: 0 });
+    },
+  };
+}
+
+describe('WebUsbTransport', () => {
+  it('turns a stall into a thrown error instead of an empty read', async () => {
+    const transport = new WebUsbTransport(stubDevice({ inResult: { status: 'stall' } }));
+    await transport.open();
+
+    const error = await transport.controlIn(OP.GET_ERROR_CODE, 4, 1000).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SeekError);
+    expect((error as SeekError).code).toBe('usb/stalled');
+  });
+
+  it('times out instead of hanging forever', async () => {
+    const transport = new WebUsbTransport(stubDevice({ hang: true }));
+    await transport.open();
+
+    const error = await transport.controlIn(OP.GET_ERROR_CODE, 4, 20).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SeekError);
+    expect((error as SeekError).code).toBe('usb/timeout');
+  });
+
+  it('clears the timer on a transfer that did answer', async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new WebUsbTransport(stubDevice());
+      await transport.open();
+      await transport.controlIn(OP.GET_ERROR_CODE, 4, 5000);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('addresses the interface, or the device when it could not be claimed', async () => {
+    const claimed = stubDevice();
+    const transport = new WebUsbTransport(claimed, { recipient: 'auto', interfaceNumber: 1 });
+    await transport.open();
+    await transport.controlIn(OP.GET_ERROR_CODE, 4, 1000);
+    expect(transport.info.recipient).toBe('interface');
+    expect(transport.info.claimedInterface).toBe(true);
+    expect(claimed.setups[0]).toMatchObject({
+      requestType: 'vendor',
+      recipient: 'interface',
+      index: 1,
+    });
+
+    const warnings: string[] = [];
+    const busy = stubDevice({ claimFails: true });
+    const fallback = new WebUsbTransport(busy, {
+      recipient: 'auto',
+      interfaceNumber: 1,
+      onWarning: (m) => warnings.push(m),
+    });
+    await fallback.open();
+    await fallback.controlIn(OP.GET_ERROR_CODE, 4, 1000);
+    expect(fallback.info.recipient).toBe('device');
+    expect(fallback.info.claimedInterface).toBe(false);
+    expect(warnings[0]).toMatch(/using recipient=device instead/);
+    expect(busy.setups[0]).toMatchObject({ recipient: 'device', index: 0 });
+  });
+
+  it('explains who is holding the camera when the caller demanded the interface', async () => {
+    const transport = new WebUsbTransport(stubDevice({ claimFails: true }), {
+      recipient: 'interface',
+    });
+
+    const error = await transport.open().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SeekError);
+    expect((error as SeekError).code).toBe('usb/not-open');
+    expect((error as SeekError).message).toMatch(/another program or a system driver/);
+  });
+
+  it('refuses transfers before open()', async () => {
+    const transport = new WebUsbTransport(stubDevice());
+    const error = await transport.controlIn(OP.GET_ERROR_CODE, 4, 1000).catch((e: unknown) => e);
+    expect((error as SeekError).code).toBe('usb/not-open');
+  });
+});

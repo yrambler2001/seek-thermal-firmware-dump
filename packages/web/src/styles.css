@@ -1,0 +1,540 @@
+/* ====================================================================
+ * Ported from the original single-file page's <style> block.
+ *
+ * Two changes, both deliberate:
+ *   - every colour is a custom property on :root, redefined under
+ *     prefers-color-scheme: dark, so the tool is readable in either theme;
+ *   - the per-panel id selectors (#bar, #bar2, ... #log5) collapse into the
+ *     .bar / .log classes, because the five run panels are one component now.
+ * ==================================================================== */
+
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #5c6570;
+  --line: #d8dee6;
+  --panel: #f6f8fa;
+  --accent: #2f6feb;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --err: #cf222e;
+  --focus: #2f6feb;
+  --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --line: #30363d;
+    --panel: #161b22;
+    --accent: #4f8bf0;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #ff7b72;
+    --focus: #6ea8ff;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--bg);
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem 1rem 3rem;
+  background: var(--bg);
+  color: var(--fg);
+  font:
+    15px/1.55 system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+main {
+  max-width: 58rem;
+  margin: 0 auto;
+}
+
+h1 {
+  font-size: 1.45rem;
+  margin: 0 0 0.3rem;
+  letter-spacing: -0.01em;
+}
+
+h2 {
+  font-size: 1.05rem;
+  margin: 1.75rem 0 0.6rem;
+}
+
+h3 {
+  font-size: 0.95rem;
+  margin: 1.1rem 0 0.35rem;
+}
+
+.sub {
+  color: var(--muted);
+  margin: 0 0 1.25rem;
+  font-size: 0.9rem;
+}
+
+a {
+  color: var(--accent);
+}
+
+code,
+pre,
+.mono {
+  font-family: var(--mono);
+  font-size: 0.85em;
+}
+
+section {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+  margin-bottom: 1rem;
+  background: var(--panel);
+}
+
+section > h2:first-child {
+  margin-top: 0;
+}
+
+.banner {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  padding: 0.7rem 0.9rem;
+  border-radius: 8px;
+  background: var(--panel);
+  margin-bottom: 1rem;
+}
+
+.banner.ok {
+  border-left-color: var(--ok);
+}
+
+.banner.warn {
+  border-left-color: var(--warn);
+}
+
+.banner.err {
+  border-left-color: var(--err);
+}
+
+.banner p {
+  margin: 0.25rem 0;
+}
+
+.banner.flush {
+  margin-top: 0;
+}
+
+.banner.inset {
+  margin: 0.9rem 0 0;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: flex-end;
+}
+
+label {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 0.2rem;
+}
+
+input[type='text'],
+input[type='number'],
+select {
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  width: 9.5rem;
+  max-width: 100%;
+}
+
+button {
+  font: inherit;
+  font-weight: 600;
+  padding: 0.5rem 0.9rem;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--muted);
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+button.danger {
+  border-color: var(--err);
+  color: var(--err);
+}
+
+button.danger.primary {
+  background: var(--err);
+  border-color: var(--err);
+  color: #fff;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Focus must stay visible: this tool is operated one careful control at a
+ * time, sometimes by keyboard only. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.btnrow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.bar {
+  height: 10px;
+  border-radius: 5px;
+  background: var(--line);
+  overflow: hidden;
+  margin: 0.9rem 0 0.45rem;
+}
+
+.bar > .fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.1s linear;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bar > .fill {
+    transition: none;
+  }
+}
+
+.status {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.log {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 24rem;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.6rem 0.7rem;
+  margin: 0.85rem 0 0;
+}
+
+.l-ok {
+  color: var(--ok);
+}
+
+.l-warn {
+  color: var(--warn);
+}
+
+.l-err {
+  color: var(--err);
+}
+
+.l-dim {
+  color: var(--muted);
+}
+
+details.opts {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 0.55rem 0.8rem;
+  background: var(--bg);
+  margin-top: 1rem;
+}
+
+details.opts[open] {
+  padding-bottom: 0.9rem;
+}
+
+details.opts > summary {
+  cursor: pointer;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+details.opts > summary strong {
+  color: var(--fg);
+}
+
+details.sub-details {
+  border-top: 1px solid var(--line);
+  padding-top: 0.7rem;
+  margin-top: 0.9rem;
+}
+
+details.sub-details > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+pre.block {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.6rem 0.7rem;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.tablewrap {
+  overflow-x: auto;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.85rem;
+  min-width: 34rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+}
+
+th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+ul {
+  padding-left: 1.2rem;
+}
+
+li {
+  margin: 0.2rem 0;
+}
+
+.note {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.note.flush {
+  margin-top: 0;
+}
+
+.note.tight {
+  margin: 0.6rem 0 0;
+}
+
+.note.last {
+  margin-bottom: 0;
+}
+
+/* the offline decryptor is a side door, not part of the numbered flow */
+section.optional {
+  background: var(--bg);
+  border-style: dashed;
+  margin-top: 1.75rem;
+}
+
+.optlabel {
+  margin: 0 0 0.3rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+/* the two views (#/ and #/flash) share the Connect panel and the platform notes */
+nav.views {
+  display: flex;
+  gap: 0.35rem;
+  margin: 0 0 1.25rem;
+  border-bottom: 1px solid var(--line);
+}
+
+nav.views a {
+  padding: 0.45rem 0.85rem;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  margin-bottom: -1px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+nav.views a:hover {
+  color: var(--fg);
+}
+
+nav.views a[aria-current='page'] {
+  color: var(--fg);
+  background: var(--panel);
+  border-color: var(--line);
+}
+
+nav.views a.danger[aria-current='page'] {
+  color: var(--err);
+}
+
+label.chk {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  font-size: 0.85rem;
+  color: var(--fg);
+  margin: 0.9rem 0 0;
+}
+
+label.chk input {
+  margin: 0.2rem 0 0;
+}
+
+dl.kv {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(9rem, auto) 1fr;
+  gap: 0.15rem 0.8rem;
+  font-size: 0.85rem;
+}
+
+dl.kv dt {
+  color: var(--muted);
+}
+
+dl.kv dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.95em;
+  overflow-wrap: anywhere;
+}
+
+.fwbox {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.7rem 0.8rem;
+  margin: 0.85rem 0 0;
+}
+
+.fwbox h3 {
+  margin-top: 0;
+}
+
+.confirm {
+  border: 1px solid var(--err);
+  border-radius: 8px;
+  padding: 0.8rem 0.9rem;
+  margin: 0.9rem 0 0;
+  background: var(--bg);
+}
+
+.confirm p {
+  margin: 0.3rem 0;
+  font-size: 0.85rem;
+}
+
+.confirm p:first-child {
+  margin-top: 0;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Android with an OTG cable is a real way to use this, so everything has to
+ * stay usable at phone width: the option grid and the key/value lists are the
+ * only two places that assume more room than that. */
+@media (max-width: 30rem) {
+  body {
+    padding: 1rem 0.75rem 2.5rem;
+  }
+
+  section {
+    padding: 0.85rem 0.8rem;
+  }
+
+  .btnrow > button {
+    flex: 1 1 auto;
+  }
+
+  dl.kv {
+    grid-template-columns: 1fr;
+    gap: 0 0;
+  }
+
+  dl.kv dt {
+    margin-top: 0.4rem;
+  }
+
+  nav.views {
+    overflow-x: auto;
+  }
+
+  .row > div {
+    flex: 1 1 8rem;
+  }
+
+  input[type='text'],
+  input[type='number'],
+  select {
+    width: 100%;
+  }
+}

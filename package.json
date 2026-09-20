@@ -1,0 +1,45 @@
+{
+  "name": "seek-thermal-firmware-toolkit",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Dump, decrypt and reflash Seek Thermal camera firmware \u2014 browser app, CLI and shared core.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "workspaces": [
+    "packages/core",
+    "packages/cli",
+    "packages/web"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @seek-fw/core && npm run build --workspace @seek-fw/cli && npm run build --workspace @seek-fw/web",
+    "build:docs": "npm run build --workspace @seek-fw/web",
+    "dev": "npm run dev --workspace @seek-fw/web",
+    "cli": "npm run --silent start --workspace @seek-fw/cli --",
+    "typecheck": "tsc --build --force && tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/cli/tsconfig.json && tsc --noEmit -p packages/web/tsconfig.app.json && tsc --noEmit -p packages/web/tsconfig.node.json && tsc --noEmit -p tsconfig.tools.json",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "verify:legacy": "node scripts/verify-against-legacy.mjs",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test",
+    "clean": "rm -rf packages/*/dist packages/*/tsconfig.tsbuildinfo coverage"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.2",
+    "@vitest/coverage-v8": "^5.0.1",
+    "eslint": "^10.11.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.12.0",
+    "prettier": "^3.9.8",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.70.0",
+    "vitest": "^5.0.1"
+  }
+}

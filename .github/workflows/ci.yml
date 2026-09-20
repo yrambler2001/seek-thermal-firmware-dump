@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Format
+        run: npm run format:check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm run test -- --coverage
+
+      - name: Build
+        run: npm run build
+
+      # GitHub Pages serves this repo from docs/, so a stale build is a broken
+      # site. Rebuilding in CI and diffing catches a forgotten `npm run build`.
+      - name: docs/ is up to date with source
+        run: |
+          if ! git diff --quiet -- docs; then
+            echo "::error::docs/ is out of date. Run 'npm run build' and commit the result."
+            git diff --stat -- docs
+            exit 1
+          fi
