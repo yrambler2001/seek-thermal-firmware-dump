@@ -1,6 +1,17 @@
 /** The "Opcode / Name / Dir / Why it is used" table, shared by both views. */
 
 import type { ReactElement } from 'react';
+import {
+  Table,
+  TableBody,
+  TableCaption,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  TableRowHeader,
+} from './ui/table';
+import { cn } from '@/lib/utils';
 
 export interface OpcodeRow {
   readonly opcode: string;
@@ -16,29 +27,47 @@ export interface OpcodeTableProps {
 
 export function OpcodeTable({ caption, rows }: OpcodeTableProps): ReactElement {
   return (
-    <div className="tablewrap">
-      <table>
-        <caption className="visually-hidden">{caption}</caption>
-        <thead>
-          <tr>
-            <th scope="col">Opcode</th>
-            <th scope="col">Name</th>
-            <th scope="col">Dir</th>
-            <th scope="col">Why it is used</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <tr key={row.opcode}>
-              <td className="mono">{row.opcode}</td>
-              <td>{row.name}</td>
-              <td>{row.dir}</td>
-              <td>{row.why}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <Table>
+      <TableCaption>{caption}</TableCaption>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="w-[5.5rem]">Opcode</TableHead>
+          <TableHead>Name</TableHead>
+          <TableHead className="w-[4rem]">Dir</TableHead>
+          <TableHead>Why it is used</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {rows.map((row) => (
+          <TableRow key={row.opcode}>
+            <TableRowHeader className="font-mono font-semibold whitespace-nowrap">
+              <span className="cell-label" aria-hidden="true">
+                Opcode
+              </span>
+              {row.opcode}
+            </TableRowHeader>
+            <TableCell label="Name" className="font-mono">
+              {row.name}
+            </TableCell>
+            <TableCell label="Dir">
+              <span
+                className={cn(
+                  'inline-flex rounded border px-1.5 py-px font-mono text-[0.68rem] font-semibold',
+                  row.dir === 'IN'
+                    ? 'border-ok/35 bg-ok/10 text-ok'
+                    : 'border-warn/40 bg-warn/10 text-warn',
+                )}
+              >
+                {row.dir}
+              </span>
+            </TableCell>
+            <TableCell label="Why it is used" className="text-muted-foreground">
+              {row.why}
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
   );
 }
 

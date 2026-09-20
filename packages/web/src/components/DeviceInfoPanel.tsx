@@ -1,10 +1,12 @@
 /**
  * What the camera is running. A direct port of the original's
  * `renderDeviceInfo` and `renderBootWarning`, with the slot list as a real
- * `<table>` with header cells rather than a grid of `<td>`s.
+ * `<table>` with header cells rather than a grid of `<td>`s — and, below
+ * 48rem, as one card per slot without losing those header cells.
  */
 
 import type { ReactElement } from 'react';
+import { HardDrive, KeyRound, Microchip } from 'lucide-react';
 import {
   bootedSlot,
   bytesToHex,
@@ -13,8 +15,20 @@ import {
   type DeviceState,
   type SlotState,
 } from '@seek-fw/core';
-import { Banner } from './Banner';
 import { KeyValue, type KeyValueRow } from './KeyValue';
+import { Panel, PanelTitle } from './Panel';
+import { Prose } from './Prose';
+import { Alert } from './ui/alert';
+import {
+  Table,
+  TableBody,
+  TableCaption,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  TableRowHeader,
+} from './ui/table';
 
 function perDeviceKey(state: DeviceState): string | null {
   const slot = state.deviceKeySlot;
@@ -24,18 +38,20 @@ function perDeviceKey(state: DeviceState): string | null {
 }
 
 function verdict(slot: SlotState): ReactElement {
-  if (slot.bootable) return <span className="l-ok">the bootloader can boot this</span>;
+  if (slot.bootable) {
+    return <span className="text-ok">the bootloader can boot this</span>;
+  }
   if (!slot.accepts) {
     return (
-      <span className="l-err">
+      <span className="text-destructive">
         {`fails the acceptance sum (${
           slot.recovered === null ? 'unknown' : hexUp(slot.recovered.checksum)
         })`}
       </span>
     );
   }
-  if (!slot.footerOk) return <span className="l-err">no valid CODE footer</span>;
-  return <span className="l-err">key unknown to the bootloader — skipped at boot</span>;
+  if (!slot.footerOk) return <span className="text-destructive">no valid CODE footer</span>;
+  return <span className="text-destructive">key unknown to the bootloader — skipped at boot</span>;
 }
 
 export interface DeviceInfoPanelProps {
@@ -79,14 +95,14 @@ export function DeviceInfoPanel({ state }: DeviceInfoPanelProps): ReactElement {
 
   return (
     <>
-      <div className="fwbox">
-        <h3>Running firmware</h3>
+      <Panel>
+        <PanelTitle icon={<Microchip />}>Running firmware</PanelTitle>
         <KeyValue rows={running} />
-      </div>
+      </Panel>
 
       {state.keyTable !== null && (
-        <div className="fwbox">
-          <h3>Keys read from this camera</h3>
+        <Panel>
+          <PanelTitle icon={<KeyRound />}>Keys read from this camera</PanelTitle>
           <KeyValue
             rows={[
               ['Found at', `flash offset ${hexUp(state.keyTable.offset, 6)}`],
@@ -94,80 +110,84 @@ export function DeviceInfoPanel({ state }: DeviceInfoPanelProps): ReactElement {
               ['Key B', bytesToHex(state.keyTable.keyB)],
             ]}
           />
-          <p className="note last">
-            Confirmed by matching a slot&apos;s keystream state, recovered from the ciphertext
-            itself. Key&nbsp;A is what an upload has to be encrypted with.
-          </p>
-        </div>
+          <Prose className="mt-2.5">
+            <p>
+              Confirmed by matching a slot&apos;s keystream state, recovered from the ciphertext
+              itself. Key&nbsp;A is what an upload has to be encrypted with.
+            </p>
+          </Prose>
+        </Panel>
       )}
 
-      <div className="fwbox">
-        <h3>Firmware slots</h3>
-        <div className="tablewrap">
-          <table>
-            <caption className="visually-hidden">
-              Each firmware slot on this camera, as read and decrypted in the browser
-            </caption>
-            <thead>
-              <tr>
-                <th scope="col">Slot</th>
-                <th scope="col">Version</th>
-                <th scope="col">Size</th>
-                <th scope="col">Encryption</th>
-                <th scope="col">SHA-256 of plaintext</th>
-              </tr>
-            </thead>
-            <tbody>
-              {state.slots.map((slot) => (
-                <tr key={slot.key}>
-                  <th scope="row">
-                    <strong>{slot.name}</strong>
-                    <br />
-                    <span className="mono note">{hexUp(slot.address)}</span>
-                  </th>
-                  {slot.present && slot.plainHeader !== null && slot.header !== null ? (
-                    <>
-                      <td>
-                        {slot.plainHeader.versionStr}
-                        <br />
-                        <span className="note">{`image ${hexUp(slot.header.imageId)}`}</span>
-                      </td>
-                      <td>
-                        {`${String(slot.header.length)} B`}
-                        <br />
-                        <span className="note">{slot.footer?.model ?? ''}</span>
-                      </td>
-                      <td>
-                        {slot.keyName ?? 'unknown'}
-                        <br />
-                        {verdict(slot)}
-                      </td>
-                      <td>
-                        <span className="mono note">
-                          {slot.sha256 === null ? '' : `${slot.sha256.slice(0, 16)}…`}
-                        </span>
-                      </td>
-                    </>
-                  ) : (
-                    <>
-                      <td colSpan={4}>
-                        <span className="l-warn">{slot.reason ?? 'not readable'}</span>
-                      </td>
-                    </>
-                  )}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <p className="note">
-          Each slot was decrypted in the browser by solving for its keystream from its own
-          known-zero reset vectors. Decrypting is not the same as booting: the bootloader only ever
-          tries {state.storeKey.name} and Key A, so a slot written under any other key checksums
-          perfectly and is still skipped. Nothing was written.
-        </p>
+      <Panel>
+        <PanelTitle icon={<HardDrive />}>Firmware slots</PanelTitle>
+        <Table>
+          <TableCaption>
+            Each firmware slot on this camera, as read and decrypted in the browser
+          </TableCaption>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Slot</TableHead>
+              <TableHead>Version</TableHead>
+              <TableHead>Size</TableHead>
+              <TableHead>Encryption</TableHead>
+              <TableHead>SHA-256 of plaintext</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {state.slots.map((slot) => (
+              <TableRow key={slot.key}>
+                <TableRowHeader className="whitespace-nowrap">
+                  <span className="block">{slot.name}</span>
+                  <span className="block font-mono text-[0.75rem] font-normal text-muted-foreground">
+                    {hexUp(slot.address)}
+                  </span>
+                </TableRowHeader>
+                {slot.present && slot.plainHeader !== null && slot.header !== null ? (
+                  <>
+                    <TableCell label="Version">
+                      {slot.plainHeader.versionStr}
+                      <span className="block text-[0.75rem] text-muted-foreground">
+                        {`image ${hexUp(slot.header.imageId)}`}
+                      </span>
+                    </TableCell>
+                    <TableCell label="Size">
+                      {`${String(slot.header.length)} B`}
+                      <span className="block text-[0.75rem] text-muted-foreground">
+                        {slot.footer?.model ?? ''}
+                      </span>
+                    </TableCell>
+                    <TableCell label="Encryption">
+                      {slot.keyName ?? 'unknown'}
+                      <span className="block text-[0.75rem]">{verdict(slot)}</span>
+                    </TableCell>
+                    <TableCell label="SHA-256 of plaintext">
+                      <span className="font-mono text-[0.75rem] text-muted-foreground">
+                        {slot.sha256 === null ? '' : `${slot.sha256.slice(0, 16)}…`}
+                      </span>
+                    </TableCell>
+                  </>
+                ) : (
+                  <TableCell colSpan={4}>
+                    <span className="text-warn">{slot.reason ?? 'not readable'}</span>
+                  </TableCell>
+                )}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+
+        <Prose className="mt-3">
+          <p>
+            Each slot was decrypted in the browser by solving for its keystream from its own
+            known-zero reset vectors. Decrypting is not the same as booting: the bootloader only
+            ever tries {state.storeKey.name} and Key A, so a slot written under any other key
+            checksums perfectly and is still skipped. Nothing was written.
+          </p>
+        </Prose>
+
         {orphans.length > 0 && (
-          <Banner tone="err" inset>
+          <Alert tone="err" className="mt-3">
             <p>
               <strong>
                 {`${orphans.map((slot) => slot.name).join(' and ')}${
@@ -189,9 +209,9 @@ export function DeviceInfoPanel({ state }: DeviceInfoPanelProps): ReactElement {
                 slot directly with an SPI programmer or over SWD/J-Link is the way round it.
               </p>
             )}
-          </Banner>
+          </Alert>
         )}
-      </div>
+      </Panel>
     </>
   );
 }

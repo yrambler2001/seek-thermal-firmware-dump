@@ -8,8 +8,9 @@
 
 import type { ReactElement } from 'react';
 import type { DetectionResult } from '@seek-fw/core';
-import { Banner } from './Banner';
 import { KeyValue, type KeyValueRow } from './KeyValue';
+import { Prose } from './Prose';
+import { Alert } from './ui/alert';
 
 export interface DetectionBoxProps {
   readonly detection: DetectionResult;
@@ -21,7 +22,21 @@ export function DetectionBox({ detection, actingName }: DetectionBoxProps): Reac
   const best = detection.best;
   const rows: readonly KeyValueRow[] = [
     ['Detected', best.profile.name],
-    ['Confidence', `${best.score.toFixed(2)} of 1.00`],
+    [
+      'Confidence',
+      <span key="confidence" className="flex items-center gap-2">
+        <span
+          aria-hidden="true"
+          className="h-1 w-20 shrink-0 overflow-hidden rounded-full bg-muted"
+        >
+          <span
+            className="block h-full rounded-full bg-primary"
+            style={{ width: `${String(Math.round(Math.max(0, Math.min(1, best.score)) * 100))}%` }}
+          />
+        </span>
+        {`${best.score.toFixed(2)} of 1.00`}
+      </span>,
+    ],
     ['Read as', actingName === best.profile.name ? null : (actingName ?? null)],
     ['Summary', best.profile.summary],
   ];
@@ -29,23 +44,23 @@ export function DetectionBox({ detection, actingName }: DetectionBoxProps): Reac
   return (
     <>
       <KeyValue rows={rows} />
-      <p className="note" style={{ margin: '.7rem 0 .2rem' }}>
-        Why:
-      </p>
-      <ul className="note" style={{ margin: 0 }}>
-        {best.reasons.map((reason) => (
-          <li key={reason}>{reason}</li>
-        ))}
-      </ul>
+      <Prose className="mt-3">
+        <p>Why:</p>
+        <ul>
+          {best.reasons.map((reason) => (
+            <li key={reason}>{reason}</li>
+          ))}
+        </ul>
+      </Prose>
       {detection.ambiguous && (
-        <Banner tone="warn" inset>
+        <Alert tone="warn" className="mt-3">
           <p>
             <strong>The evidence did not settle which family this is.</strong> Either the winner
             scored no better than the generic fallback, or a runner-up came too close to call. The
             decryption is unaffected — the key is solved out of the ciphertext either way — but the
             profile named in the report, and anything gated on it, is a guess.
           </p>
-        </Banner>
+        </Alert>
       )}
     </>
   );

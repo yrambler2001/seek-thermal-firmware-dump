@@ -219,12 +219,13 @@ describe('the write button', () => {
       />,
     );
     /* No prepared image, so pressing it opens nothing — the confirmation only
-     * appears once there is something to confirm. */
-    expect(view.container.querySelector('.confirm')).toBeNull();
+     * appears once there is something to confirm. It is a modal in a portal,
+     * so it is looked for in the document, not in this container. */
+    expect(document.body.querySelector('[role="alertdialog"]')).toBeNull();
     act(() => {
       buttonByText(view.container, 'Write to camera').click();
     });
-    expect(view.container.querySelector('.confirm')).toBeNull();
+    expect(document.body.querySelector('[role="alertdialog"]')).toBeNull();
     view.unmount();
   });
 });

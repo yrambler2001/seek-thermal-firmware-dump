@@ -1,5 +1,7 @@
+import { fileURLToPath, URL } from 'node:url';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 
 /**
  * The built site is committed to `docs/` because GitHub Pages serves this repo
@@ -7,7 +9,10 @@ import react from '@vitejs/plugin-react';
  * same output works at a project path, at a user-site root, and opened from disk.
  */
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
+  },
   base: './',
   build: {
     outDir: '../../docs',

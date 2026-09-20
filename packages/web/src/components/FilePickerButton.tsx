@@ -5,14 +5,16 @@
  * accessibility tree.
  */
 
-import { useRef, type ReactElement } from 'react';
+import { useRef, type ReactElement, type ReactNode } from 'react';
+import { Button, type ButtonProps } from './ui/button';
 
 export interface FilePickerButtonProps {
   readonly id: string;
   readonly label: string;
   readonly accept: string;
   readonly disabled: boolean;
-  readonly className?: string | undefined;
+  readonly variant?: ButtonProps['variant'];
+  readonly icon?: ReactNode;
   readonly onPick: (file: File) => void;
 }
 
@@ -21,22 +23,23 @@ export function FilePickerButton({
   label,
   accept,
   disabled,
-  className,
+  variant,
+  icon,
   onPick,
 }: FilePickerButtonProps): ReactElement {
   const input = useRef<HTMLInputElement | null>(null);
   return (
     <>
-      <button
-        type="button"
-        className={className ?? ''}
+      <Button
+        variant={variant ?? 'outline'}
         disabled={disabled}
         onClick={() => {
           input.current?.click();
         }}
       >
+        {icon}
         {label}
-      </button>
+      </Button>
       <input
         ref={input}
         id={id}
@@ -44,7 +47,7 @@ export function FilePickerButton({
         accept={accept}
         tabIndex={-1}
         aria-hidden="true"
-        style={{ display: 'none' }}
+        className="hidden"
         onChange={(event) => {
           const file = event.target.files?.[0];
           /* Cleared so picking the same file twice fires `change` again. */

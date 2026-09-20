@@ -7,6 +7,7 @@
  */
 
 import type { ReactElement } from 'react';
+import { FileCheck } from 'lucide-react';
 import {
   bytesToHex,
   hexDump,
@@ -15,8 +16,21 @@ import {
   type DeviceState,
   type PreparedFlash,
 } from '@seek-fw/core';
-import { Banner } from './Banner';
+import { HexBlock } from './HexBlock';
 import { KeyValue, type KeyValueRow } from './KeyValue';
+import { Panel, PanelTitle } from './Panel';
+import { Prose } from './Prose';
+import { Alert } from './ui/alert';
+import {
+  Table,
+  TableBody,
+  TableCaption,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  TableRowHeader,
+} from './ui/table';
 
 export interface FlashPreviewProps {
   readonly state: DeviceState;
@@ -27,72 +41,87 @@ export interface FlashPreviewProps {
 function KeyNote({ prep }: { readonly prep: PreparedFlash }): ReactElement | null {
   if (prep.keyPatch.changed) {
     return (
-      <p className="note l-ok" style={{ margin: '.9rem 0 0' }}>
-        The key table at {prep.keyPatch.where} was rewritten to this camera&apos;s Key&nbsp;A and
-        Key&nbsp;B, so once this image runs it will encrypt its own upgrades with keys this
-        bootloader can read. The acceptance sum below is balanced over the patched image.
-      </p>
+      <Prose className="mt-3 text-ok">
+        <p>
+          The key table at {prep.keyPatch.where} was rewritten to this camera&apos;s Key&nbsp;A and
+          Key&nbsp;B, so once this image runs it will encrypt its own upgrades with keys this
+          bootloader can read. The acceptance sum below is balanced over the patched image.
+        </p>
+      </Prose>
     );
   }
   if (prep.carriesMine) return null;
   return (
-    <p className="note l-warn" style={{ margin: '.9rem 0 0' }}>
-      <strong>This image does not contain this camera&apos;s key pair.</strong> Either it belongs to
-      a different key family, or it derives its key at runtime. It may still boot, but once it runs
-      its upgrades will be encrypted with whatever keys it does carry — and if those are not this
-      bootloader&apos;s, later flashes will land in slots that cannot be booted. Re-dump the image
-      from a camera in this key family to get a filename carrying its keys, and this page will
-      retarget them for you.
-    </p>
+    <Alert tone="warn" className="mt-3">
+      <p>
+        <strong>This image does not contain this camera&apos;s key pair.</strong> Either it belongs
+        to a different key family, or it derives its key at runtime. It may still boot, but once it
+        runs its upgrades will be encrypted with whatever keys it does carry — and if those are not
+        this bootloader&apos;s, later flashes will land in slots that cannot be booted. Re-dump the
+        image from a camera in this key family to get a filename carrying its keys, and this page
+        will retarget them for you.
+      </p>
+    </Alert>
   );
 }
 
 function Comparison({ prep }: { readonly prep: PreparedFlash }): ReactElement {
   if (prep.compare.length === 0) {
     return (
-      <p className="note l-ok" style={{ margin: '.9rem 0 0' }}>
-        {`Header matches the firmware the camera is running now (${
-          prep.runningSlot ?? 'the running slot'
-        }) in every field — version, image id, stack pointer, reset vector and size.`}
-      </p>
+      <Prose className="mt-3 text-ok">
+        <p>
+          {`Header matches the firmware the camera is running now (${
+            prep.runningSlot ?? 'the running slot'
+          }) in every field — version, image id, stack pointer, reset vector and size.`}
+        </p>
+      </Prose>
     );
   }
   return (
-    <>
-      <p className="note" style={{ margin: '.9rem 0 .3rem' }}>
-        <strong>This image is not what the camera is running.</strong> Expected if you meant to
-        change firmware — worth a second look if you did not.
-      </p>
-      <div className="tablewrap">
-        <table>
-          <caption className="visually-hidden">
-            Header fields that differ between the camera and the chosen image
-          </caption>
-          <thead>
-            <tr>
-              <th scope="col">Field</th>
-              <th scope="col">{`On the camera now (${prep.runningSlot ?? 'running slot'})`}</th>
-              <th scope="col">Your image</th>
-            </tr>
-          </thead>
-          <tbody>
-            {prep.compare.map((row) => (
-              <tr key={row.field}>
-                <th scope="row">{row.field}</th>
-                <td className="mono">{row.onCamera}</td>
-                <td className="mono">{row.inImage}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      {prep.layoutMoved && (
-        <p className="note l-warn" style={{ margin: '.3rem 0 0' }}>
-          The stack pointer or reset vector moved. Those come from the image&apos;s own vector
-          table, so this is a differently linked build — make sure it is a build for this camera.
+    <div className="mt-3 space-y-2">
+      <Prose>
+        <p>
+          <strong>This image is not what the camera is running.</strong> Expected if you meant to
+          change firmware — worth a second look if you did not.
         </p>
+      </Prose>
+      <Table>
+        <TableCaption>
+          Header fields that differ between the camera and the chosen image
+        </TableCaption>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Field</TableHead>
+            <TableHead>{`On the camera now (${prep.runningSlot ?? 'running slot'})`}</TableHead>
+            <TableHead>Your image</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {prep.compare.map((row) => (
+            <TableRow key={row.field}>
+              <TableRowHeader>{row.field}</TableRowHeader>
+              <TableCell
+                label={`On the camera now (${prep.runningSlot ?? 'running slot'})`}
+                className="font-mono"
+              >
+                {row.onCamera}
+              </TableCell>
+              <TableCell label="Your image" className="font-mono">
+                {row.inImage}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+      {prep.layoutMoved && (
+        <Prose className="text-warn">
+          <p>
+            The stack pointer or reset vector moved. Those come from the image&apos;s own vector
+            table, so this is a differently linked build — make sure it is a build for this camera.
+          </p>
+        </Prose>
       )}
-    </>
+    </div>
   );
 }
 
@@ -147,10 +176,11 @@ export function FlashPreview({ state, prep, sha256 }: FlashPreviewProps): ReactE
   ];
 
   return (
-    <div className="fwbox">
-      <h3>Ready to write</h3>
+    <Panel className="border-primary/30 bg-primary/[0.03]">
+      <PanelTitle icon={<FileCheck />}>Ready to write</PanelTitle>
+
       {prep.rekeyRisk && (
-        <Banner tone="err" flush>
+        <Alert tone="err" className="mb-3">
           <p>
             <strong>This write will not be booted.</strong> {prep.targetName} already holds a valid
             image encrypted with a key this camera&apos;s bootloader does not know, which means the
@@ -162,17 +192,24 @@ export function FlashPreview({ state, prep, sha256 }: FlashPreviewProps): ReactE
             Nothing here is damaged by trying — but to actually change what this camera runs you
             need an SPI programmer or SWD/J-Link.
           </p>
-        </Banner>
+        </Alert>
       )}
+
       <KeyValue rows={rows} />
       <KeyNote prep={prep} />
       <Comparison prep={prep} />
-      <p className="note">First 64 bytes of the payload:</p>
-      <pre className="block">{hexDump(prep.payload.subarray(0, 64))}</pre>
-      <p className="note last">
-        Nothing has been sent to the camera yet. <strong>Write to camera</strong> streams this
-        payload and commits it.
-      </p>
-    </div>
+
+      <Prose className="mt-3">
+        <p>First 64 bytes of the payload:</p>
+      </Prose>
+      <HexBlock className="mt-1.5">{hexDump(prep.payload.subarray(0, 64))}</HexBlock>
+
+      <Prose className="mt-2.5">
+        <p>
+          Nothing has been sent to the camera yet. <strong>Write to camera</strong> streams this
+          payload and commits it.
+        </p>
+      </Prose>
+    </Panel>
   );
 }

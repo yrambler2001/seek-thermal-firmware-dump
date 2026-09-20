@@ -9,8 +9,16 @@
     "noEmit": true,
     "composite": false,
     "declaration": false,
-    "declarationMap": false
+    "declarationMap": false,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
   },
   "include": ["src"],
-  "references": [{ "path": "../core/tsconfig.build.json" }]
+  "references": [
+    {
+      "path": "../core/tsconfig.build.json"
+    }
+  ]
 }

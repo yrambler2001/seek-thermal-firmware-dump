@@ -5,9 +5,13 @@
  */
 
 import type { ReactElement } from 'react';
+import { ScanSearch } from 'lucide-react';
 import { listProfiles, type DeviceState } from '@seek-fw/core';
 import { DetectionBox } from './DetectionBox';
-import type { ProfileChoice } from '../hooks/useFlashPanel';
+import { Panel, PanelTitle } from './Panel';
+import { Prose } from './Prose';
+import { Field, Select } from './ui/field';
+import type { ProfileChoice } from '@/hooks/useFlashPanel';
 
 export interface ProfilePanelProps {
   /** null until a read has happened; the selector still works. */
@@ -24,24 +28,28 @@ export function ProfilePanel({
   disabled,
 }: ProfilePanelProps): ReactElement {
   return (
-    <div className="fwbox">
-      <h3>Detected firmware profile</h3>
+    <Panel>
+      <PanelTitle icon={<ScanSearch />}>Detected firmware profile</PanelTitle>
       {state === null ? (
-        <p className="note flush">
-          Nothing detected yet — press <strong>Read device info</strong>. The selector below chooses
-          which family the next read acts under.
-        </p>
+        <Prose>
+          <p>
+            Nothing detected yet — press <strong>Read device info</strong>. The selector below
+            chooses which family the next read acts under.
+          </p>
+        </Prose>
       ) : (
         <DetectionBox detection={state.detection} actingName={state.profile.name} />
       )}
 
-      <div style={{ marginTop: '.9rem' }}>
-        <label htmlFor="profileChoice">firmware profile for the next read</label>
-        <select
+      <Field
+        htmlFor="profileChoice"
+        label="firmware profile for the next read"
+        className="mt-3.5 max-w-sm"
+      >
+        <Select
           id="profileChoice"
           value={choice}
           disabled={disabled}
-          style={{ width: '18rem' }}
           onChange={(event) => {
             onChange(event.target.value);
           }}
@@ -52,13 +60,16 @@ export function ProfilePanel({
               {`${profile.name} (${profile.id})`}
             </option>
           ))}
-        </select>
-      </div>
-      <p className="note last" style={{ marginTop: '.5rem' }}>
-        Overriding changes the selector map, the whitening constant and the acceptance sum the next
-        read uses. A profile that does not declare flashing keeps the write button disabled however
-        the camera answers.
-      </p>
-    </div>
+        </Select>
+      </Field>
+
+      <Prose className="mt-2.5">
+        <p>
+          Overriding changes the selector map, the whitening constant and the acceptance sum the
+          next read uses. A profile that does not declare flashing keeps the write button disabled
+          however the camera answers.
+        </p>
+      </Prose>
+    </Panel>
   );
 }

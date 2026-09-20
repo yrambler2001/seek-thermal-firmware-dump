@@ -1,6 +1,12 @@
 /** Step 1, shared by both views. Presentational: every action is a prop. */
 
 import type { ReactElement } from 'react';
+import { Plug, PlugZap, Unplug, Waypoints } from 'lucide-react';
+import { Prose } from './Prose';
+import { Section } from './Section';
+import { Button } from './ui/button';
+import { Toolbar } from './ui/toolbar';
+import { cn } from '@/lib/utils';
 
 export interface ConnectSectionProps {
   readonly description: string;
@@ -26,31 +32,43 @@ export function ConnectSection({
   onForget,
 }: ConnectSectionProps): ReactElement {
   return (
-    <section aria-labelledby="connect-heading">
-      <h2 id="connect-heading">1 · Connect</h2>
-      <div className="btnrow">
-        <button type="button" className="primary" onClick={onConnect} disabled={!canUseUsb || busy}>
+    <Section id="connect" step="1" title="Connect" icon={<PlugZap />}>
+      <Toolbar label="Device actions">
+        <Button variant="default" onClick={onConnect} disabled={!canUseUsb || busy}>
+          <Plug />
           {connected ? 'Change device' : 'Connect device'}
-        </button>
-        <button type="button" onClick={onTest} disabled={!connected || busy || testing}>
+        </Button>
+        <Button onClick={onTest} disabled={!connected || busy || testing}>
+          <Waypoints />
           Test connection
-        </button>
-        <button type="button" onClick={onForget} disabled={!connected || !canForget || busy}>
+        </Button>
+        <Button onClick={onForget} disabled={!connected || !canForget || busy}>
+          <Unplug />
           Forget device
-        </button>
-      </div>
+        </Button>
+      </Toolbar>
+
       <p
-        className="note"
         id="device-description"
-        style={{ margin: '.9rem 0 0' }}
         aria-live="polite"
+        className="flex items-center gap-2 rounded-md border border-border/80 bg-sunken/60 px-3 py-2 font-mono text-[0.82rem]"
       >
-        {description}
+        <span
+          aria-hidden="true"
+          className={cn(
+            'size-1.5 shrink-0 rounded-full',
+            connected ? 'bg-ok' : 'bg-muted-foreground/50',
+          )}
+        />
+        <span className="min-w-0 [overflow-wrap:anywhere]">{description}</span>
       </p>
-      <p className="note" style={{ margin: '.5rem 0 0' }}>
-        Any Seek Thermal device is offered (USB vendor <code>0x289d</code>) — Compact, Compact PRO,
-        Nano and so on. Pick yours in the browser&apos;s device chooser.
-      </p>
-    </section>
+
+      <Prose>
+        <p>
+          Any Seek Thermal device is offered (USB vendor <code>0x289d</code>) — Compact,
+          Compact&nbsp;PRO, Nano and so on. Pick yours in the browser&apos;s device chooser.
+        </p>
+      </Prose>
+    </Section>
   );
 }

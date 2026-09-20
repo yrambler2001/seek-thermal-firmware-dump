@@ -1,540 +1,279 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
 /* ====================================================================
- * Ported from the original single-file page's <style> block.
+ * Seek Thermal Firmware Toolkit — the instrument palette.
  *
- * Two changes, both deliberate:
- *   - every colour is a custom property on :root, redefined under
- *     prefers-color-scheme: dark, so the tool is readable in either theme;
- *   - the per-panel id selectors (#bar, #bar2, ... #log5) collapse into the
- *     .bar / .log classes, because the five run panels are one component now.
+ * The tool is a bench instrument, not a page: dense, monospaced where the
+ * bytes are, and coloured only where colour means something. Every colour is
+ * a token on :root and is redefined under prefers-color-scheme: dark. There
+ * is no theme toggle and there must never be one — the browser already knows.
  * ==================================================================== */
+
+@custom-variant dark (@media (prefers-color-scheme: dark));
 
 :root {
   color-scheme: light dark;
-  --bg: #ffffff;
-  --fg: #1a1a1a;
-  --muted: #5c6570;
-  --line: #d8dee6;
-  --panel: #f6f8fa;
-  --accent: #2f6feb;
-  --ok: #1a7f37;
-  --warn: #9a6700;
-  --err: #cf222e;
-  --focus: #2f6feb;
-  --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  --radius: 0.625rem;
+
+  /* surfaces, coolest at the back and warmest at the front */
+  --background: oklch(0.982 0.003 258);
+  --foreground: oklch(0.21 0.02 258);
+  --card: oklch(1 0 0);
+  --card-foreground: var(--foreground);
+  --popover: oklch(1 0 0);
+  --popover-foreground: var(--foreground);
+  /* sunken: logs, hex dumps, anything that came off the wire */
+  --sunken: oklch(0.965 0.005 258);
+  --grid: oklch(0.91 0.008 258);
+
+  --muted: oklch(0.965 0.005 258);
+  --muted-foreground: oklch(0.47 0.022 258);
+
+  /* Two blues and two reds, not one of each.
+   *
+   * `--primary` and `--destructive` are read AS TEXT — links, log levels,
+   * badges, the verdict on a slot — so in dark mode they have to be light.
+   * `--primary-solid` and `--destructive-solid` are the button fills, which
+   * carry white text and therefore have to stay dark in both themes. Folding
+   * the two roles into one token is what makes a red button with white text
+   * fail contrast on a dark page. */
+  --primary: oklch(0.52 0.168 254);
+  --primary-solid: oklch(0.52 0.168 254);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.961 0.005 258);
+  --secondary-foreground: oklch(0.28 0.02 258);
+  --accent: oklch(0.945 0.012 254);
+  --accent-foreground: oklch(0.28 0.02 258);
+
+  --destructive: oklch(0.545 0.208 27);
+  --destructive-solid: oklch(0.545 0.208 27);
+  --destructive-foreground: oklch(0.99 0 0);
+
+  /* the four log levels, and the only four status colours in the app */
+  --ok: oklch(0.505 0.135 153);
+  --warn: oklch(0.545 0.125 72);
+  --err: var(--destructive);
+  --detail: var(--muted-foreground);
+
+  --border: oklch(0.906 0.008 258);
+  /* Darker than `--border` on purpose: this one is the *only* boundary a text
+   * field or an outline button has, so it is held to WCAG 1.4.11's 3:1
+   * against the surface behind it. Card and table rules are decoration and
+   * are not. */
+  --input: oklch(0.628 0.018 258);
+  --ring: oklch(0.55 0.16 254);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0d1117;
-    --fg: #e6edf3;
-    --muted: #9198a1;
-    --line: #30363d;
-    --panel: #161b22;
-    --accent: #4f8bf0;
-    --ok: #3fb950;
-    --warn: #d29922;
-    --err: #ff7b72;
-    --focus: #6ea8ff;
+    --background: oklch(0.183 0.014 258);
+    --foreground: oklch(0.935 0.008 258);
+    --card: oklch(0.222 0.015 258);
+    --card-foreground: var(--foreground);
+    --popover: oklch(0.243 0.016 258);
+    --popover-foreground: var(--foreground);
+    --sunken: oklch(0.152 0.014 258);
+    --grid: oklch(0.29 0.015 258);
+
+    --muted: oklch(0.262 0.015 258);
+    --muted-foreground: oklch(0.7 0.018 258);
+
+    --primary: oklch(0.73 0.13 254);
+    --primary-solid: oklch(0.56 0.175 254);
+    --primary-foreground: oklch(0.99 0 0);
+    --secondary: oklch(0.268 0.016 258);
+    --secondary-foreground: oklch(0.93 0.008 258);
+    --accent: oklch(0.3 0.026 254);
+    --accent-foreground: oklch(0.95 0.008 258);
+
+    --destructive: oklch(0.72 0.16 25);
+    --destructive-solid: oklch(0.545 0.21 27);
+    --destructive-foreground: oklch(0.99 0 0);
+
+    --ok: oklch(0.755 0.155 152);
+    --warn: oklch(0.805 0.13 82);
+
+    --border: oklch(0.315 0.016 258);
+    --input: oklch(0.565 0.018 258);
+    --ring: oklch(0.74 0.13 254);
   }
 }
 
-* {
-  box-sizing: border-box;
+@theme inline {
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-sunken: var(--sunken);
+  --color-grid: var(--grid);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-primary: var(--primary);
+  --color-primary-solid: var(--primary-solid);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-solid: var(--destructive-solid);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-err: var(--err);
+  --color-detail: var(--detail);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
 }
 
-html {
-  background: var(--bg);
-}
-
-body {
-  margin: 0;
-  padding: 1.5rem 1rem 3rem;
-  background: var(--bg);
-  color: var(--fg);
-  font:
-    15px/1.55 system-ui,
-    -apple-system,
-    'Segoe UI',
-    Roboto,
-    sans-serif;
-  -webkit-text-size-adjust: 100%;
-}
-
-main {
-  max-width: 58rem;
-  margin: 0 auto;
-}
-
-h1 {
-  font-size: 1.45rem;
-  margin: 0 0 0.3rem;
-  letter-spacing: -0.01em;
-}
-
-h2 {
-  font-size: 1.05rem;
-  margin: 1.75rem 0 0.6rem;
-}
-
-h3 {
-  font-size: 0.95rem;
-  margin: 1.1rem 0 0.35rem;
-}
-
-.sub {
-  color: var(--muted);
-  margin: 0 0 1.25rem;
-  font-size: 0.9rem;
-}
-
-a {
-  color: var(--accent);
-}
-
-code,
-pre,
-.mono {
-  font-family: var(--mono);
-  font-size: 0.85em;
-}
-
-section {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 1rem 1.1rem;
-  margin-bottom: 1rem;
-  background: var(--panel);
-}
-
-section > h2:first-child {
-  margin-top: 0;
-}
-
-.banner {
-  border: 1px solid var(--line);
-  border-left: 4px solid var(--accent);
-  padding: 0.7rem 0.9rem;
-  border-radius: 8px;
-  background: var(--panel);
-  margin-bottom: 1rem;
-}
-
-.banner.ok {
-  border-left-color: var(--ok);
-}
-
-.banner.warn {
-  border-left-color: var(--warn);
-}
-
-.banner.err {
-  border-left-color: var(--err);
-}
-
-.banner p {
-  margin: 0.25rem 0;
-}
-
-.banner.flush {
-  margin-top: 0;
-}
-
-.banner.inset {
-  margin: 0.9rem 0 0;
-}
-
-.row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  align-items: flex-end;
-}
-
-label {
-  display: block;
-  font-size: 0.8rem;
-  color: var(--muted);
-  margin-bottom: 0.2rem;
-}
-
-input[type='text'],
-input[type='number'],
-select {
-  font: inherit;
-  font-family: var(--mono);
-  font-size: 0.85rem;
-  padding: 0.4rem 0.5rem;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--fg);
-  width: 9.5rem;
-  max-width: 100%;
-}
-
-button {
-  font: inherit;
-  font-weight: 600;
-  padding: 0.5rem 0.9rem;
-  border-radius: 6px;
-  border: 1px solid var(--line);
-  background: var(--bg);
-  color: var(--fg);
-  cursor: pointer;
-}
-
-button:hover:not(:disabled) {
-  border-color: var(--muted);
-}
-
-button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
-}
-
-button.primary:hover:not(:disabled) {
-  filter: brightness(1.08);
-}
-
-button.danger {
-  border-color: var(--err);
-  color: var(--err);
-}
-
-button.danger.primary {
-  background: var(--err);
-  border-color: var(--err);
-  color: #fff;
-}
-
-button:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-/* Focus must stay visible: this tool is operated one careful control at a
- * time, sometimes by keyboard only. */
-:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 2px;
-  border-radius: 4px;
-}
-
-.btnrow {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.bar {
-  height: 10px;
-  border-radius: 5px;
-  background: var(--line);
-  overflow: hidden;
-  margin: 0.9rem 0 0.45rem;
-}
-
-.bar > .fill {
-  height: 100%;
-  width: 0%;
-  background: var(--accent);
-  transition: width 0.1s linear;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .bar > .fill {
-    transition: none;
+@layer base {
+  *,
+  ::after,
+  ::before {
+    border-color: var(--border);
   }
-}
 
-.status {
-  font-size: 0.85rem;
-  color: var(--muted);
-}
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
 
-.log {
-  font-family: var(--mono);
-  font-size: 0.78rem;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  max-height: 24rem;
-  overflow-y: auto;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 0.6rem 0.7rem;
-  margin: 0.85rem 0 0;
-}
-
-.l-ok {
-  color: var(--ok);
-}
-
-.l-warn {
-  color: var(--warn);
-}
-
-.l-err {
-  color: var(--err);
-}
-
-.l-dim {
-  color: var(--muted);
-}
-
-details.opts {
-  border: 1px dashed var(--line);
-  border-radius: 8px;
-  padding: 0.55rem 0.8rem;
-  background: var(--bg);
-  margin-top: 1rem;
-}
-
-details.opts[open] {
-  padding-bottom: 0.9rem;
-}
-
-details.opts > summary {
-  cursor: pointer;
-  font-size: 0.88rem;
-  color: var(--muted);
-}
-
-details.opts > summary strong {
-  color: var(--fg);
-}
-
-details.sub-details {
-  border-top: 1px solid var(--line);
-  padding-top: 0.7rem;
-  margin-top: 0.9rem;
-}
-
-details.sub-details > summary {
-  cursor: pointer;
-  font-weight: 600;
-  font-size: 0.9rem;
-}
-
-pre.block {
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 0.6rem 0.7rem;
-  overflow-x: auto;
-  max-width: 100%;
-}
-
-.tablewrap {
-  overflow-x: auto;
-}
-
-table {
-  border-collapse: collapse;
-  width: 100%;
-  font-size: 0.85rem;
-  min-width: 34rem;
-}
-
-th,
-td {
-  text-align: left;
-  padding: 0.35rem 0.5rem;
-  border-bottom: 1px solid var(--line);
-}
-
-th {
-  color: var(--muted);
-  font-weight: 600;
-}
-
-ul {
-  padding-left: 1.2rem;
-}
-
-li {
-  margin: 0.2rem 0;
-}
-
-.note {
-  font-size: 0.85rem;
-  color: var(--muted);
-}
-
-.note.flush {
-  margin-top: 0;
-}
-
-.note.tight {
-  margin: 0.6rem 0 0;
-}
-
-.note.last {
-  margin-bottom: 0;
-}
-
-/* the offline decryptor is a side door, not part of the numbered flow */
-section.optional {
-  background: var(--bg);
-  border-style: dashed;
-  margin-top: 1.75rem;
-}
-
-.optlabel {
-  margin: 0 0 0.3rem;
-  font-size: 0.72rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--muted);
-  font-weight: 600;
-}
-
-/* the two views (#/ and #/flash) share the Connect panel and the platform notes */
-nav.views {
-  display: flex;
-  gap: 0.35rem;
-  margin: 0 0 1.25rem;
-  border-bottom: 1px solid var(--line);
-}
-
-nav.views a {
-  padding: 0.45rem 0.85rem;
-  border: 1px solid transparent;
-  border-bottom: none;
-  border-radius: 8px 8px 0 0;
-  margin-bottom: -1px;
-  font-size: 0.9rem;
-  font-weight: 600;
-  color: var(--muted);
-  text-decoration: none;
-}
-
-nav.views a:hover {
-  color: var(--fg);
-}
-
-nav.views a[aria-current='page'] {
-  color: var(--fg);
-  background: var(--panel);
-  border-color: var(--line);
-}
-
-nav.views a.danger[aria-current='page'] {
-  color: var(--err);
-}
-
-label.chk {
-  display: flex;
-  align-items: flex-start;
-  gap: 0.45rem;
-  font-size: 0.85rem;
-  color: var(--fg);
-  margin: 0.9rem 0 0;
-}
-
-label.chk input {
-  margin: 0.2rem 0 0;
-}
-
-dl.kv {
-  margin: 0;
-  display: grid;
-  grid-template-columns: minmax(9rem, auto) 1fr;
-  gap: 0.15rem 0.8rem;
-  font-size: 0.85rem;
-}
-
-dl.kv dt {
-  color: var(--muted);
-}
-
-dl.kv dd {
-  margin: 0;
-  font-family: var(--mono);
-  font-size: 0.95em;
-  overflow-wrap: anywhere;
-}
-
-.fwbox {
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 0.7rem 0.8rem;
-  margin: 0.85rem 0 0;
-}
-
-.fwbox h3 {
-  margin-top: 0;
-}
-
-.confirm {
-  border: 1px solid var(--err);
-  border-radius: 8px;
-  padding: 0.8rem 0.9rem;
-  margin: 0.9rem 0 0;
-  background: var(--bg);
-}
-
-.confirm p {
-  margin: 0.3rem 0;
-  font-size: 0.85rem;
-}
-
-.confirm p:first-child {
-  margin-top: 0;
-}
-
-.visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  padding: 0;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  clip-path: inset(50%);
-  white-space: nowrap;
-  border: 0;
-}
-
-/* Android with an OTG cable is a real way to use this, so everything has to
- * stay usable at phone width: the option grid and the key/value lists are the
- * only two places that assume more room than that. */
-@media (max-width: 30rem) {
   body {
-    padding: 1rem 0.75rem 2.5rem;
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.55;
+    /* Android over USB-OTG is a supported way to run this. Nothing may push
+     * the document sideways. */
+    overflow-x: hidden;
   }
 
-  section {
-    padding: 0.85rem 0.8rem;
+  /* One careful control at a time, often by keyboard only. The ring is never
+   * allowed to disappear. */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+    border-radius: 3px;
   }
 
-  .btnrow > button {
-    flex: 1 1 auto;
+  [data-tone='danger'] :focus-visible,
+  :focus-visible[data-tone='danger'] {
+    outline-color: var(--destructive);
   }
 
-  dl.kv {
-    grid-template-columns: 1fr;
-    gap: 0 0;
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: var(--font-mono);
+  }
+}
+
+/* --------------------------------------------------------------------
+ * Prose written by the firmware people, rendered inside cards.
+ * `.prose-note` is the muted explanatory voice the whole tool speaks in.
+ * -------------------------------------------------------------------- */
+@layer components {
+  .prose-note code {
+    font-size: 0.86em;
+    padding: 0.05em 0.3em;
+    border-radius: var(--radius-sm);
+    background: color-mix(in oklab, var(--muted) 70%, transparent);
+    overflow-wrap: anywhere;
   }
 
-  dl.kv dt {
-    margin-top: 0.4rem;
+  .prose-note a {
+    color: var(--primary);
+    text-underline-offset: 2px;
+    text-decoration-line: underline;
   }
 
-  nav.views {
-    overflow-x: auto;
+  /* ----------------------------------------------------------------
+   * Tables stay real tables. Below 48rem each row becomes a card, and
+   * the explicit ARIA roles on every element keep the grid semantics
+   * that `display: block` would otherwise strip out.
+   * ---------------------------------------------------------------- */
+  .table-cards .cell-label {
+    display: none;
   }
 
-  .row > div {
-    flex: 1 1 8rem;
-  }
+  @media (max-width: 48rem) {
+    .table-cards,
+    .table-cards tbody,
+    .table-cards tr,
+    .table-cards td,
+    .table-cards tbody th {
+      display: block;
+      width: auto;
+    }
 
-  input[type='text'],
-  input[type='number'],
-  select {
-    width: 100%;
+    .table-cards thead {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+      border-width: 0;
+    }
+
+    .table-cards tr {
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 0.35rem 0.6rem 0.5rem;
+      margin-bottom: 0.5rem;
+      background: var(--card);
+    }
+
+    .table-cards td,
+    .table-cards tbody th {
+      border-bottom: 0;
+      padding: 0.2rem 0;
+      text-align: left;
+    }
+
+    .table-cards tbody th {
+      padding-bottom: 0.4rem;
+    }
+
+    .table-cards .cell-label {
+      display: block;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--muted-foreground);
+    }
   }
+}
+
+/* The hairline grid behind the masthead — an instrument bezel, nothing more. */
+@utility bezel-grid {
+  background-image:
+    linear-gradient(to right, var(--grid) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid) 1px, transparent 1px);
+  background-size: 28px 28px;
+  background-position: center;
+  mask-image: linear-gradient(to bottom, rgb(0 0 0 / 0.55), transparent 85%);
+}
+
+@utility scrollbar-slim {
+  scrollbar-width: thin;
+  scrollbar-color: var(--input) transparent;
 }
