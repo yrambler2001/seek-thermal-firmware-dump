@@ -362,6 +362,14 @@ interface `WebUsbTransport` already declares, so the transport, `SeekDevice`, `r
 profile tables and the decrypt are the real ones. What is substituted is the **host
 controller** — USB/IP instead of libusb — and nothing else.
 
+**Until §9.9 that last sentence was not true in effect.** The adapter's `claimInterface`
+sent a `SET_INTERFACE` no real host sends (`bmRequestType 0x00`). Every firmware stalled it,
+and `WebUsbTransport`'s `'auto'` mode then fell back to device-recipient requests without a
+word. So every emulator row in both tiers measured `0x40`/`0xC0` vendor requests, while a
+real host sends `0x41`/`0xC1`. §9.9 fixes the adapter and re-measures. **No row of either
+tier changes**, because every Seek firmware's vendor handler ignores the recipient bits.
+Every row now asserts that it ran on the real-host path.
+
 **Why the fill matters, in one line:** 68–96 % of a real Seek flash is erased, so without it
 `0xFF` and "never transferred" are the same byte and a dump that lost a window still compares
 clean over most of its length. With it, a gap is a diff at a named address.
@@ -485,7 +493,8 @@ reconstruction of that handler names independently. One token, not one per build
 ### 9.4 The harness change that made the emulator rows honest
 
 §8 recorded a flake: one row in fifty-one wedging under `npm run check`, a different row each time,
-`device stalled status IN bRequest=11` from some point on and `no-answer` thereafter. The fix is
+`device stalled status IN bRequest=11` from some point on and `no-answer` thereafter (that stall
+was the adapter's own malformed `SET_INTERFACE`, on every import from the first; §9.7, §9.9). The fix is
 harness-side and it is a distinction rather than a tolerance. `probeTier1` now throws
 `ProbeUnmeasurable` when the camera **was** answering and then answers neither `GetErrorCode` nor
 `GetFirmwareInfo` through three fresh USB/IP imports, or when the emulator process has exited; the
@@ -643,7 +652,7 @@ wall; tier 2 finished at 187.2 s and every other file together took under 30 s.
 | (c) CPU-bound URB service                                                          | 117              | 91.7 s of it is 0.6.0.4's 127 unanswered requests, each ended by the emulator's host-harness budget with `-ETIMEDOUT`                                                                                                  |
 | host side, re-import, spawn and teardown                                           | ~159             | the remainder                                                                                                                                                                                                          |
 | (a) deadlines waited out on silent refusals                                        | **0**            | no gate wait over 0.5 s that was not a dropped reply; over control transfers a refusal is a stall, answered in 1–3 ms                                                                                                  |
-| (b) the `SET_INTERFACE` stall                                                      | ~0               | it stalls on **1,362 of 1,362** imports, every row, from the first. It is the baseline, not a wedge signature, and costs 1–3 ms                                                                                        |
+| (b) the `SET_INTERFACE` stall                                                      | ~0               | it stalls on **1,362 of 1,362** imports, every row, from the first. It is the baseline, not a wedge signature, and costs 1–3 ms. Gone since §9.9: the adapter no longer sends it                                       |
 | (e) vitest pool queueing                                                           | 0 on row timers  | rows queued behind the stuck ones still show 3–4 s; but five stuck rows held five of six slots for up to 11 min                                                                                                        |
 | (f) a gate deadlock: the host waits with nothing pending and the device needs time | **0**            | `SetOperationMode` was **never sent**. `GetOperationMode` read 0 on every row, so `ensureMode0()` never slept                                                                                                          |
 
@@ -704,7 +713,7 @@ did in run B.
 3. **DONE (§9.8). Harness: a known gap must not pass on a timeout.** `test.fails` turned run A's 900 s hang
    into a green "expected failure". Assert the gap's own condition and let any other error,
    a timeout included, fail the row. Low risk.
-4. **NOT DONE — a separate decision. Harness fidelity, because it changes what is measured.**
+4. **DONE (§9.9), re-measured: 0 of 51 and 0 of 15 rows change. Harness fidelity, because it changes what is measured.**
    `UsbIpWebUsbDevice.claimInterface` sends `SET_INTERFACE` as `bmRequestType 0x00`. USB 2.0
    §9.4.10 requires `0x01`, and neither WebUSB's `claimInterface` nor `libusb_claim_interface`
    sends anything at all. It stalls on every import, so **every row in both tiers has run with
@@ -842,10 +851,9 @@ Machine: 10 cores, with a desktop session running beside the suite. "Load" is `u
 
 #### What is still open
 
-- **§9.7 fix 4, the `SET_INTERFACE` recipient**, is untouched on purpose: `claimInterface` still
-  sends `bmRequestType 0x00`, it still stalls on every import, and every vendor request is still
-  measured with `recipient: 'device'`. Changing it changes what is measured and needs its own
-  regeneration and a reviewed diff.
+- ~~**§9.7 fix 4, the `SET_INTERFACE` recipient**~~: done in §9.9, with its own regeneration.
+  `claimInterface` sends nothing, and every vendor request goes out with interface recipient.
+  0 of 66 rows changed.
 - **0.6.0.4's margin.** Its never-completed requests take at most ~0.85 s each idle and ~2.6 s
   each at load 378 (the row's time over its 127 requests), against `WebUsbTransport`'s 5 s. If
   one ever crossed it, the client would abandon the transfer and the audit would fail the row as
@@ -855,3 +863,206 @@ Machine: 10 cores, with a desktop session running beside the suite. "Load" is `u
 - The re-measure-from-a-fresh-emulator path (`PROBE_ATTEMPTS`) is kept. It can no longer hide a
   lost reply (every attempt is audited); whether it still earns its place is not settled here.
 - No toolkit source (`packages/*/src`) was changed.
+
+### 9.9 The recipient fix, and the re-measure (2026-09-22)
+
+§9.7 fix 4, made. The toolkit is at `aa69f72` (the adapter) and `0f69282` (the regenerated
+pins). FW-V1 is at `c94c61df` (`emu-corpus`, Phase 19), which also carries an emulator
+defect this work exposed. **No toolkit source (`packages/*/src`) was changed.**
+
+**What was wrong.** The emulator suites present the emulated camera to the toolkit through
+`UsbIpWebUsbDevice`. Its `claimInterface()` sent `SET_INTERFACE` with `bmRequestType 0x00`.
+USB 2.0 §9.4.10 defines `SET_INTERFACE` only as `00000001B`, interface recipient (Table
+9-3), and a request a device does not define is answered with a STALL (§9.2.7). Every
+firmware stalled it, on every import. `WebUsbTransport.open()` (`webusb.ts:170-189`)
+catches any claim rejection and, under `recipient: 'auto'`, sets `recipient = 'device'`.
+It reports that only through `onWarning`, which neither suite passed. So every emulator row
+in both tiers ran with device-recipient vendor requests (`0x40`/`0xC0`, `wIndex` 0),
+which is not the path a real host takes.
+
+#### Ground truth: what a real host puts on the wire
+
+The CLI's host stack is `usb` 3.1.0, which is node-usb-rs over nusb 0.2.7 and not libusb.
+The web app's is Chrome's `navigator.usb`. `WebUsbTransport` calls `open()`, then
+`selectConfiguration(1)` only if `configuration.configurationValue !== 1`, then
+`claimInterface(0)`, and then vendor transfers with `recipient: 'interface'`, `index: 0`.
+It never calls `selectAlternateInterface`.
+
+| call                             | WebUSB spec (WICG `index.bs`)                                                                         | CLI: node-usb 3.1.0 → nusb 0.2.7                                                                                                                      | adapter before                                 | adapter now                              |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- | ---------------------------------------- |
+| `configuration`                  | `[[configurationValue]]` set from Get Configuration at detection                                      | the OS's value (sysfs `bConfigurationValue` on Linux, the IOKit interface nubs on macOS); no packet                                                   | `null` → the toolkit sent SET_CONFIGURATION(1) | the import record's value (1); no packet |
+| `claimInterface(0)`              | "platform-specific steps to request exclusive control"; no control transfer                           | `USBInterfaceOpen` (macOS), `USBDEVFS_CLAIMINTERFACE` (Linux; `claimintf()` in `devio.c` only binds usbfs); no packet                                 | **`SET_INTERFACE`, bm 0x00**                   | nothing                                  |
+| `selectAlternateInterface(n, a)` | "Issue a `SET_INTERFACE` control transfer"; interface must be claimed                                 | `SetAlternateInterface` (macOS), `USBDEVFS_SETINTERFACE` → `usb_set_interface()` → `USB_REQ_SET_INTERFACE`, `USB_RECIP_INTERFACE` (Linux `message.c`) | absent                                         | `SET_INTERFACE`, bm **0x01**             |
+| vendor transfer, `'interface'`   | interface (low byte of `index`) must exist and be claimed, else `NotFoundError` / `InvalidStateError` | routed through the claimed interface; `invalid state` if none is                                                                                      | `0x41`/`0xC1`, unchecked                       | `0x41`/`0xC1`, checked as the spec does  |
+
+**Measured on the real camera, read-only.** The bench Compact PRO FF runs 4.18.2.0 and was
+powered through `USBSW-1` channel 2, with the J-Link left off. It was driven through
+node-usb 3.1.0 and the real `WebUsbTransport` exactly as `packages/cli/src/backend.ts`
+wraps it. Only GetErrorCode, GetChipID, GetOperationMode and GetFirmwareInfo were sent,
+each checked against `facts.json`. macOS had configured the camera
+(`kUSBCurrentConfiguration = 1`, interface 0 is vendor class 255), so no
+SET_CONFIGURATION was sent. With `'auto'` the claim **succeeded, with no warning**, and the
+transport stayed on `recipient: 'interface'`. The four reads answered identically as `0xC1`
+and, with `'device'` forced, as `0xC0`: `00000000`, `18001800a600af001200e300`, `0000`,
+`04120200`. The camera was powered off afterwards. So on a real host the fallback does not
+fire, and the harness had been measuring a path users do not take.
+
+**Measured on the emulator, 8 builds.** 0.3.0.1, 0.5.0.2, 1.3.0.8 and 4.8.1.9 Compacts;
+the Compact PRO 1.0.3.0 and FF 4.18.2.0 dumps; the Mosaic FF 2.27.1.33 dump; and the Nano
+300 dump. On each, the old adapter drove the transport to `recipient=device` with
+`could not claim interface 0 (control 11 stalled (status -32))`. `SET_INTERFACE` as `0x00`
+stalls and as `0x01` succeeds; `GET_INTERFACE` (`0x81`) returns 0. GetErrorCode,
+GetOperationMode, GetFirmwareInfo and GetChipID return the same bytes as `0xC0` and as
+`0xC1`, and all four stall with `wIndex = 1`. The instruments are FW-V1
+`tools/recipient_fidelity/`.
+
+#### What the adapter does now
+
+For every call it sends exactly what the table's right-hand column says.
+
+- `claimInterface` and `releaseInterface` are host-side state only. They check "opened,
+  configured, interface exists" as the spec does; USB 2.0 §9.6.5 makes interface numbers
+  `0 .. bNumInterfaces-1`.
+- `configuration` comes from the USB/IP import record.
+- `close()` releases every claim.
+- An interface-recipient transfer to an unclaimed interface is refused before anything
+  is sent.
+- `bmRequestType` is built from the setup's own type and recipient.
+
+Two guards, so the fallback cannot hide again:
+
+1. **`assertRealHostPath`** (`webusb-over-usbip.ts`) runs after the first `open()` and at
+   the end of every row, in both tiers. It throws `HarnessFidelityError` unless
+   `transport.info.recipient === 'interface'` and the adapter never rejected a claim; the
+   transport re-claims on every reopen, which is up to a few hundred per row. The suites rethrow it, so it is
+   never recorded as a gap.
+2. **The wire log.** `DeliveryLedger` counts every control transfer by
+   `bmRequestType/bRequest`, and the summary matrix now ends with a line such as:
+   `wire: vendor requests 15901 interface-recipient (0x41/0xC1), 0 device-recipient
+(0x40/0xC0), 747 stalled; SET_CONFIGURATION sent 0; SET_INTERFACE sent 0, stalled 0
+(emulator log: 0 'bRequest=11' stall(s)); standard requests stalled: none`. The
+   emulator-log count is taken from the server's own `device stalled ... bRequest=11`
+   notes, so the claim does not rest on the client counting itself.
+
+**Negative test** (reverted afterwards). With the old claim restored, tier 1 on its own
+exits 1. All **51 of 51** rows fail with `HarnessFidelityError: … recipient=device,
+claimedInterface=false, 1 claimInterface() call(s) rejected by the adapter (last:
+LIBUSB_TRANSFER_STALL: control 11 stalled (status -32))`. The wire line reads
+`SET_INTERFACE sent 51, stalled 51 (emulator log: 51 'bRequest=11' stall(s))`.
+
+#### The re-measure, and why nothing moved
+
+`node scripts/update-emulator-expectations.mjs` (both tiers, 199 s, 392 passed, exit 0)
+against the pins of `dd336c0`: **0 of 51 tier-1 rows and 0 of 15 tier-2 rows differ.** The
+only change in either file is the `note` line, which now names the path the pins were
+measured on. The same result came twice before the regeneration, with the fixed adapter
+asserting against the old pins: one run matched 50 of 51 plus 15 of 15, and the other
+matched 51 of 51 plus 15 of 15. The one row missing from the first run is the emulator
+defect below, not a difference.
+
+**No row changed, so there is no per-row before/after table.** The mechanism is in each
+firmware's own dispatch. The vendor EP0 handler `usb_ctrl_xfer_handler` is registered with
+the mask ROM's `RegisterClassHandler` (FW-V1 `docs/EMULATOR.md` §7.4a). It checks exactly
+two things, the type and `wIndex`, and never reads the recipient bits (D4..0). That holds
+in all 11 FW-V1 reconstructions that carry a `usb_core.c`:
+
+- `targets/compact_pro_ff/src/usb_core.c:1063`:
+  `(bmRequestType.B & 0x60u) != 0x40u || wIndex.W`.
+- The same line in `compact_pro`, `compact_pro_4_9_2_0`, `compact_xr`, `mosaic_9hz`,
+  `mosaic_ff`, `nano200` and `nano_300`.
+- The same check split in two, with an "Ignoring request to non-zero interface" trace, in
+  `compact_32k_1_3_0_8` and `compact_pro_9hz_2016`.
+- `BM.Type != 2` then `wIndex.W != 0` in `compact_32k_0_3_0_1`.
+
+The only other use of `bmRequestType` in each is the direction bit. Interface 0 is
+`wIndex` 0 either way. So the firmware cannot tell `0xC0` from `0xC1`, and the removed
+`SET_INTERFACE` stall had no lasting effect: a control-pipe STALL lasts only until the next
+SETUP (USB 2.0 §8.5.3.4). The removed SET_CONFIGURATION made no difference either. The old adapter reported
+`configuration: null`, so the transport sent SET_CONFIGURATION(1) once per attach, to a part
+the emulator had already configured.
+
+#### What it exposed in the emulator: a SIGTERM self-deadlock (FW-V1 `c94c61df`)
+
+The first regeneration against the pre-fix emulator failed 2 rows, and one of the two
+assert runs failed 1. None of these was a measurement: each emulator **did not stop on
+SIGTERM**. §9.8's 30 s SIGKILL backstop killed it, and the audit failed the row with "the
+emulator exited without printing its ---USBIP-SUMMARY--- delivery ledger". That is 3 of 198
+processes, all tier 1: 0.6.0.4, 1.3.0.8 and the Nano 200 image. `sample` on the one
+captured showed its main thread parked in `lock_PyThread_acquire_lock` under
+`handle_signals`.
+
+The cause was the emulator's handler. It called `Bridge.stop()`, which sets two
+`threading.Event`s. Python runs the handler on the emulator thread between two bytecodes
+of whatever it interrupted. When that was `_gate()` inside `work.clear()` or `work.wait()`,
+the thread already held the Event's non-reentrant Condition lock, and it waited for itself.
+FW-V1 now has the handler do one attribute store, and the emulator thread stops itself
+holding no lock. `selftest.py` forces the interleaving with a real SIGTERM sent from inside
+the lock. The pre-fix handler, run verbatim as a control, deadlocks; the fixed one returns.
+The self-test count goes from 125 to 127, all pass.
+
+Whether the adapter change raised the rate is **not established**. It was 0 in 381
+processes in §9.8 and 3 in 198 here, but the stress instrument
+(`tools/recipient_fidelity/stop_stress.ts`) found 0 hangs in 200 trials at this timing
+before the fix. The mechanism does not involve the client at all: the self-test reproduces
+it with no socket.
+
+#### The measurements
+
+The toolkit was at `0f69282` and FW-V1 at `c94c61df`, on the same 10-core machine as §9.8.
+
+| run                                  | exit | passed / failed      | wall (vitest)   | slowest row (tier 1 / tier 2) | replies delivered = received | dropped | emulators left | `bRequest=11` stalls |
+| ------------------------------------ | ---- | -------------------- | --------------- | ----------------------------- | ---------------------------- | ------- | -------------- | -------------------- |
+| `npm run check` 1                    | 0    | 581 / 0              | 218 s (203.7 s) | 114.3 s / 97.5 s              | 889,123                      | 0       | 0              | 0                    |
+| `npm run check` 2                    | 0    | 581 / 0              | 219 s (205.3 s) | 115.3 s / 98.1 s              | 889,123                      | 0       | 0              | 0                    |
+| regeneration, both tiers             | 0    | 392 / 0 (core)       | 200 s (198.9 s) | 110.3 s / 90.2 s              | 889,123                      | 0       | 0              | 0                    |
+| tier 1 alone, **old claim restored** | 1    | 325 / 51 (1 skipped) | —               | 4.5 s / —                     | 281                          | 0       | 0              | 51                   |
+
+- The slowest tier-1 row is still the 0.6.0.4 Compact, CPU-bound as in §9.8. `emulators left`
+  is the `afterAll` leak check in both tiers, confirmed by an empty `pgrep -fl seek_emu.py`
+  after each run.
+- **Every full run's wire line reads:** tier 1 sent 15,901 vendor requests as `0x41`/`0xC1`,
+  0 as `0x40`/`0xC0`, and 747 of them stalled (refusals, which are measurements). Tier 2 sent
+  872,934 as `0x41`/`0xC1`, 0 as `0x40`/`0xC0`, and 3 stalled. Neither tier sent a
+  SET_CONFIGURATION or a SET_INTERFACE, and no standard request stalled.
+- **The reply count fell by exactly what was removed.** Tier 1 went from §9.8's 17,347 to
+  16,120, down 1,227: one SET_INTERFACE per import (1,176) plus one SET_CONFIGURATION per
+  attach (51). Tier 2 went from 873,033 to 873,003, down 30, which is 15 × 2.
+- Without the optional inputs, `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run`
+  gives **445 passed | 3 skipped**, exit 0. With the dump corpus and no emulator it gives
+  **513 passed | 2 skipped**. Both are unchanged.
+- FW-V1 `emu/selftest.py`: **127 passed, 0 failed, 0 skipped** (196 s).
+
+#### Findings in toolkit source, reported and not patched
+
+1. **`'auto'` falls back on any claim rejection, silently unless a caller passes
+   `onWarning`** (`webusb.ts:170-189`). Its doc comment says the fallback is for "a driver
+   holding the interface", but the `catch` does not look at the cause. A stall, a not-found
+   or an unconfigured device all switch the recipient. This is what hid the harness bug for
+   a whole campaign. On a real host the claim sends no packet, so only host-side causes can
+   trigger it. On every Seek firmware measured the recipient does not change an answer, so
+   the fallback costs nothing on the wire. Its risk is the masking.
+2. **The recipient is re-decided on every `open()`** (`webusb.ts:154-191`), and
+   `runDump`'s retry reopens mid-dump (`dump.ts:158-160`). A claim that fails on a reopen
+   switches the recipient partway through a dump.
+3. **The dump manifest cannot record either** (from code; not run). `readWindows` closes
+   the transport in its `finally` (`dump.ts:226`) before `runDump` builds the manifest from
+   `transportInfoOf(device.transport.info)` (`dump.ts:367`). So `claimedInterface` in a
+   manifest is always `false`, and `recipient` is the last open's.
+4. **Under the CLI, the host stack's own timeout is 1 s, not the transport's.** node-usb
+   3.x's `controlTransferIn/Out` default their timeout to 1000 ms
+   (`node_modules/usb/dist/index.js:8,22,32`), and `WebUsbTransport` never passes one
+   (`webusb.ts:260,274`). So the 5 s `USB_TIMEOUT_MS` race never fires under the CLI. Also,
+   `completeMemoryUpgrade`'s 20 s `USB_COMMIT_TIMEOUT_MS` sits on top of a 1 s native
+   transfer that the host cancels, although `client.ts` says "the erase, program and verify
+   all run inside this one transfer". Not exercised: a commit was not sent to any camera.
+   Browsers apply no transfer timeout, and neither does this adapter, so the emulator
+   matrix cannot see it.
+5. **Under the CLI, a stall rejects instead of resolving `status: 'stall'`.** node-usb-rs
+   `webusb_device.rs` `controlTransferIn` turns any nusb error, including "endpoint
+   stalled", into a rejection. So `WebUsbTransport` reports a firmware refusal as
+   `usb/transfer-failed` ("unplug and replug") rather than `usb/stalled`. This adapter
+   models the browser, so the emulator matrix exercises the browser's stall path only.
+6. **Latent:** node-usb 3.x's `configuration` getter **throws** on an unconfigured device
+   (`active_configuration()` mapped to an error) instead of returning `null`. So
+   `WebUsbTransport.open()`'s `dev.configuration?.configurationValue` would throw rather
+   than configure the device. Not observed: macOS had configured the bench camera.
