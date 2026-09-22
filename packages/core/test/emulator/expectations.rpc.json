@@ -211,7 +211,7 @@
         "productName": "PIR206 Thermal Camera",
         "serialNumber": "@Ă耀�"
       },
-      "chipIdHex": null,
+      "chipIdHex": "ffffffffffffffffffffffff",
       "commands": {
         "GetErrorCode": "ok",
         "GetOperationMode": "ok",
@@ -253,46 +253,27 @@
       "product": "Compact",
       "version": "0.7.0.7",
       "identity": {
-        "vendorId": "0x289D",
-        "productId": "0x0010",
-        "manufacturerName": "Seek Thermal",
-        "productName": "PIR206 Thermal Camera",
-        "serialNumber": "@Ă耀�"
+        "vendorId": "",
+        "productId": "",
+        "manufacturerName": null,
+        "productName": null,
+        "serialNumber": null
       },
-      "chipIdHex": "220029002e009d009200e000",
-      "commands": {
-        "GetErrorCode": "no-answer",
-        "GetOperationMode": "no-answer",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
-        "GetFirmwareInfo": "no-answer",
-        "GetChipID": "no-answer",
-        "BeginFirmwareUpgrade": "no-answer",
-        "SetFirmwareInfoFeatures": "no-answer",
-        "EnsureMode0": "no-answer"
-      },
-      "controlInBytes": {
-        "32": null,
-        "64": null,
-        "128": null,
-        "256": null,
-        "512": null
-      },
+      "chipIdHex": null,
+      "commands": {},
+      "controlInBytes": {},
       "windowsConfirmed": [],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
-      "windowsRefused": [
-        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
-      ],
+      "windowsRefused": [],
       "auth": {
-        "subcmd": 5,
         "plainAccepted": false,
         "authAccepted": false,
-        "wrongTokenAccepted": false
+        "wrongTokenAccepted": false,
+        "subcmd": 5
       },
       "gap": {
-        "reason": "the selector map reaches no window: 63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)"
+        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: window probe subcmd 0x01: the emulator process exited during the probe, so nothing measured after that point is a property of the firmware [fault: unmapped addr=0x42040204 at PC=0x100854F2]"
       }
     },
     "compact/2014.09.06-10.24.56-0.7.0.8/no-serial/subi_lpc43xx_lpcopen_0.7.0.8_compact_sep_6_2014_10-24-56_99.28_yrambler2001_firmware": {
@@ -301,46 +282,27 @@
       "product": "Compact",
       "version": "0.7.0.8",
       "identity": {
-        "vendorId": "0x289D",
-        "productId": "0x0010",
-        "manufacturerName": "Seek Thermal",
-        "productName": "PIR206 Thermal Camera",
-        "serialNumber": "@Ă耀�"
+        "vendorId": "",
+        "productId": "",
+        "manufacturerName": null,
+        "productName": null,
+        "serialNumber": null
       },
-      "chipIdHex": "220029002e009d009200e000",
-      "commands": {
-        "GetErrorCode": "no-answer",
-        "GetOperationMode": "no-answer",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
-        "GetFirmwareInfo": "no-answer",
-        "GetChipID": "no-answer",
-        "BeginFirmwareUpgrade": "no-answer",
-        "SetFirmwareInfoFeatures": "no-answer",
-        "EnsureMode0": "no-answer"
-      },
-      "controlInBytes": {
-        "32": null,
-        "64": null,
-        "128": null,
-        "256": null,
-        "512": null
-      },
+      "chipIdHex": null,
+      "commands": {},
+      "controlInBytes": {},
       "windowsConfirmed": [],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
-      "windowsRefused": [
-        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
-      ],
+      "windowsRefused": [],
       "auth": {
-        "subcmd": 5,
         "plainAccepted": false,
         "authAccepted": false,
-        "wrongTokenAccepted": false
+        "wrongTokenAccepted": false,
+        "subcmd": 5
       },
       "gap": {
-        "reason": "the selector map reaches no window: 63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)"
+        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: window probe subcmd 0x01: the emulator process exited during the probe, so nothing measured after that point is a property of the firmware [fault: unmapped addr=0x42040204 at PC=0x1008557E]"
       }
     },
     "compact/2014.09.17-09.17.37-0.8.0.0/no-serial/subi_lpc43xx_lpcopen_0.8.0.0_compact_sep_17_2014_09-17-37_99.28_yrambler2001_firmware": {
@@ -349,46 +311,27 @@
       "product": "Compact",
       "version": "0.8.0.0",
       "identity": {
-        "vendorId": "0x289D",
-        "productId": "0x0010",
-        "manufacturerName": "Seek Thermal",
-        "productName": "PIR206 Thermal Camera",
-        "serialNumber": "@Ă耀�"
+        "vendorId": "",
+        "productId": "",
+        "manufacturerName": null,
+        "productName": null,
+        "serialNumber": null
       },
-      "chipIdHex": "220029002e009d009200e000",
-      "commands": {
-        "GetErrorCode": "no-answer",
-        "GetOperationMode": "no-answer",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
-        "GetFirmwareInfo": "no-answer",
-        "GetChipID": "no-answer",
-        "BeginFirmwareUpgrade": "no-answer",
-        "SetFirmwareInfoFeatures": "no-answer",
-        "EnsureMode0": "no-answer"
-      },
-      "controlInBytes": {
-        "32": null,
-        "64": null,
-        "128": null,
-        "256": null,
-        "512": null
-      },
+      "chipIdHex": null,
+      "commands": {},
+      "controlInBytes": {},
       "windowsConfirmed": [],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
-      "windowsRefused": [
-        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
-      ],
+      "windowsRefused": [],
       "auth": {
-        "subcmd": 5,
         "plainAccepted": false,
         "authAccepted": false,
-        "wrongTokenAccepted": false
+        "wrongTokenAccepted": false,
+        "subcmd": 5
       },
       "gap": {
-        "reason": "the selector map reaches no window: 63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)"
+        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: window probe subcmd 0x01: the emulator process exited during the probe, so nothing measured after that point is a property of the firmware [fault: unmapped addr=0x42040204 at PC=0x100856BA]"
       }
     },
     "compact/2014.09.29-13.38.48-0.9.0.2/no-serial/subi_lpc43xx_lpcopen_0.9.0.2_compact_sep_29_2014_13-38-48_99.28_yrambler2001_firmware": {
@@ -397,46 +340,27 @@
       "product": "Compact",
       "version": "0.9.0.2",
       "identity": {
-        "vendorId": "0x289D",
-        "productId": "0x0010",
-        "manufacturerName": "Seek Thermal",
-        "productName": "PIR206 Thermal Camera",
-        "serialNumber": "@Ă耀�"
+        "vendorId": "",
+        "productId": "",
+        "manufacturerName": null,
+        "productName": null,
+        "serialNumber": null
       },
-      "chipIdHex": "220029002e009d009200e000",
-      "commands": {
-        "GetErrorCode": "no-answer",
-        "GetOperationMode": "no-answer",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
-        "GetFirmwareInfo": "no-answer",
-        "GetChipID": "no-answer",
-        "BeginFirmwareUpgrade": "no-answer",
-        "SetFirmwareInfoFeatures": "no-answer",
-        "EnsureMode0": "no-answer"
-      },
-      "controlInBytes": {
-        "32": null,
-        "64": null,
-        "128": null,
-        "256": null,
-        "512": null
-      },
+      "chipIdHex": null,
+      "commands": {},
+      "controlInBytes": {},
       "windowsConfirmed": [],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
-      "windowsRefused": [
-        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
-      ],
+      "windowsRefused": [],
       "auth": {
-        "subcmd": 5,
         "plainAccepted": false,
         "authAccepted": false,
-        "wrongTokenAccepted": false
+        "wrongTokenAccepted": false,
+        "subcmd": 5
       },
       "gap": {
-        "reason": "the selector map reaches no window: 63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)"
+        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: window probe subcmd 0x01: the emulator process exited during the probe, so nothing measured after that point is a property of the firmware [fault: unmapped addr=0x42040204 at PC=0x1008573A]"
       }
     },
     "compact/2014.10.02-13.48.57-0.9.1.0/no-serial/subi_lpc43xx_lpcopen_0.9.1.0_compact_oct_2_2014_13-48-57_99.28_yrambler2001_firmware": {
@@ -445,46 +369,27 @@
       "product": "Compact",
       "version": "0.9.1.0",
       "identity": {
-        "vendorId": "0x289D",
-        "productId": "0x0010",
-        "manufacturerName": "Seek Thermal",
-        "productName": "PIR206 Thermal Camera",
-        "serialNumber": "@Ă耀�"
+        "vendorId": "",
+        "productId": "",
+        "manufacturerName": null,
+        "productName": null,
+        "serialNumber": null
       },
-      "chipIdHex": "220029002e009d009200e000",
-      "commands": {
-        "GetErrorCode": "no-answer",
-        "GetOperationMode": "no-answer",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
-        "GetFirmwareInfo": "no-answer",
-        "GetChipID": "no-answer",
-        "BeginFirmwareUpgrade": "no-answer",
-        "SetFirmwareInfoFeatures": "no-answer",
-        "EnsureMode0": "no-answer"
-      },
-      "controlInBytes": {
-        "32": null,
-        "64": null,
-        "128": null,
-        "256": null,
-        "512": null
-      },
+      "chipIdHex": null,
+      "commands": {},
+      "controlInBytes": {},
       "windowsConfirmed": [],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
-      "windowsRefused": [
-        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
-      ],
+      "windowsRefused": [],
       "auth": {
-        "subcmd": 5,
         "plainAccepted": false,
         "authAccepted": false,
-        "wrongTokenAccepted": false
+        "wrongTokenAccepted": false,
+        "subcmd": 5
       },
       "gap": {
-        "reason": "the selector map reaches no window: 63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)"
+        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: window probe subcmd 0x01: the emulator process exited during the probe, so nothing measured after that point is a property of the firmware [fault: unmapped addr=0x42040204 at PC=0x1008573A]"
       }
     },
     "compact/2014.10.02-14.16.26-0.10.0.0/no-serial/subi_lpc43xx_lpcopen_0.10.0.0_compact_oct_2_2014_14-16-26_99.28_yrambler2001_firmware": {
@@ -493,46 +398,27 @@
       "product": "Compact",
       "version": "0.10.0.0",
       "identity": {
-        "vendorId": "0x289D",
-        "productId": "0x0010",
-        "manufacturerName": "Seek Thermal",
-        "productName": "PIR206 Thermal Camera",
-        "serialNumber": "@Ă耀�"
+        "vendorId": "",
+        "productId": "",
+        "manufacturerName": null,
+        "productName": null,
+        "serialNumber": null
       },
-      "chipIdHex": "220029002e009d009200e000",
-      "commands": {
-        "GetErrorCode": "no-answer",
-        "GetOperationMode": "no-answer",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
-        "GetFirmwareInfo": "no-answer",
-        "GetChipID": "no-answer",
-        "BeginFirmwareUpgrade": "no-answer",
-        "SetFirmwareInfoFeatures": "no-answer",
-        "EnsureMode0": "no-answer"
-      },
-      "controlInBytes": {
-        "32": null,
-        "64": null,
-        "128": null,
-        "256": null,
-        "512": null
-      },
+      "chipIdHex": null,
+      "commands": {},
+      "controlInBytes": {},
       "windowsConfirmed": [],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
-      "windowsRefused": [
-        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
-      ],
+      "windowsRefused": [],
       "auth": {
-        "subcmd": 5,
         "plainAccepted": false,
         "authAccepted": false,
-        "wrongTokenAccepted": false
+        "wrongTokenAccepted": false,
+        "subcmd": 5
       },
       "gap": {
-        "reason": "the selector map reaches no window: 63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)"
+        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: window probe subcmd 0x01: the emulator process exited during the probe, so nothing measured after that point is a property of the firmware [fault: unmapped addr=0x42040204 at PC=0x1008573A]"
       }
     },
     "compact/2014.10.03-15.32.39-0.9.0.6/no-serial/subi_lpc43xx_lpcopen_0.9.0.6_compact_oct_3_2014_15-32-39_99.28_yrambler2001_firmware": {
@@ -541,46 +427,27 @@
       "product": "Compact",
       "version": "0.9.0.6",
       "identity": {
-        "vendorId": "0x289D",
-        "productId": "0x0010",
-        "manufacturerName": "Seek Thermal",
-        "productName": "PIR206 Thermal Camera",
-        "serialNumber": "@Ă耀�"
+        "vendorId": "",
+        "productId": "",
+        "manufacturerName": null,
+        "productName": null,
+        "serialNumber": null
       },
-      "chipIdHex": "220029002e009d009200e000",
-      "commands": {
-        "GetErrorCode": "no-answer",
-        "GetOperationMode": "no-answer",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
-        "GetFirmwareInfo": "no-answer",
-        "GetChipID": "no-answer",
-        "BeginFirmwareUpgrade": "no-answer",
-        "SetFirmwareInfoFeatures": "no-answer",
-        "EnsureMode0": "no-answer"
-      },
-      "controlInBytes": {
-        "32": null,
-        "64": null,
-        "128": null,
-        "256": null,
-        "512": null
-      },
+      "chipIdHex": null,
+      "commands": {},
+      "controlInBytes": {},
       "windowsConfirmed": [],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
-      "windowsRefused": [
-        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
-      ],
+      "windowsRefused": [],
       "auth": {
-        "subcmd": 5,
         "plainAccepted": false,
         "authAccepted": false,
-        "wrongTokenAccepted": false
+        "wrongTokenAccepted": false,
+        "subcmd": 5
       },
       "gap": {
-        "reason": "the selector map reaches no window: 63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)"
+        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: window probe subcmd 0x01: the emulator process exited during the probe, so nothing measured after that point is a property of the firmware [fault: unmapped addr=0x42040204 at PC=0x1008573A]"
       }
     },
     "compact/2014.10.03-18.31.47-0.9.0.7/no-serial/subi_lpc43xx_lpcopen_0.9.0.7_compact_oct_3_2014_18-31-47_99.28_yrambler2001_firmware": {
@@ -589,46 +456,27 @@
       "product": "Compact",
       "version": "0.9.0.7",
       "identity": {
-        "vendorId": "0x289D",
-        "productId": "0x0010",
-        "manufacturerName": "Seek Thermal",
-        "productName": "PIR206 Thermal Camera",
-        "serialNumber": "@Ă耀�"
+        "vendorId": "",
+        "productId": "",
+        "manufacturerName": null,
+        "productName": null,
+        "serialNumber": null
       },
-      "chipIdHex": "220029002e009d009200e000",
-      "commands": {
-        "GetErrorCode": "no-answer",
-        "GetOperationMode": "no-answer",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
-        "GetFirmwareInfo": "no-answer",
-        "GetChipID": "no-answer",
-        "BeginFirmwareUpgrade": "no-answer",
-        "SetFirmwareInfoFeatures": "no-answer",
-        "EnsureMode0": "no-answer"
-      },
-      "controlInBytes": {
-        "32": null,
-        "64": null,
-        "128": null,
-        "256": null,
-        "512": null
-      },
+      "chipIdHex": null,
+      "commands": {},
+      "controlInBytes": {},
       "windowsConfirmed": [],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
-      "windowsRefused": [
-        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
-      ],
+      "windowsRefused": [],
       "auth": {
-        "subcmd": 5,
         "plainAccepted": false,
         "authAccepted": false,
-        "wrongTokenAccepted": false
+        "wrongTokenAccepted": false,
+        "subcmd": 5
       },
       "gap": {
-        "reason": "the selector map reaches no window: 63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)"
+        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: window probe subcmd 0x01: the emulator process exited during the probe, so nothing measured after that point is a property of the firmware [fault: unmapped addr=0x42040204 at PC=0x10085722]"
       }
     },
     "compact/2014.10.07-14.55.43-1.0.0.0/no-serial/subi_lpc43xx_lpcopen_1.0.0.0_compact_oct_7_2014_14-55-43_99.28_yrambler2001_firmware": {
@@ -637,46 +485,27 @@
       "product": "Compact",
       "version": "1.0.0.0",
       "identity": {
-        "vendorId": "0x289D",
-        "productId": "0x0010",
-        "manufacturerName": "Seek Thermal",
-        "productName": "PIR206 Thermal Camera",
-        "serialNumber": "@Ă耀�"
+        "vendorId": "",
+        "productId": "",
+        "manufacturerName": null,
+        "productName": null,
+        "serialNumber": null
       },
-      "chipIdHex": "220029002e009d009200e000",
-      "commands": {
-        "GetErrorCode": "no-answer",
-        "GetOperationMode": "no-answer",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
-        "GetFirmwareInfo": "no-answer",
-        "GetChipID": "no-answer",
-        "BeginFirmwareUpgrade": "no-answer",
-        "SetFirmwareInfoFeatures": "no-answer",
-        "EnsureMode0": "no-answer"
-      },
-      "controlInBytes": {
-        "32": null,
-        "64": null,
-        "128": null,
-        "256": null,
-        "512": null
-      },
+      "chipIdHex": null,
+      "commands": {},
+      "controlInBytes": {},
       "windowsConfirmed": [],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
-      "windowsRefused": [
-        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
-      ],
+      "windowsRefused": [],
       "auth": {
-        "subcmd": 5,
         "plainAccepted": false,
         "authAccepted": false,
-        "wrongTokenAccepted": false
+        "wrongTokenAccepted": false,
+        "subcmd": 5
       },
       "gap": {
-        "reason": "the selector map reaches no window: 63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)"
+        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: window probe subcmd 0x01: the emulator process exited during the probe, so nothing measured after that point is a property of the firmware [fault: unmapped addr=0x42040204 at PC=0x10085722]"
       }
     },
     "compact/2014.10.13-11.15.52-1.2.0.0/no-serial/subi_lpc43xx_lpcopen_1.2.0.0_-_compact_oct_13_2014_11-15-52_99.28_gabiz_ro_firmware": {
@@ -685,46 +514,27 @@
       "product": "Compact",
       "version": "1.2.0.0",
       "identity": {
-        "vendorId": "0x289D",
-        "productId": "0x0010",
-        "manufacturerName": "Seek Thermal",
-        "productName": "PIR206 Thermal Camera",
-        "serialNumber": "@Ă耀�"
+        "vendorId": "",
+        "productId": "",
+        "manufacturerName": null,
+        "productName": null,
+        "serialNumber": null
       },
-      "chipIdHex": "220029002e009d009200e000",
-      "commands": {
-        "GetErrorCode": "no-answer",
-        "GetOperationMode": "no-answer",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
-        "GetFirmwareInfo": "no-answer",
-        "GetChipID": "no-answer",
-        "BeginFirmwareUpgrade": "no-answer",
-        "SetFirmwareInfoFeatures": "no-answer",
-        "EnsureMode0": "no-answer"
-      },
-      "controlInBytes": {
-        "32": null,
-        "64": null,
-        "128": null,
-        "256": null,
-        "512": null
-      },
+      "chipIdHex": null,
+      "commands": {},
+      "controlInBytes": {},
       "windowsConfirmed": [],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
-      "windowsRefused": [
-        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
-      ],
+      "windowsRefused": [],
       "auth": {
-        "subcmd": 5,
         "plainAccepted": false,
         "authAccepted": false,
-        "wrongTokenAccepted": false
+        "wrongTokenAccepted": false,
+        "subcmd": 5
       },
       "gap": {
-        "reason": "the selector map reaches no window: 63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)"
+        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: window probe subcmd 0x01: the emulator process exited during the probe, so nothing measured after that point is a property of the firmware [fault: unmapped addr=0x42040204 at PC=0x10085722]"
       }
     },
     "compact/2014.10.21-14.58.29-1.3.0.0/no-serial/subi_lpc43xx_lpcopen_1.3.0.0_-_compact_oct_21_2014_14-58-29_99.28_gabiz_ro_firmware": {
@@ -733,46 +543,27 @@
       "product": "Compact",
       "version": "1.3.0.0",
       "identity": {
-        "vendorId": "0x289D",
-        "productId": "0x0010",
-        "manufacturerName": "Seek Thermal",
-        "productName": "PIR206 Thermal Camera",
-        "serialNumber": "@Ă耀�"
+        "vendorId": "",
+        "productId": "",
+        "manufacturerName": null,
+        "productName": null,
+        "serialNumber": null
       },
-      "chipIdHex": "220029002e009d009200e000",
-      "commands": {
-        "GetErrorCode": "no-answer",
-        "GetOperationMode": "no-answer",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
-        "GetFirmwareInfo": "no-answer",
-        "GetChipID": "no-answer",
-        "BeginFirmwareUpgrade": "no-answer",
-        "SetFirmwareInfoFeatures": "no-answer",
-        "EnsureMode0": "no-answer"
-      },
-      "controlInBytes": {
-        "32": null,
-        "64": null,
-        "128": null,
-        "256": null,
-        "512": null
-      },
+      "chipIdHex": null,
+      "commands": {},
+      "controlInBytes": {},
       "windowsConfirmed": [],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
-      "windowsRefused": [
-        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
-      ],
+      "windowsRefused": [],
       "auth": {
-        "subcmd": 5,
         "plainAccepted": false,
         "authAccepted": false,
-        "wrongTokenAccepted": false
+        "wrongTokenAccepted": false,
+        "subcmd": 5
       },
       "gap": {
-        "reason": "the selector map reaches no window: 63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)"
+        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: window probe subcmd 0x01: the emulator process exited during the probe, so nothing measured after that point is a property of the firmware [fault: unmapped addr=0x42040204 at PC=0x10085722]"
       }
     },
     "compact/2017.01.06-11.16.17-1.3.0.8/no-serial/32k_43x0_1.3.0.8_compact-insecure-8hz_public_-_compact_jan_6_2017_11-16-17_99.28_gabiz_ro_firmware": {

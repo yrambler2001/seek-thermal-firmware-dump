@@ -43,7 +43,13 @@ describe('parseCli', () => {
       decrypt: true,
       yes: false,
       rescueDump: true,
+      probe: true,
     });
+  });
+
+  it('turns the capability probe off with --no-probe', () => {
+    expect(runOptions(['dump']).options.probe).toBe(true);
+    expect(runOptions(['dump', '--no-probe']).options.probe).toBe(false);
   });
 
   it('accepts the whole documented flag surface', () => {

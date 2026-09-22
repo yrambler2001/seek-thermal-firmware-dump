@@ -7,8 +7,10 @@
 import {
   SeekDevice,
   detectProfile,
+  evidenceFromChannelProbe,
   getProfile,
   hex,
+  probeSelectorChannel,
   type Artifact,
   type DetectionResult,
   type DeviceEvidence,
@@ -56,6 +58,44 @@ export function chooseProfile(options: GlobalOptions, evidence: DeviceEvidence):
     return { profile: getProfile(options.profile), detection: null, forced: true };
   }
   const detection = detectProfile(evidence);
+  return { profile: detection.best.profile, detection, forced: false };
+}
+
+/**
+ * The profile a run acts under, after ASKING the camera.
+ *
+ * `chooseProfile` above scores USB descriptors, which is the thinnest evidence
+ * there is: a vendor id and a product string say nothing about which
+ * BeginFirmwareUpgrade handler is behind them, so an unforced run landed on
+ * `generic` almost every time and dumped with the post-2018 map whatever the
+ * camera was. On a 2016 part that map refuses 38 of its 63 selectors and
+ * gap-fills the six banks holding the boot config and the firmware images.
+ *
+ * This sends four read-only transfers first — the version, a plain arm of a
+ * protected bank, an authenticated arm of the same bank, and a read of a bank
+ * open on every line — and hands the answers to the same scoring. See
+ * `probeSelectorChannel` for why each one is safe and what it settles.
+ *
+ * `--profile` still wins outright and skips the probe: a caller who has named
+ * a family is not asking to be second-guessed, and on a camera the fewest
+ * transfers is the safest run.
+ */
+export async function chooseProfileByProbe(
+  ctx: CommandContext,
+  session: Session,
+): Promise<ProfileChoice> {
+  const descriptors = evidenceFromDevice(session.transport);
+  if (ctx.options.profile !== null) return chooseProfile(ctx.options, descriptors);
+  if (!ctx.options.probe) {
+    ctx.reporter.log('capability probe skipped (--no-probe)', 'detail');
+    return chooseProfile(ctx.options, descriptors);
+  }
+
+  ctx.reporter.log('asking the camera which protocol it speaks ...', 'detail');
+  const probe = await probeSelectorChannel(session.device);
+  for (const note of probe.notes) ctx.reporter.log(`  ${note}`, 'detail');
+
+  const detection = detectProfile({ ...descriptors, ...evidenceFromChannelProbe(probe) });
   return { profile: detection.best.profile, detection, forced: false };
 }
 

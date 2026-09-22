@@ -45,6 +45,16 @@ export interface GlobalOptions {
   readonly out: string | null;
   readonly zip: string | null;
   readonly profile: ProfileId | null;
+  /**
+   * Ask the camera which protocol it speaks before choosing a profile.
+   *
+   * On by default, and `--no-probe` turns it off. The probe is four read-only
+   * transfers and it is the difference between choosing a family from a USB
+   * product string and choosing it from the camera's own answers — see
+   * `probeSelectorChannel`. Off is for a bench session that wants nothing sent
+   * but the dump itself.
+   */
+  readonly probe: boolean;
   /** null means "core's default", which is the value the README documents. */
   readonly chunk: number | null;
   readonly gapFill: number | null;
@@ -142,6 +152,7 @@ export function parseCli(argv: readonly string[]): ParsedCli {
         color: { type: 'boolean', default: true },
         yes: { type: 'boolean', default: false },
         'rescue-dump': { type: 'boolean', default: true },
+        probe: { type: 'boolean', default: true },
         help: { type: 'boolean', short: 'h', default: false },
         version: { type: 'boolean', short: 'V', default: false },
       },
@@ -205,8 +216,9 @@ export function parseCli(argv: readonly string[]): ParsedCli {
     json: values.json,
     quiet: values.quiet,
     verbose: values.verbose,
-    /* `--no-color` and `--no-rescue-dump` come through parseArgs' own negation
-     * support, so both arrive here already resolved to a boolean. */
+    probe: values.probe,
+    /* `--no-color`, `--no-rescue-dump` and `--no-probe` come through parseArgs'
+     * own negation support, so each arrives here already resolved. */
     colorFlag: values.color,
     yes: values.yes,
     rescueDump: values['rescue-dump'],

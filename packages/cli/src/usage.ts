@@ -23,6 +23,7 @@ const COMMON_OPTIONS = `Options
   --out <dir>            write files to a directory (default)
   --zip <file>           write a single archive instead
   --profile <id>         force a firmware profile instead of detecting one
+  --no-probe             do not ask the camera which protocol it speaks
   --chunk <n>            control-IN request size (default 64)
   --gap-fill <byte>      fill byte for unreachable blocks (default 0xff)
   --retries <n>          per-window retry count (default 2)

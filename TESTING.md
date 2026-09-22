@@ -437,3 +437,94 @@ the concurrency (it is per suite _file_, so two files in flight double it).
 Skips exactly as §4 rule 1 demands: `SEEK_EMU_DIR` absent → loud skip on stderr, exit 0.
 With neither optional input: **404 passed | 3 skipped**, exit 0. With the dump corpus but no
 emulator: **472 passed | 2 skipped**.
+
+---
+
+## 9. Built after §8: the firmware-facts tier, and what it found (2026-09-22)
+
+§3 ranked the test ideas by damage prevented. The one that was missing from that list turned out
+to be the cheapest of all, and it caught more than any of them: **read the firmware's own command
+table out of the image, and check the toolkit's opcode constants against it.**
+
+### 9.1 The measurement
+
+Every Seek application image carries its RPC method table — an array of 16-byte records whose first
+word points at the command's name string, in wire order, with **wire id = index + 53**. That is not
+inferred: FW-V1's byte-exact reconstruction of the Compact PRO FF names the structure
+(`g_rpc_method_table`, and `tu025_rpc_cmds_data.c` lists all 41 rows with their addresses and wire
+ids). `scripts/update-firmware-facts.mjs` finds that array in each of the 36 decrypted images in
+FW-V1's corpus by the only structure it needs — consecutive 16-byte slots whose first words, minus
+one unknown load base, land on NUL-terminated identifiers, starting at `GetErrorCode` — and writes
+what it read to `packages/core/test/firmware/facts.json`. The images stay outside this repository;
+the derived facts are committed, exactly as §3's P0 does for the dump corpus, so
+`firmware-facts.test.ts` runs on a bare clone.
+
+**36 of 36 tables recovered.** Sizes run 33 to 41 entries, and 41 is what the independent
+reconstruction declares for the pilot.
+
+### 9.2 What it says about this toolkit's `OP` table
+
+**Right on 31 of 36 images, wrong on five, and the five matter.**
+
+`GetErrorCode` (0x35), `SetOperationMode` (0x3C) and `GetOperationMode` (0x3D) are at those ids in
+**all 36**, from 0.3.0.1 (May 2014) to 4.16.1.7 (Sep 2018) — which is why the mode handshake is safe
+to send to a camera nothing is yet known about. From 0.7.0.7 onward, so are `GetFirmwareInfo`
+(0x4E), `GetFeaturedFirmwareData` (0x4F), `CompleteMemoryUpgrade` (0x51), `BeginFirmwareUpgrade`
+(0x52) and `SetFirmwareInfoFeatures` (0x55).
+
+Before 0.7.0.7 they are not:
+
+| build   | 0x4F                    | 0x50             | 0x51                      | 0x52                      |
+| ------- | ----------------------- | ---------------- | ------------------------- | ------------------------- |
+| 0.3.0.1 | `UploadFirmwareRowSize` | `UploadFirmware` | `VerifyFirmwareSendCRC16` | **`EnterBootloaderMode`** |
+| 0.5.0.2 | `UploadFirmwareRowSize` | as expected      | as expected               | `BeginFirmwareUpgrade`    |
+| 0.5.1.0 | `UploadFirmwareRowSize` | as expected      | as expected               | `BeginFirmwareUpgrade`    |
+| 0.5.1.3 | `UploadFirmwareRowSize` | as expected      | as expected               | `BeginFirmwareUpgrade`    |
+| 0.6.0.4 | `UploadFirmwareRowSize` | as expected      | as expected               | `BeginFirmwareUpgrade`    |
+
+`GetFeaturedFirmwareData` is not in any of those five tables. It is the only command this toolkit
+reads flash with, so on these builds **nothing can read a window, however the window is armed** —
+and on 0.3.0.1 the wire id a dump arms 63 windows with is a request to leave the application. Hence
+the `compact-2014` profile, which refuses `dump` and `sweep` and says which command it would
+otherwise have sent.
+
+### 9.3 And about the "per-build" unlock token
+
+`legacy-auth` described its 16-byte token as build-specific, recovered from one PIR324 unit.
+Searching every image for those exact bytes finds them **once each in 22 of the 36**, across two
+product lines and three years (every 0.x and 1.x build), and in **none** of the 14 post-2018 images
+— which have no token check to hold one. The 1.0.3.0 hit at raw `0xAC01` is the address FW-V1's
+reconstruction of that handler names independently. One token, not one per build.
+
+### 9.4 The harness change that made the emulator rows honest
+
+§8 recorded a flake: one row in fifty-one wedging under `npm run check`, a different row each time,
+`device stalled status IN bRequest=11` from some point on and `no-answer` thereafter. The fix is
+harness-side and it is a distinction rather than a tolerance. `probeTier1` now throws
+`ProbeUnmeasurable` when the camera **was** answering and then answers neither `GetErrorCode` nor
+`GetFirmwareInfo` through three fresh USB/IP imports, or when the emulator process has exited; the
+suite discards that attempt entirely and re-measures from a **new emulator**, up to three times.
+Nothing about a discarded attempt is recorded, and a stall or a device error code — the device
+speaking — is still measured once and written down as it answered.
+
+That distinction also re-classified rows that were never a flake. Eleven rows were pinned with
+`no-answer` on every command; on the 2014 Compacts the emulator **dies**, with
+`UC_ERR_WRITE_UNMAPPED` on a write to `0x42040204` — a Cortex-M bit-band alias, which FW-V1's own
+`docs/EMULATOR_CORPUS.md` says the emulator does not model. Those rows were never a statement about
+firmware, and they no longer read as one.
+
+### 9.5 The open disagreement, stated as one
+
+For the eleven 2014 Compacts from 0.7.0.7 to 1.3.0.0, **the images and the emulator disagree**, and
+the images are the better evidence:
+
+- the images say these builds have `BeginFirmwareUpgrade` at 0x52 and `GetFeaturedFirmwareData` at
+  0x4F, like every later build, so the dump path should work;
+- the emulator reaches no window on any of them, because it stops executing on an unmodelled
+  bit-band write before the question can be asked.
+
+Neither says what a real 2014 Compact does. Settling it needs one of those cameras, or bit-band
+support in the emulator — which is FW-V1's to add, and is already on its unmodelled-MMIO queue.
+Until then the toolkit treats them as ordinary `legacy-auth` cameras, which is what their own
+command tables say they are, and the emulator rows for them are tracked gaps whose reason says
+"not measurable", not "the firmware refused".

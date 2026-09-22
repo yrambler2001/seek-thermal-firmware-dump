@@ -13,9 +13,8 @@
 import { runDump } from '@seek-fw/core';
 import type { CommandContext, CommandResult } from '../cli.js';
 import {
-  chooseProfile,
+  chooseProfileByProbe,
   dumpOptionsFrom,
-  evidenceFromDevice,
   openSession,
   uniqueArtifacts,
   writeRun,
@@ -25,7 +24,7 @@ import {
 export async function dumpCommand(ctx: CommandContext): Promise<CommandResult> {
   const session = await openSession(ctx);
   try {
-    const choice = chooseProfile(ctx.options, evidenceFromDevice(session.transport));
+    const choice = await chooseProfileByProbe(ctx, session);
     ctx.reporter.log(
       `acting under profile ${choice.profile.id}${choice.forced ? ' (--profile)' : ''}`,
       'detail',

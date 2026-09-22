@@ -86,7 +86,7 @@
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { Emulator, liveEmulatorCount } from './emulator/harness.js';
-import { probeTier1, type Tier1Result } from './emulator/probe.js';
+import { probeTier1, ProbeUnmeasurable, type Tier1Result } from './emulator/probe.js';
 import {
   announceSkip,
   BOOT_TIMEOUT_MS,
@@ -100,6 +100,7 @@ import {
   REGENERATING,
   RPC_EXPECTATIONS,
   scratchFile,
+  PROBE_ATTEMPTS,
   TIER1_TIMEOUT_MS,
   URB_TIMEOUT_MS,
   writeExpectations,
@@ -168,6 +169,21 @@ function summarize(result: Tier1Result, entry: (typeof ENTRIES)[number]): RpcExp
   };
 }
 
+/**
+ * The failure, as a gap reason.
+ *
+ * `detail` used to be the FIRST LINE of the message, which is fine for a one
+ * line failure and throws away the only part that matters for an unmeasurable
+ * row: "not measurable in 1 attempt(s)" says nothing, while the line under it
+ * names the Unicorn fault and the address. So the whole message is kept,
+ * flattened to one line, and the `record()` matrix takes its own first line
+ * for the terminal.
+ */
+function gapReason(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.replace(/\s*\n\s*/g, ' | ').trim();
+}
+
 /* ---- the suite ------------------------------------------------------- */
 
 if (EMU_DIR === null) announceSkip('emulator RPC surface (tier 1)');
@@ -227,18 +243,58 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
       let detail = '';
       let emu: Emulator | null = null;
       try {
-        const truth = scratchFile(`t1_${entry.id}.bin`);
-        emu = await Emulator.start(EMU_DIR!, {
-          entryId: entry.id,
-          fillSeed: FILL_SEED,
-          fillScope: FILL_SCOPE,
-          flashOut: truth,
-          readyTimeoutMs: BOOT_TIMEOUT_MS,
-        });
-        const got = await probeTier1(emu, {
-          groundTruthPath: truth,
-          urbTimeoutMs: URB_TIMEOUT_MS,
-        });
+        /* RE-MEASURED FROM A FRESH EMULATOR, NEVER RETRIED IN PLACE.
+         *
+         * `ProbeUnmeasurable` means the camera stopped being there — the
+         * emulator's own run ended, or the session died and three fresh imports
+         * did not bring it back. Retrying the remaining commands on the corpse
+         * would record this machine's load as the firmware's behaviour, which is
+         * exactly the flake this replaced. So the whole row is taken again from
+         * a new process, and NOTHING about the discarded attempt is recorded:
+         * this is not a retry-until-green, it is a refusal to write down a
+         * measurement that was not made. A row that is unmeasurable every time
+         * becomes a gap saying so.
+         */
+        let got: Tier1Result | null = null;
+        const unmeasurable: string[] = [];
+        for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+          const truth = scratchFile(`t1_${entry.id}_a${String(attempt)}.bin`);
+          emu = await Emulator.start(EMU_DIR!, {
+            entryId: entry.id,
+            fillSeed: FILL_SEED,
+            fillScope: FILL_SCOPE,
+            flashOut: truth,
+            readyTimeoutMs: BOOT_TIMEOUT_MS,
+          });
+          try {
+            got = await probeTier1(emu, {
+              groundTruthPath: truth,
+              urbTimeoutMs: URB_TIMEOUT_MS,
+            });
+            break;
+          } catch (error) {
+            if (!(error instanceof ProbeUnmeasurable)) throw error;
+            unmeasurable.push(
+              `attempt ${String(attempt)}: ${error.message}` +
+                (error.emulatorStopReason === null ? '' : ` [${error.emulatorStopReason}]`),
+            );
+            await emu.stop();
+            emu = null;
+            /* A FAULT IS NOT RE-DRAWN. `worthRetrying` is false when the
+             * emulator stopped on an instruction it cannot execute, which it
+             * will reach again at the same point on a fresh process — three
+             * attempts would spend fifteen minutes reproducing a result already
+             * in hand. Only a session that died with nothing to say for itself
+             * gets another go. */
+            if (!error.worthRetrying) break;
+          }
+        }
+        if (got === null) {
+          throw new ProbeUnmeasurable(
+            `not measurable in ${String(unmeasurable.length)} attempt(s) from fresh ` +
+              `emulators:\n  ${unmeasurable.join('\n  ')}`,
+          );
+        }
         const now = summarize(got, entry);
         detail =
           `${String(now.windowsConfirmed.length)} windows confirmed, ` +
@@ -320,7 +376,7 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
         expect(now.auth, 'auth-token accept/refuse on a protected bank').toEqual(want.auth);
       } catch (error) {
         status = gap === null ? 'failed' : 'known-gap';
-        detail = error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error);
+        detail = gapReason(error);
         if (REGENERATING) {
           measured[entry.id] = {
             kind: entry.kind,

@@ -16,8 +16,14 @@ export const OP = {
   GET_OPERATION_MODE: 0x3d,
   GET_FEATURED_FIRMWARE_DATA: 0x4f,
   BEGIN_FIRMWARE_UPGRADE: 0x52,
-  /* --- used by the flash path only (see FLASH_OPS below) --- */
+  /**
+   * The one command every corpus build answers the same way, which is what
+   * makes it the version probe. Recovering each image's own RPC method table
+   * puts `GetFirmwareInfo` at 0x4E on all 36 decrypted images, from 0.3.0.1
+   * (May 2014) to 4.16.1.7 (Sep 2018) — see `test/firmware/facts.json`.
+   */
   GET_FIRMWARE_INFO: 0x4e,
+  /* --- used by the flash path only (see FLASH_OPS below) --- */
   SET_FEATURED_FIRMWARE_DATA: 0x50,
   COMPLETE_MEMORY_UPGRADE: 0x51,
   SET_FIRMWARE_INFO_FEATURES: 0x55,
@@ -35,12 +41,33 @@ export const READ_ONLY_OPS: ReadonlySet<Opcode> = new Set<Opcode>([
   OP.GET_OPERATION_MODE,
   OP.GET_FEATURED_FIRMWARE_DATA,
   OP.BEGIN_FIRMWARE_UPGRADE,
+  /**
+   * MOVED HERE FROM `FLASH_OPS`, 2026-09-22, and the move is a reclassification
+   * rather than a relaxation.
+   *
+   * These sets are not "harmless" and "dangerous": the header above `FLASH_OPS`
+   * says it is "every opcode that can change the camera, PLUS the info reads
+   * that only the flash path needs", and `GetFirmwareInfo` was one of those
+   * info reads. It is a control IN that returns a 36-byte block and writes
+   * nothing, which is precisely what `READ_ONLY_OPS` means.
+   *
+   * It is here because the capability probe needs it BEFORE anything else is
+   * sent. The 0.3.0.1 Compact has `EnterBootloaderMode` at wire id 0x52 — the
+   * id a dump arms 63 windows with — and the only way to know that before
+   * sending it is to read the version, which `GetFirmwareInfo` gives on every
+   * build there is. A safety gate that could only be reached by leaving the
+   * read-only set would not be much of one.
+   *
+   * The selector it is normally paired with, `SetFirmwareInfoFeatures`, stays
+   * in `FLASH_OPS`: the probe reads selector 0, which is the default after
+   * reset, so it never has to set one.
+   */
+  OP.GET_FIRMWARE_INFO,
 ]);
 
 /** Every opcode that can change the camera, plus the info reads that only the
  *  flash path needs. Nothing in here may ever run during a dump. */
 export const FLASH_OPS: ReadonlySet<Opcode> = new Set<Opcode>([
-  OP.GET_FIRMWARE_INFO,
   OP.SET_FEATURED_FIRMWARE_DATA,
   OP.COMPLETE_MEMORY_UPGRADE,
   OP.SET_FIRMWARE_INFO_FEATURES,

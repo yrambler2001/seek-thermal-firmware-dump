@@ -30,7 +30,8 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { silentReporter } from '../src/events.js';
 import { SeekDevice } from '../src/protocol/client.js';
 import { WebUsbTransport } from '../src/protocol/webusb.js';
-import { getProfile } from '../src/profiles/registry.js';
+import { detectProfile, getProfile } from '../src/profiles/registry.js';
+import { evidenceFromChannelProbe, probeSelectorChannel } from '../src/workflows/capability.js';
 import { runDump } from '../src/workflows/dump.js';
 import { Emulator, liveEmulatorCount } from './emulator/harness.js';
 import {
@@ -47,6 +48,7 @@ import {
   REGENERATING,
   ROUNDTRIP_EXPECTATIONS,
   scratchFile,
+  PROBE_ATTEMPTS,
   TIER2_TIMEOUT_MS,
   URB_TIMEOUT_MS,
   writeExpectations,
@@ -164,6 +166,23 @@ export interface RoundTripExpectation {
   readonly bytesStillErased: number | null;
   /** sha256 of every image the toolkit's decrypt recovered, in order. */
   readonly decryptedSha256: readonly string[];
+  /** Which profile the capability probe picked for this camera. */
+  readonly profile: string;
+}
+
+/**
+ * The failure, as a gap reason.
+ *
+ * `detail` used to be the FIRST LINE of the message, which is fine for a one
+ * line failure and throws away the only part that matters for an unmeasurable
+ * row: "not measurable in 1 attempt(s)" says nothing, while the line under it
+ * names the Unicorn fault and the address. So the whole message is kept,
+ * flattened to one line, and the `record()` matrix takes its own first line
+ * for the terminal.
+ */
+function gapReason(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.replace(/\s*\n\s*/g, ' | ').trim();
 }
 
 /* ---- the suite -------------------------------------------------------- */
@@ -228,36 +247,77 @@ describe.skipIf(EMU_DIR === null || population.length === 0)(
         let detail = '';
         let emu: Emulator | null = null;
         try {
-          const truthPath = scratchFile(`t2_${entry.id}.bin`);
-          emu = await Emulator.start(EMU_DIR!, {
-            entryId: entry.id,
-            fillSeed: FILL_SEED,
-            fillScope: FILL_SCOPE,
-            flashOut: truthPath,
-            readyTimeoutMs: BOOT_TIMEOUT_MS,
-          });
+          /* SAME RULE AS TIER 1: a dump taken off an emulator that stopped
+           * executing partway through is not a round-trip result, it is a
+           * partial transfer to a corpse, and writing its diff ranges down
+           * would pin this machine's load. `Emulator.alive` is the check, and
+           * the whole row is taken again from a fresh process. */
+          let result: Awaited<ReturnType<typeof runDump>> | null = null;
+          let truth: Uint8Array | null = null;
+          let profile = getProfile('generic');
+          const dead: string[] = [];
+          for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+            const truthPath = scratchFile(`t2_${entry.id}_a${String(attempt)}.bin`);
+            emu = await Emulator.start(EMU_DIR!, {
+              entryId: entry.id,
+              fillSeed: FILL_SEED,
+              fillScope: FILL_SCOPE,
+              flashOut: truthPath,
+              readyTimeoutMs: BOOT_TIMEOUT_MS,
+            });
 
-          const device = await emu.attach({ urbTimeoutMs: URB_TIMEOUT_MS });
-          const transport = new WebUsbTransport(device, {
-            recipient: 'auto',
-            api: 'usbip (emulator)',
-            host: 'vitest',
-          });
-          await transport.open();
+            const device = await emu.attach({ urbTimeoutMs: URB_TIMEOUT_MS });
+            const transport = new WebUsbTransport(device, {
+              recipient: 'auto',
+              api: 'usbip (emulator)',
+              host: 'vitest',
+            });
+            await transport.open();
+            const seek = new SeekDevice(transport);
 
-          const profile = getProfile('modern-4x');
-          const result = await runDump(
-            {
-              device: new SeekDevice(transport),
-              profile,
-              detection: null,
-              reporter: silentReporter,
-            },
-            { chunk: READ_CHUNK, retries: 1, decrypt: true },
-          );
-          await device.close().catch(() => undefined);
+            /* THE PROFILE IS ASKED FOR, NOT ASSUMED.
+             *
+             * This used to be a hard-coded `getProfile('modern-4x')` on all 51
+             * firmwares, which is the very assumption the refactor removed: the
+             * 2016 generation refuses 38 of that map's 63 selectors and needs
+             * the authenticated channel for six banks. `probeSelectorChannel`
+             * asks the camera — read-only, four transfers — and the answer
+             * picks the profile, exactly as a caller with no `--profile` now
+             * does. */
+            const channel = await probeSelectorChannel(seek);
+            profile = detectProfile(evidenceFromChannelProbe(channel)).best.profile;
 
-          const truth = new Uint8Array(readFileSync(truthPath));
+            const attemptResult = await runDump(
+              { device: seek, profile, detection: null, reporter: silentReporter },
+              { chunk: READ_CHUNK, retries: 1, decrypt: true },
+            );
+            await device.close().catch(() => undefined);
+
+            if (!emu.alive) {
+              const reason = await emu.settledStopReason();
+              dead.push(
+                `attempt ${String(attempt)}: the emulator exited during the dump` +
+                  (reason === null ? '' : ` [${reason}]`),
+              );
+              const fatal = reason !== null;
+              await emu.stop();
+              emu = null;
+              /* Same rule as tier 1: a Unicorn fault is deterministic, so a
+               * fresh process reproduces it rather than measuring anything
+               * new. */
+              if (fatal) break;
+              continue;
+            }
+            result = attemptResult;
+            truth = new Uint8Array(readFileSync(truthPath));
+            break;
+          }
+          if (result === null || truth === null) {
+            throw new Error(
+              `not measurable in ${String(dead.length)} attempt(s) from fresh emulators:\n  ` +
+                dead.join('\n  '),
+            );
+          }
           expect(truth.length, 'the emulator wrote a 4 MiB ground-truth image').toBe(FLASH_SIZE);
 
           const holes: Range[] = profile.memory.unreachable.map((u) => ({
@@ -292,8 +352,9 @@ describe.skipIf(EMU_DIR === null || population.length === 0)(
             diffBytesComparable,
             diffRangesComparable: describeRanges(comparable),
             bytesUnreachable,
-            bytesStillErased: emu.ready.fill?.bytes_still_erased ?? null,
+            bytesStillErased: emu?.ready.fill?.bytes_still_erased ?? null,
             decryptedSha256,
+            profile: profile.id,
           };
           detail =
             `${String(result.windowsRead)}/${String(result.windowsExpected)} windows, ` +
@@ -342,6 +403,9 @@ describe.skipIf(EMU_DIR === null || population.length === 0)(
           expect(want, `${entry.id} is not in ${ROUNDTRIP_EXPECTATIONS}`).not.toBeNull();
           if (want === null) return;
 
+          /* ---- which profile the camera's own answers selected ---- */
+          expect(now.profile, 'profile chosen by the selector-channel probe').toBe(want.profile);
+
           /* ---- the transfer itself ---- */
           expect(now.windowsRead, 'windows read').toBe(want.windowsRead);
           expect(now.windowsExpected, 'windows the selector map declares').toBe(
@@ -364,7 +428,7 @@ describe.skipIf(EMU_DIR === null || population.length === 0)(
           );
         } catch (error) {
           status = gap === null ? 'failed' : 'known-gap';
-          detail = error instanceof Error ? (error.message.split('\n')[0] ?? '') : String(error);
+          detail = gapReason(error);
           if (REGENERATING) {
             measured[entry.id] = {
               kind: entry.kind,
@@ -379,6 +443,7 @@ describe.skipIf(EMU_DIR === null || population.length === 0)(
               bytesUnreachable: 0,
               bytesStillErased: null,
               decryptedSha256: [],
+              profile: '',
               gap: { reason: detail.slice(0, 300) },
             };
             return;

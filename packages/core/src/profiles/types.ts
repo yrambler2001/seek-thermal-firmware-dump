@@ -20,7 +20,8 @@
  */
 
 /** The families that ship with this package. */
-export type BuiltInProfileId = 'modern-4x' | 'legacy-auth' | 'compact-2016' | 'generic';
+export type BuiltInProfileId =
+  'modern-4x' | 'legacy-auth' | 'compact-2016' | 'compact-2014' | 'generic';
 
 /**
  * A profile identifier. Open on purpose: the built-in ids autocomplete, but any
@@ -151,6 +152,29 @@ export interface DeviceEvidence {
    * profiles score this as corroboration, never as a verdict.
    */
   readonly authSelectorWorks?: boolean;
+  /**
+   * A plain 2-byte BeginFirmwareUpgrade of a protected bank was REFUSED.
+   *
+   * THE OBSERVATION THAT SETTLES THE AUTH QUESTION, and until 2026-09-22 the
+   * comment on `authSelectorWorks` said in as many words that nothing made it.
+   * Something does now: `probeSelectorChannel` sends the plain arm on purpose
+   * and records the refusal, and the emulator sweep confirms the split is real
+   * — 26 firmwares accept the plain arm of subcommand 5, and nine refuse it and
+   * accept the same bank on the 18-byte channel (and refuse an 18-byte payload
+   * carrying the wrong token, so the token is genuinely compared).
+   *
+   * `true` rules the 4.x line out and names the legacy locked firmware; `false`
+   * does the reverse. Absent, as it is for every offline dump, both profiles
+   * fall back to the weaker signals they used before.
+   */
+  readonly plainSelectorRefused?: boolean;
+  /**
+   * A window the selector map says is open on the plain channel actually served
+   * bytes. False means `GetFeaturedFirmwareData` did not answer — which on the
+   * earliest Compacts is not a wedge but the truth: that opcode is not in their
+   * RPC table at all (see `compact-2014`).
+   */
+  readonly windowReadable?: boolean;
   /** Byte offsets at which image-header magic was found in a dump. */
   readonly imageBaseOffsets?: readonly number[];
 }

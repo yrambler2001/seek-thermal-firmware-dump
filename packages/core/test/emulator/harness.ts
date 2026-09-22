@@ -178,6 +178,53 @@ export class Emulator {
     return this.logLines.slice(-tail).join('\n');
   }
 
+  /**
+   * Is the Python process still running?
+   *
+   * A DEAD EMULATOR IS NOT A FIRMWARE RESULT, and telling the two apart matters:
+   * several corpus firmwares reach an instruction this emulator cannot execute
+   * — a bit-band write, for instance, which it does not model — and Unicorn
+   * stops the whole run with `UC_ERR_WRITE_UNMAPPED`. Every transfer after that
+   * fails with ECONNREFUSED, which a probe that only watches the wire records as
+   * "the camera answered nothing". It answered nothing because there was no
+   * longer a camera.
+   */
+  get alive(): boolean {
+    return this.child.exitCode === null && this.child.signalCode === null;
+  }
+
+  /** The emulator's own stop reason, when it has one. Unicorn prints
+   *  `stopped: ...` and `fault: ...` lines just before the run summary. */
+  stopReason(): string | null {
+    for (let i = this.logLines.length - 1; i >= 0; i--) {
+      const line = this.logLines[i] ?? '';
+      if (line.startsWith('stopped: ') || line.startsWith('fault: ')) return line.trim();
+    }
+    return null;
+  }
+
+  /**
+   * The stop reason, after giving the child's stdout a moment to arrive.
+   *
+   * THE RACE IS REAL AND IT COSTS FIVE MINUTES A ROW WHEN IT IS LOST. Node sets
+   * `exitCode` on the `exit` event, but the final stdout chunks — which is
+   * where `stopped:` and `fault:` live — can still be in flight. A caller that
+   * reads `stopReason()` the instant it notices the process is gone gets null,
+   * concludes the death was a random session loss, and re-measures a
+   * deterministic Unicorn fault from scratch. Waiting a beat for the pipe to
+   * drain is the difference between "this firmware faults here, recorded" and
+   * three identical five-minute reruns.
+   */
+  async settledStopReason(waitMs = 750): Promise<string | null> {
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      const reason = this.stopReason();
+      if (reason !== null) return reason;
+      if (this.alive || Date.now() >= deadline) return null;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   static async start(dir: string, options: StartOptions): Promise<Emulator> {
     hookOnce();
     let lastError: unknown;

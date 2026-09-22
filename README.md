@@ -105,17 +105,36 @@ Seek cameras do not all speak the same protocol, and the differences are not cos
 which selector exposes which block, how a stored key maps to the cipher state, and what the
 bootloader will accept. A **profile** captures one firmware family:
 
-| Profile        | Family                                                            | Dump | Decrypt | Flash   |
-| -------------- | ----------------------------------------------------------------- | ---- | ------- | ------- |
-| `modern-4x`    | 2018+ 4.x (Compact Pro, Compact Pro FF, Compact XR, Nano 300)     | yes  | yes     | **yes** |
-| `legacy-auth`  | older builds whose protected banks need an authenticated selector | yes  | yes     | no      |
-| `compact-2016` | the 2016 Compact Pro generation                                   | yes  | yes     | no      |
-| `generic`      | fallback when the family cannot be identified                     | yes  | yes     | no      |
+| Profile        | Family                                                                                                             | Dump   | Decrypt | Flash   |
+| -------------- | ------------------------------------------------------------------------------------------------------------------ | ------ | ------- | ------- |
+| `modern-4x`    | 2018 and later: Compact 4.8/4.16, Compact Pro 4.9/4.18, Compact XR, Mosaic 2.27/10.9, Nano 200 42.x, Nano 300 44.x | yes    | yes     | **yes** |
+| `legacy-auth`  | 2014-2017 locked line: Compact 0.7.0.7-1.3.0.8, Compact PRO 1.0.3.x                                                | yes    | yes     | no      |
+| `compact-2016` | the same locked protocol with the 2016 cipher (K=0, acceptance sum 0)                                              | yes    | yes     | no      |
+| `compact-2014` | Compact builds older than 0.7.0.7 — no read command exists in their RPC table                                      | **no** | yes     | no      |
+| `generic`      | fallback when the family cannot be identified                                                                      | yes    | yes     | no      |
 
-The profile is detected from evidence — the acceptance sum a slot decrypts to, whether a bank
-required the authenticated selector, the reported firmware version — and never guessed. When the
-evidence is weak the tool lands on `generic`, which keeps the camera dumpable and decryptable while
-refusing the one operation that can destroy it. `--profile <id>` overrides detection.
+The profile is detected from evidence — and, on an attached camera, from **asking it**. Before a
+dump or a sweep the CLI sends four read-only transfers (`--no-probe` turns this off): the running
+firmware's version, a plain 2-byte arm of a bank the locked line protects, the 18-byte
+authenticated arm of the same bank, and a read of a bank that is open on every line. Those answers
+separate the families directly, where a USB product string or an acceptance sum only correlates
+with them. `--profile <id>` overrides detection and skips the probe.
+
+**`compact-2014` refuses to dump, and that refusal is the point.** Every decrypted image carries
+its own RPC method table — wire id = index + 53 — and recovering it from all 36 images in the
+reference corpus shows five builds (0.3.0.1, 0.5.0.2, 0.5.1.0, 0.5.1.3, 0.6.0.4) with no
+`GetFeaturedFirmwareData` at all: wire id `0x4F` is `UploadFirmwareRowSize` there, so nothing can
+read a window however it is armed. On 0.3.0.1, `0x52` — the id a dump arms 63 windows with — is
+`EnterBootloaderMode`. Dumping such a camera would not fail; it would send it 63 requests to leave
+the application. The facts are committed in `packages/core/test/firmware/facts.json` and asserted
+by `packages/core/test/firmware-facts.test.ts`.
+
+**The locked line reaches `0x14060000` and the modern line does not**, which is the reverse of what
+the section below says about 4.x cameras: on a 2016 or 2017 build that block is subcommand 8 behind
+the authenticated channel, and the six protected banks (`0x14010000`, `0x14030000`-`0x14070000`)
+come back with the token. What that line cannot reach is `0x14000000`, blocked on every channel,
+and everything above `0x141FFFFF`, for which it decodes no selector at all — 2 MiB that the dump
+now declares as gaps instead of trying 32 selectors and reporting 32 refusals.
 
 Three properties that older versions of this tool conflated are kept independent, because measurement
 showed they are:

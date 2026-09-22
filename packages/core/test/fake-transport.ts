@@ -261,9 +261,17 @@ export class FakeCamera implements UsbTransport {
       case OP.GET_FEATURED_FIRMWARE_DATA:
         return this.readArmedWindow(length);
       case OP.GET_FIRMWARE_INFO: {
-        const sel = this.infoSelector;
+        /* SELECTOR 0 IS THE DEFAULT, not "no selector". This used to stall an
+         * unarmed read, which is not what a camera does: after a reset the
+         * selector is 0 and 0 is the build block. Measured over USB/IP against
+         * five emulated builds — 0.3.0.1, 1.3.0.8, 4.18.2.0, 10.9.1.31 and
+         * 42.32.3.10 — each of which answered an unarmed GetFirmwareInfo with
+         * 36 bytes beginning 00 03 00 01, 01 03 00 08, 04 12 02 00, 0A 09 01 1F
+         * and 2A 20 03 0A: its own version, then its own build date. The
+         * capability probe reads exactly that, so the fake has to model it. */
+        const sel = this.infoSelector ?? 0;
         this.infoSelector = null; /* the handler clears it after every read */
-        const payload = sel === null ? undefined : this.options.fwInfo?.get(sel);
+        const payload = this.options.fwInfo?.get(sel);
         if (payload === undefined) throw this.stall(request);
         return payload.subarray(0, Math.min(length, payload.length));
       }

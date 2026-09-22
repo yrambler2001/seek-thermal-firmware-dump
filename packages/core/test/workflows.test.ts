@@ -107,6 +107,27 @@ const KEY_B_AT = 0x1010;
  * at 0x200, the adjust word tuned to the profile's acceptance sum, and its own
  * g_keyA/g_keyB embedded outside the cleartext header window.
  */
+/**
+ * A version word that agrees with the profile being built.
+ *
+ * THE FIXTURE USED TO SAY 4.18.2.0 WHATEVER IT WAS BUILDING, and that is the
+ * synthetic-fixture drift `TESTING.md` warns about, caught: the `compact-2016`
+ * dump carried a zero acceptance sum — a 2016 part — and a header claiming the
+ * build from 2020. Nothing noticed, because no `detect()` read the header
+ * version. Now that they do, a fixture has to be consistent to be evidence of
+ * anything, so the version comes off the profile.
+ *
+ * `0x00021204` is 4.18.2.0 and `0x00030001` is 1.0.3.0, both low byte first
+ * (`versionString`): the Compact PRO FF build the modern map was decoded from,
+ * and the 2016 Compact PRO build the legacy handler was decoded from.
+ */
+function versionWordFor(profile: FirmwareProfile): number {
+  if (profile.id === 'compact-2016' || profile.id === 'legacy-auth')
+    return 0x00030001; /* 1.0.3.0 */
+  if (profile.id === 'compact-2014') return 0x00000500; /* 0.5.0.0 */
+  return 0x00021204; /* 4.18.2.0 */
+}
+
 function makePlainImage(keyA: Uint8Array, keyB: Uint8Array, profile: FirmwareProfile): Uint8Array {
   const image = new Uint8Array(IMAGE_SIZE);
   const dv = viewOf(image);
@@ -116,7 +137,7 @@ function makePlainImage(keyA: Uint8Array, keyB: Uint8Array, profile: FirmwarePro
   dv.setUint32(HEADER_OFFSET + 0, IMAGE_MAGIC, true);
   dv.setUint32(HEADER_OFFSET + 4, IMAGE_SIZE, true);
   dv.setUint32(HEADER_OFFSET + 8, 0x00001234, true);
-  dv.setUint32(HEADER_OFFSET + 12, 0x00021204, true); /* 4.18.2.0 */
+  dv.setUint32(HEADER_OFFSET + 12, versionWordFor(profile), true);
   dv.setUint32(HEADER_OFFSET + 16, 0x14030201, true);
   image.set(keyA, KEY_A_AT);
   image.set(keyB, KEY_B_AT);
@@ -804,8 +825,9 @@ describe('detectProfileForDump', () => {
      * whichever profile computed it — that is what makes detection sound */
     expect(evidence.observedAcceptanceSums).toEqual([0]);
     expect(evidence.imageBaseOffsets).toEqual([slotOffset]);
-    /* header.version lives in the cleartext window, so no decryption was needed */
-    expect(evidence.imageVersions).toEqual(['4.18.2.0']);
+    /* header.version lives in the cleartext window, so no decryption was needed —
+     * and this fixture is a 2016 part, so it says so */
+    expect(evidence.imageVersions).toEqual(['1.0.3.0']);
   });
 
   it('picks compact-2016 for a dump whose slots decrypt to a zero acceptance sum', () => {

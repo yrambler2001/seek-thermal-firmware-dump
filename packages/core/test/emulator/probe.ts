@@ -82,6 +82,70 @@ export const CONTROL_IN_SIZES: readonly number[] = [32, 64, 128, 256, 512];
  */
 export type CommandOutcome = 'ok' | 'stall' | 'device-error' | 'no-answer';
 
+/**
+ * The measurement could not be taken. NOT a result about the firmware.
+ *
+ * WHY THIS IS A SEPARATE TYPE AND NOT A RECORDED OUTCOME. A probe over a
+ * three-orders-of-magnitude-slower device can fail in two entirely different
+ * ways, and until this existed they were written into the expectations as the
+ * same thing:
+ *
+ *   1. THE DEVICE REFUSED. It stalled the endpoint, or answered with a device
+ *      error code. That is the firmware speaking, and it is exactly what this
+ *      suite is for.
+ *   2. NOTHING CAME BACK, AND NOTHING CAME BACK AFTERWARDS EITHER. The emulator
+ *      hit an instruction it cannot execute and Unicorn stopped the run; or a
+ *      transfer was abandoned mid-flight under host contention and the session
+ *      never recovered. The camera is gone. Whatever is written down next is a
+ *      property of this machine's load, not of Seek firmware.
+ *
+ * Recording (2) as `no-answer` is what produced eleven rows of
+ * "every command: no-answer" in the pinned expectations, and one *different*
+ * row per `npm run check` — the flake this type exists to end. A measurement
+ * that could not be taken is re-taken from a fresh emulator; only if it cannot
+ * be taken at all does the row become a gap, and the gap then says so in those
+ * words instead of claiming the firmware is silent.
+ */
+export class ProbeUnmeasurable extends Error {
+  /**
+   * What the emulator said about why it stopped, when it said anything.
+   *
+   * NON-NULL MEANS DO NOT RE-MEASURE. Unicorn prints `stopped: UcError ...` and
+   * `fault: unmapped addr=... at PC=...` when the emulated part executed
+   * something it cannot: a write through a Cortex-M bit-band alias, say, which
+   * this emulator does not model. That is a deterministic property of this
+   * firmware on this emulator — the same instruction will be reached at the
+   * same point on a fresh process — so a retry costs ~5 minutes to reproduce a
+   * result already in hand. A session that died with NO stop reason is the
+   * other case: nothing faulted, the host lost the transfer, and a fresh
+   * process is a fresh draw.
+   */
+  readonly emulatorStopReason: string | null;
+  constructor(message: string, emulatorStopReason: string | null = null) {
+    super(message);
+    this.name = 'ProbeUnmeasurable';
+    this.emulatorStopReason = emulatorStopReason;
+  }
+
+  /** True when re-measuring could plausibly give a different answer. */
+  get worthRetrying(): boolean {
+    return this.emulatorStopReason === null;
+  }
+}
+
+/**
+ * The two opcodes used to ask "is this camera still there?".
+ *
+ * BOTH ARE READ-ONLY AND BOTH EXIST IN EVERY BUILD. `GetErrorCode` (0x35) and
+ * `GetFirmwareInfo` (0x4E) sit at those wire ids in all 36 decrypted images of
+ * the corpus — recovered from each image's own RPC method table, see
+ * `test/firmware/facts.json` — so a liveness check built on them is not making
+ * a family assumption. Either answering is enough: 0.6.0.4 answers
+ * `GetErrorCode` and times out `GetFirmwareInfo`, which is a real property of
+ * that build and must not read as a dead session.
+ */
+const LIVENESS_OPS: readonly number[] = [OP.GET_ERROR_CODE, OP.GET_FIRMWARE_INFO];
+
 export interface IdentityProbe {
   readonly vendorId: string;
   readonly productId: string;
@@ -229,12 +293,90 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
       await transport.close();
       await transport.open();
     } catch {
-      /* The device is gone; whatever is measured next will say so. */
+      /* The device is gone; `ensureMeasurable` is what notices and says so. */
     }
+  };
+
+  /**
+   * Did any liveness opcode answer, right now? One transfer, read-only.
+   *
+   * AT THE TOOLKIT'S OWN DEADLINE, not a shorter one. Tightening it to
+   * `USB_PROBE_TIMEOUT_MS` was tried and reverted: this check is what decides
+   * whether a row is thrown away, and a device that is merely slow — which an
+   * emulator three orders of magnitude off silicon can be — would then be
+   * declared gone. The cost of being generous is bounded and paid once: in the
+   * ordinary case the first call answers immediately, and only a genuinely dead
+   * session pays two timeouts per attempt, after which the row ends anyway.
+   */
+  const answersSomething = async (): Promise<boolean> => {
+    for (const op of LIVENESS_OPS) {
+      try {
+        await seek.rpcIn(op, 4);
+        return true;
+      } catch {
+        /* try the other one */
+      }
+    }
+    return false;
+  };
+
+  /**
+   * True once the camera has been seen to answer. Set at the top of the run.
+   *
+   * A firmware that never answers anything is a RESULT — silent is a thing a
+   * camera can be, and several corpus builds are. `ensureMeasurable` therefore
+   * only fires for a device that WAS answering and then stopped: that is the
+   * transition that means the session died rather than the firmware refusing.
+   */
+  let wasAnswering = false;
+
+  /**
+   * Throws `ProbeUnmeasurable` when the camera has gone away rather than
+   * refused. Called after an outcome that came back with nothing at all.
+   *
+   * THREE RE-IMPORTS BEFORE GIVING UP, and the number is not a tolerance: the
+   * emulator serves one USB/IP import at a time and frees the slot
+   * asynchronously, so a single refused re-attach is ordinary. What is not
+   * ordinary is a camera that answered a moment ago and now answers nothing
+   * through three fresh sessions.
+   */
+  const ensureMeasurable = async (what: string): Promise<void> => {
+    if (!wasAnswering) return;
+    if (!emu.alive) {
+      throw new ProbeUnmeasurable(
+        `${what}: the emulator process exited during the probe, so nothing measured after ` +
+          'that point is a property of the firmware',
+        await emu.settledStopReason(),
+      );
+    }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (await answersSomething()) return;
+      await recover();
+    }
+    if (await answersSomething()) return;
+    throw new ProbeUnmeasurable(
+      `${what}: the camera answered earlier in this run and now answers neither GetErrorCode ` +
+        'nor GetFirmwareInfo through three fresh imports — the session is gone, not the command',
+      await emu.settledStopReason(),
+    );
+  };
+
+  /**
+   * One command outcome, with `no-answer` checked rather than believed.
+   *
+   * `stall` and `device-error` are the device speaking and are recorded as-is.
+   * `no-answer` is the ambiguous one — it means the host gave up waiting — so it
+   * is only recorded once the camera has proved it is still there.
+   */
+  const measure = async (what: string, run: () => Promise<unknown>): Promise<CommandOutcome> => {
+    const got = await outcome(run);
+    if (got === 'no-answer') await ensureMeasurable(what);
+    return got;
   };
 
   try {
     await transport.open();
+    wasAnswering = await answersSomething();
 
     const identity: IdentityProbe = {
       vendorId: HEX(transport.description.vendorId, 4),
@@ -304,6 +446,10 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
          * clear, and reopening would add a re-import per subcommand to a firmware
          * that already costs three seconds per arm. */
         if (!(e instanceof SeekError && e.code === 'device/mode')) await recover();
+        /* AND CONFIRM THE CAMERA IS STILL THERE. A window that "refused" because
+         * the emulator had already stopped executing is not a refusal; without
+         * this check one dead session was recorded as sixty-three refusals. */
+        await ensureMeasurable(`window probe subcmd ${HEX(subcmd)}`);
       }
       windows.push({
         subcmd,
@@ -329,6 +475,7 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
         controlInBytes[String(size)] = raw.length;
       } catch {
         controlInBytes[String(size)] = null;
+        await ensureMeasurable(`control-IN ceiling probe at ${String(size)} B`);
       }
     }
 
@@ -357,7 +504,11 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
         payload === undefined
           ? { subcmd: AUTH_SUBCMD, address: 0, note: 'auth probe' }
           : { subcmd: AUTH_SUBCMD, address: 0, note: 'auth probe', payload };
-      return (await outcome(() => seek.armWindow(entry))) === 'ok';
+      return (
+        (await measure(`auth probe (${payload === undefined ? 'plain' : '18-byte'})`, () =>
+          seek.armWindow(entry),
+        )) === 'ok'
+      );
     };
     const auth: AuthProbe = {
       subcmd: AUTH_SUBCMD,
@@ -370,14 +521,14 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
     const commands: Record<string, CommandOutcome> = {};
     for (const { name, op } of PROBED_COMMANDS) {
       await recover();
-      commands[name] = await outcome(() => seek.rpcIn(op, 4));
+      commands[name] = await measure(name, () => seek.rpcIn(op, 4));
     }
     await recover();
-    commands.BeginFirmwareUpgrade = await outcome(() =>
+    commands.BeginFirmwareUpgrade = await measure('BeginFirmwareUpgrade', () =>
       seek.rpcOut(OP.BEGIN_FIRMWARE_UPGRADE, new Uint8Array([0x05, 0x00])),
     );
     await recover();
-    commands.SetFirmwareInfoFeatures = await outcome(() =>
+    commands.SetFirmwareInfoFeatures = await measure('SetFirmwareInfoFeatures', () =>
       seek.rpcOut(OP.SET_FIRMWARE_INFO_FEATURES, new Uint8Array([0x01, 0x00])),
     );
     await recover();
@@ -390,7 +541,24 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
      * `ensureMode0()` reads the mode first and returns without writing when it is
      * already 0, which those builds are. The toolkit was right and the probe was
      * wrong; what is recorded here is the toolkit's own guarded path. */
-    commands.EnsureMode0 = await outcome(() => seek.ensureMode0());
+    commands.EnsureMode0 = await measure('EnsureMode0', () => seek.ensureMode0());
+
+    /* THE LAST THING ASKED IS WHETHER THERE WAS STILL A CAMERA.
+     *
+     * `ensureMeasurable` only fires for a device that was seen to answer and
+     * then stopped, which is right for the common case and leaves one hole: a
+     * firmware that answers NOTHING from the start and whose emulator then dies
+     * partway through would be written down as a silent camera. Silent is a
+     * real thing for a camera to be and several corpus builds are, so the
+     * distinction cannot be made from the wire alone — but it can be made from
+     * the process, and this is where. */
+    if (!emu.alive) {
+      throw new ProbeUnmeasurable(
+        'the emulator process exited before the probe finished, so this row describes a run ' +
+          'that ended rather than a camera that refused',
+        await emu.settledStopReason(),
+      );
+    }
 
     return {
       entryId: emu.entryId,

@@ -34,6 +34,17 @@ export {
 } from './types.js';
 
 export { describeDevice, runDump } from './dump.js';
+export {
+  evidenceFromChannelProbe,
+  predatesDumpProtocol,
+  probeSelectorChannel,
+  FIRST_DUMPABLE_MAJOR,
+  FIRST_DUMPABLE_MINOR,
+  PROBE_OPEN_SUBCMD,
+  PROBE_PROTECTED_SUBCMD,
+  type ProbeOptions,
+  type SelectorChannelProbe,
+} from './capability.js';
 export { runSweep } from './sweep.js';
 export {
   decryptDump,

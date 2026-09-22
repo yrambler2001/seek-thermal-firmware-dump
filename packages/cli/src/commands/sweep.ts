@@ -9,9 +9,8 @@
 import { runSweep } from '@seek-fw/core';
 import type { CommandContext, CommandResult } from '../cli.js';
 import {
-  chooseProfile,
+  chooseProfileByProbe,
   dumpOptionsFrom,
-  evidenceFromDevice,
   openSession,
   uniqueArtifacts,
   writeRun,
@@ -21,7 +20,7 @@ import {
 export async function sweepCommand(ctx: CommandContext): Promise<CommandResult> {
   const session = await openSession(ctx);
   try {
-    const choice = chooseProfile(ctx.options, evidenceFromDevice(session.transport));
+    const choice = await chooseProfileByProbe(ctx, session);
     const workflow = workflowContext(session, choice.profile, choice.detection, ctx);
     const [first, last] = choice.profile.sweepRange;
     ctx.reporter.log(

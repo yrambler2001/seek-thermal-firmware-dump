@@ -3,6 +3,12 @@ import { describe, expect, it } from 'vitest';
 import { hexUp } from '../src/bytes.js';
 import { SeekError } from '../src/errors.js';
 import {
+  parseVersion,
+  primaryVersion,
+  versionSource,
+  versionsIn,
+} from '../src/profiles/version.js';
+import {
   FLASH_BASE,
   FLASH_SIZE,
   GAP_ADDRESS,
@@ -462,22 +468,70 @@ describe('capabilities', () => {
     });
   }
 
-  it('keeps every read path open on every profile', () => {
-    const reads: readonly CapabilityName[] = ['dump', 'sweep', 'decrypt', 'deviceInfo'];
+  /**
+   * WEAKENED ON PURPOSE, AND ONLY THIS FAR. This used to say "every read path is
+   * open on every profile", which was a good rule while every profile could
+   * read. `compact-2014` cannot: the five builds it covers have no
+   * `GetFeaturedFirmwareData` in their RPC method table at all, and on 0.3.0.1
+   * the wire id a dump ARMS with is `EnterBootloaderMode`. A profile that
+   * dumped those would be sending a mode change 63 times.
+   *
+   * So the invariant becomes: reading is open unless the profile gives a
+   * reason, and offline work — decrypting a dump somebody took with an SPI
+   * programmer, and reading device info over commands that ARE at their usual
+   * ids — stays open on every profile without exception. A future profile that
+   * refuses `decrypt` has broken something real.
+   */
+  it('keeps decrypt and deviceInfo open on every profile', () => {
+    const always: readonly CapabilityName[] = ['decrypt', 'deviceInfo'];
     for (const profile of listProfiles()) {
-      for (const op of reads) {
-        expect(profile.capabilities[op].supported).toBe(true);
+      for (const op of always) {
+        expect(profile.capabilities[op].supported, `${profile.id}.${op}`).toBe(true);
         expect(() => {
           requireCapability(profile, op);
         }).not.toThrow();
       }
     }
   });
+
+  it('opens the camera read paths on every profile but compact-2014', () => {
+    const reads: readonly CapabilityName[] = ['dump', 'sweep'];
+    for (const profile of listProfiles()) {
+      const expected = profile.id !== 'compact-2014';
+      for (const op of reads) {
+        expect(profile.capabilities[op].supported, `${profile.id}.${op}`).toBe(expected);
+      }
+    }
+  });
+
+  it('gives compact-2014 a refusal that names the command it would have sent', () => {
+    const profile = getProfile('compact-2014');
+    for (const op of ['dump', 'sweep'] as const) {
+      const support = profile.capabilities[op];
+      expect(support.supported).toBe(false);
+      if (support.supported) return;
+      expect(support.reason).toContain('GetFeaturedFirmwareData');
+      expect(support.reason).toContain('EnterBootloaderMode');
+    }
+  });
+
+  it('gives compact-2014 no selector map at all, so a bypass still sends nothing', () => {
+    const profile = getProfile('compact-2014');
+    expect(profile.windowMap()).toEqual([]);
+    const [lo, hi] = profile.sweepRange;
+    expect(lo).toBeGreaterThan(hi);
+  });
 });
 
 describe('registry', () => {
-  it('registers the four built-ins and looks them up by id', () => {
-    const ids: readonly ProfileId[] = ['modern-4x', 'legacy-auth', 'compact-2016', 'generic'];
+  it('registers the five built-ins and looks them up by id', () => {
+    const ids: readonly ProfileId[] = [
+      'modern-4x',
+      'legacy-auth',
+      'compact-2016',
+      'compact-2014',
+      'generic',
+    ];
     expect(listProfiles().map((p) => p.id)).toEqual(ids);
     for (const id of ids) expect(getProfile(id).id).toBe(id);
   });
@@ -509,5 +563,64 @@ describe('registry', () => {
       unregisterProfile(fakeId);
     }
     expect(listProfiles().map((p) => p.id)).toEqual(before);
+  });
+});
+
+/* ==================================================================== *
+ * Reading a version out of the evidence.
+ *
+ * Two fields carry one, and only one of them used to be read. These are the
+ * rules the profiles now share, tested where they live rather than four times
+ * over in four `detect()`s.
+ * ==================================================================== */
+
+describe('version evidence', () => {
+  it('parses a dotted version and ignores anything that is not one', () => {
+    expect(parseVersion('4.18.2.0')).toEqual({ text: '4.18.2.0', major: 4, minor: 18 });
+    expect(parseVersion(' 0.3.0.1 ')).toEqual({ text: '0.3.0.1', major: 0, minor: 3 });
+    expect(parseVersion('42.32.3.10')?.major).toBe(42);
+    expect(parseVersion('PIR206 Thermal Camera')).toBeNull();
+    expect(parseVersion('4')).toBeNull();
+    expect(parseVersion(undefined)).toBeNull();
+  });
+
+  it('prefers what the camera reported over what a dump contains', () => {
+    const evidence = { firmwareVersion: '4.18.2.0', imageVersions: ['1.0.3.0'] };
+    expect(primaryVersion(evidence)?.text).toBe('4.18.2.0');
+    expect(versionSource(evidence)).toBe('camera');
+    expect(versionsIn(evidence).map((v) => v.text)).toEqual(['4.18.2.0', '1.0.3.0']);
+  });
+
+  it("uses a dump's image headers when no camera reported one", () => {
+    const evidence = { imageVersions: ['1.0.3.0', '1.0.3.0'] };
+    /* Both slots hold the same build, which is the ordinary case; the duplicate
+     * carries nothing and is dropped rather than double-counted. */
+    expect(versionsIn(evidence).map((v) => v.text)).toEqual(['1.0.3.0']);
+    expect(primaryVersion(evidence)?.text).toBe('1.0.3.0');
+    expect(versionSource(evidence)).toBe('dump');
+  });
+
+  it('refuses to pick when a dump holds two different builds', () => {
+    /* A part whose slot A and slot B are different versions cannot tell you
+     * which one the camera runs, and a profile must not pretend it did. */
+    const evidence = { imageVersions: ['1.0.3.0', '4.18.2.0'] };
+    expect(primaryVersion(evidence)).toBeNull();
+    expect(versionSource(evidence)).toBe('none');
+  });
+
+  it('has nothing to say about evidence with no version at all', () => {
+    expect(primaryVersion({})).toBeNull();
+    expect(versionsIn({})).toEqual([]);
+    expect(versionSource({})).toBe('none');
+    expect(versionsIn({ imageVersions: ['not a version'] })).toEqual([]);
+  });
+
+  it("lets a dump's own header rule modern-4x in and out", () => {
+    /* The bug the version module exists to fix: `evidenceFromDump` parsed these
+     * headers and every `detect()` ignored them, so a 1.3.0.8 image — which
+     * hits the 4.x acceptance sum with no whitening — was detected as 4.x. */
+    const modern = getProfile('modern-4x');
+    expect(modern.detect({ imageVersions: ['1.3.0.8'] }).score).toBe(0);
+    expect(modern.detect({ imageVersions: ['10.9.1.31'] }).score).toBeGreaterThan(0.5);
   });
 });

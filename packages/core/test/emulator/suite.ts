@@ -86,6 +86,24 @@ export const TIER2_TIMEOUT_MS = Number(process.env.SEEK_EMU_TIER2_TIMEOUT_MS ?? 
  *  works on every camera; a larger one is faster and is reported when used. */
 export const READ_CHUNK = Number(process.env.SEEK_EMU_CHUNK ?? '64');
 
+/**
+ * How many times a row may be re-measured FROM A FRESH EMULATOR before it is
+ * recorded as unmeasurable.
+ *
+ * THIS IS NOT A RETRY-UNTIL-GREEN, and the distinction is the whole point. It
+ * fires only on `ProbeUnmeasurable` — the camera stopped being there, because
+ * the emulator's own run ended or the session died and would not come back. A
+ * device that STALLS, or answers a device error code, is measured once and
+ * recorded as it answered; nothing here can turn a refusal into an `ok`.
+ *
+ * Three, because the failure it covers is a per-process event: the emulated
+ * part faulted on an instruction this emulator does not model, or one transfer
+ * was abandoned mid-flight under host contention. A fresh process is a fresh
+ * draw, and a row that comes up unmeasurable three times running is telling you
+ * something real — which is then written down in those words.
+ */
+export const PROBE_ATTEMPTS = Number(process.env.SEEK_EMU_PROBE_ATTEMPTS ?? '3');
+
 /* ---- scratch space ---------------------------------------------------- */
 
 const SCRATCH = path.join(tmpdir(), `seek-emu-suite-${String(process.pid)}`);
@@ -193,7 +211,7 @@ export function printMatrix(title: string): void {
   for (const row of [...rows].sort((a, b) => b.seconds - a.seconds)) {
     out.push(
       `  ${row.seconds.toFixed(1).padStart(7)}s  ${row.status.padEnd(10)}  ` +
-        `${row.entryId.slice(0, 62).padEnd(62)}  ${row.detail}`,
+        `${row.entryId.slice(0, 62).padEnd(62)}  ${row.detail.slice(0, 160)}`,
     );
   }
   out.push('');

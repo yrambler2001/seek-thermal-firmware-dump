@@ -1,14 +1,39 @@
 /**
- * `modern-4x` — the 2018+ "4.x" family.
+ * `modern-4x` — the 2018-and-later selector map.
  *
- * Covers the 4.8.x / 4.9.x / 4.18.x application line: Compact Pro, Compact Pro FF,
- * Compact XR and Nano 300. This is the family every part of the original tool was
- * written against and the only one whose write path has been exercised on hardware,
- * so it is the only profile that declares `flash` supported.
+ * Every camera whose `BeginFirmwareUpgrade` exposes the whole 4 MiB part on the
+ * plain 2-byte channel. Measured on eleven distinct builds across six product
+ * lines, and the name is now the only thing about it that says "4.x".
  *
- * Three other profiles reuse pieces of this one — the 2016 generation and the
- * unknown-camera fallback both fall back to this selector map, exactly as the
- * original did. Those reuses are re-exported from here rather than copied, so a
+ * WHAT IT REALLY COVERS, AND HOW THAT IS KNOWN. The emulator sweep arms all 63
+ * selectors of this map against each firmware and compares the 256 bytes served
+ * with the 4 MiB image the emulated part actually holds, at the address this
+ * table CLAIMS. 26 of the 51 corpus firmwares confirm all 63:
+ *
+ *   Compact       4.8.1.7, 4.8.1.9, 4.8.2.1, 4.16.1.7
+ *   Compact Pro   4.9.1.15, 4.9.2.0, 4.18.2.0
+ *   Compact XR    4.8.2.1
+ *   Mosaic        10.9.1.31, 2.27.1.33
+ *   Nano 200      42.32.3.10
+ *   Nano 300      44.27.3.10
+ *
+ * Three of those version lines are not 4.x at all, and `detect()` used to score
+ * them ZERO for that reason — a Mosaic or a Nano 200 fell through to `generic`,
+ * which then refused to flash a camera whose map it had just read perfectly.
+ * The family is the map, not the major version; see `detectModern`.
+ *
+ * THE MAP IS ALSO DERIVED, NOT ONLY MEASURED. FW-V1's byte-exact reconstruction
+ * of `cmd_BeginFirmwareUpgrade` is the same switch statement in source form —
+ * `codegen/fn/cmd_BeginFirmwareUpgrade.c`, variants `base` (Compact PRO FF,
+ * Compact Pro 4.9.2.0), `nano_const`, `nano200_amend`, `compact_pro`,
+ * `mosaic_ff` and `compact_xr`. Where this file and that switch disagree, one
+ * of them is wrong about a real camera; today they agree everywhere, including
+ * on the gap (see `GAP_ADDRESS`).
+ *
+ * Three other profiles reuse pieces of this one. `generic` falls back to this
+ * selector map, exactly as the original did; `legacy-auth` and `compact-2016`
+ * reuse only the flash geometry, because their selector map is genuinely
+ * different. Those reuses are re-exported from here rather than copied, so a
  * correction to the map lands everywhere at once.
  */
 
@@ -27,6 +52,7 @@ import type {
   WindowEntry,
 } from './types.js';
 import { SUPPORTED } from './types.js';
+import { primaryVersion, versionSource } from './version.js';
 
 /* ---- memory layout ------------------------------------------------------ */
 
@@ -34,7 +60,21 @@ export const FLASH_BASE = 0x14000000;
 export const FLASH_SIZE = 4 * 1024 * 1024;
 export const WINDOW_SIZE = 0x10000;
 
-/** The one 64 KiB block in 0x14000000..0x143fffff no selector reaches. */
+/**
+ * The one 64 KiB block in 0x14000000..0x143fffff no selector reaches.
+ *
+ * DERIVED, not inferred from a sweep coming back empty. FW-V1's byte-exact
+ * `cmd_BeginFirmwareUpgrade` is a switch over the subcommand, and no arm of it
+ * assigns `fw_op_dest = 0x14060000` on any variant this profile covers: cases
+ * 7/8/9 are slot A, 0x14050000 and 0x14070000 (`base`, `nano200_amend`), 0x0A
+ * starts the linear run at 0x14080000, and the default arm covers 0x22..0x41 as
+ * `(subcmd + 5118) << 16`, i.e. 0x14200000 upward. The block is skipped in the
+ * firmware's own table, so no sweep will ever find it.
+ *
+ * The legacy generation is the opposite and it is worth knowing which way
+ * round: there 0x14060000 IS reachable, on subcommand 8 and only through the
+ * authenticated channel. See `legacy-auth`.
+ */
 export const GAP_ADDRESS = 0x14060000;
 
 /* ---- firmware slot / image layout (2018+ "4.x" family) ------------------ */
@@ -84,6 +124,15 @@ export const MODERN_SWEEP_RANGE: readonly [number, number] = [0, 0x41];
  * `0x14080000 + (subcmd - 0x0a) * 0x10000` is `(subcmd + 5118) << 16` — but they
  * are kept as two loops with distinct notes, exactly as the original decoded
  * them, so a diff against `legacy/index.html` stays trivial.
+ *
+ * TWO ALIASES ARE DELIBERATELY ABSENT. The firmware's own switch also accepts
+ * subcommand 4 (`case 1: case 4: fw_op_dest = 0x14020000`) and subcommand 7
+ * (slot A plus `g_flash_base_offset`), so the real table has 65 live
+ * subcommands, not 63. Both point at a block subcommands 1 and 5 already cover,
+ * and a dump tiles the address space once: adding them would read 128 KiB twice
+ * and change nothing about what comes back. They are recorded here rather than
+ * in the map so that a future reader does not "discover" them as a gap.
+ * Derived from `codegen/fn/cmd_BeginFirmwareUpgrade.c`, variant `base`.
  */
 export function buildModernWindowMap(): readonly WindowEntry[] {
   const entries: WindowEntry[] = [
@@ -192,43 +241,74 @@ const SCORE_CORROBORATED = 0.97;
 const SCORE_STRONG = 0.85;
 /** Rules out other families without singling this one out. */
 const SCORE_WEAK = 0.3;
+/**
+ * A plain arm of a protected bank, measured to WORK, with nothing else known.
+ *
+ * Above `CONFIDENT_SCORE` because the observation is direct and it is this
+ * line's defining behaviour, and below the version and sum scores because the
+ * earliest Compacts answer the plain channel on the open banks too. It is what
+ * lets a camera with no readable version still be dumped with the right map
+ * instead of the fallback's.
+ */
+const SCORE_MEASURED_PLAIN = 0.6;
 
-/** Major component of a dotted version string, or null when there is none. */
-function versionMajor(version: string | undefined): number | null {
-  if (version === undefined) return null;
-  const match = /^\s*(\d+)\./.exec(version);
-  const major = match?.[1];
-  return major === undefined ? null : Number.parseInt(major, 10);
-}
+/**
+ * THE LEGACY LINE, AND NOTHING ELSE, IS RULED OUT BY VERSION.
+ *
+ * Seek's application versions are not one numbering line. `0.x` and `1.x` are
+ * the 2014-2017 Compact / Compact PRO builds, whose BeginFirmwareUpgrade
+ * refuses subcommands 2..9 on the plain channel and has no selector above
+ * 0x141FFFFF; everything from 2018 on — `2.x`, `4.x`, `10.x`, `42.x`, `44.x` —
+ * exposes the whole part on the plain channel. So the test is "is this the
+ * legacy line", not "is this 4.x".
+ *
+ * The earlier test WAS "major === 4", and it cost three product families: a
+ * Mosaic (10.9.1.31, 2.27.1.33), a Nano 200 (42.32.3.10) and a Nano 300
+ * (44.27.3.10) scored zero here and fell through to `generic`, which refuses to
+ * flash. All four of those builds are measured confirming every one of this
+ * map's 63 windows at the address it claims.
+ */
+const LEGACY_MAJORS: readonly number[] = [0, 1];
 
 function detectModern(evidence: DeviceEvidence): DetectionVerdict {
   const reasons: string[] = [];
 
-  /* No 4.x build implements the 18-byte authenticated handler, but an
-   * authenticated arm that WORKED does not rule this family out: the flag says
-   * the payload armed a bank, not that the plain 2-byte one was refused, and a
-   * handler that reads the first two bytes of the setup packet and ignores the
-   * rest arms on it too. The payload is only ever sent because the ACTING
-   * profile's map carries a token, so zeroing this family on it would zero it
-   * on which map the caller picked. The observation that WOULD rule it out —
-   * a plain arm of a protected bank coming back refused — is not made anywhere
-   * yet, so the flag is recorded as a caveat and left out of the score. */
-  if (evidence.authSelectorWorks === true) {
+  /* THE DECISIVE NEGATIVE, now that something actually makes the observation.
+   * A protected bank that refused the plain 2-byte arm is the legacy locked
+   * firmware's defining behaviour and no build on this line does it: 26 corpus
+   * firmwares arm subcommand 5 plain, and the reconstruction says why — the
+   * modern handler's only length test is `(req_len & 0xFFFFFFEF) != 2`, which
+   * accepts 2 and 18 alike and compares no token at all. */
+  if (evidence.plainSelectorRefused === true) {
+    reasons.push(
+      'a plain 2-byte BeginFirmwareUpgrade of a protected bank was REFUSED, which no build ' +
+        'on this line does — its handler has no token check and accepts the plain channel ' +
+        'on every bank',
+    );
+    return { score: 0, reasons };
+  }
+
+  /* An authenticated arm that WORKED does not rule this family out: the flag
+   * says the payload armed a bank, not that the plain one was refused, and this
+   * line's handler ignores the extra 16 bytes. Kept as a caveat, out of the
+   * score — `plainSelectorRefused` above is the one that decides. */
+  if (evidence.authSelectorWorks === true && evidence.plainSelectorRefused === undefined) {
     reasons.push(
       'a protected bank armed on the 18-byte authenticated selector; nothing tried the plain ' +
-        'one there, so that does not place this camera off the 4.x line',
+        'one there, so that does not place this camera off this line',
     );
   }
 
-  const major = versionMajor(evidence.firmwareVersion);
-  if (major !== null && major !== 4) {
+  const version = primaryVersion(evidence);
+  if (version !== null && LEGACY_MAJORS.includes(version.major)) {
     /* Deliberately outranks the acceptance sum below. 32K_43X0_1.3.0.8_COMPACT
      * is measured to hit the 0x0000FFFF sum with NO whitening, so the sum on its
-     * own cannot place a build on this line — a reported version can. */
+     * own cannot place a build on this line — a version can. */
     reasons.push(
-      `reported firmware version ${String(evidence.firmwareVersion)} is not on the 4.x ` +
-        'application line (the 1.0.3.x / 1.3.0.x images are a different numbering line, ' +
-        'and one of them hits the 0x0000FFFF sum too)',
+      `${versionSource(evidence) === 'dump' ? 'the image header says' : 'the camera reports'} ` +
+        `firmware ${version.text}, which is on the 0.x / 1.x legacy line (a different ` +
+        'numbering line, not an older 4.x — and one of those builds hits the 0x0000FFFF ' +
+        'sum too)',
     );
     return { score: 0, reasons };
   }
@@ -249,22 +329,32 @@ function detectModern(evidence: DeviceEvidence): DetectionVerdict {
     score = SCORE_DECISIVE;
     reasons.push(`a slot decrypts to the ${hexUp(ACCEPT_SUM)} acceptance sum`);
   }
-  if (major === 4) {
+  if (version !== null) {
     reasons.push(
-      `reported firmware version ${String(evidence.firmwareVersion)} is on the 4.x ` +
-        'application line (Compact Pro / Compact Pro FF / Compact XR / Nano 300)',
+      `firmware ${version.text} is on the post-2018 line this selector map covers ` +
+        '(2.x / 4.x / 10.x / 42.x / 44.x: Compact, Compact Pro, Compact XR, Mosaic, Nano)',
     );
     score = hitsTarget ? SCORE_CORROBORATED : Math.max(score, SCORE_STRONG);
   }
-  if (score === 0 && evidence.plainSelectorWorks === true) {
-    /* Rules the legacy locked firmware out, but the 2016 generation also answers
-     * plain selectors — so this alone stays below the confidence threshold. */
+  if (evidence.plainSelectorRefused === false) {
+    /* MEASURED, and the mirror of the decisive negative above: the camera was
+     * asked to arm a protected bank on the plain channel and it did. That is
+     * this line's behaviour and the legacy firmware's refusal is what it rules
+     * out — but the 2016 generation is ruled out by it too only because that
+     * generation refuses; a camera answering plain could still be an early
+     * Compact, which is why this corroborates rather than decides. */
+    reasons.push(
+      'a plain 2-byte BeginFirmwareUpgrade armed a protected bank, so the authenticated ' +
+        'read channel is not in force',
+    );
+    score = Math.max(score, SCORE_MEASURED_PLAIN);
+  } else if (score === 0 && evidence.plainSelectorWorks === true) {
     reasons.push(
       'a plain 2-byte BeginFirmwareUpgrade armed a protected bank, so this is not the locked legacy firmware',
     );
     score = SCORE_WEAK;
   }
-  if (score === 0) reasons.push('no evidence placing this camera on the 4.x line');
+  if (score === 0) reasons.push('no evidence placing this camera on the post-2018 line');
   return { score, reasons };
 }
 
@@ -272,12 +362,17 @@ function detectModern(evidence: DeviceEvidence): DetectionVerdict {
 
 export const modern4x: FirmwareProfile = {
   id: 'modern-4x',
-  name: 'Modern 4.x',
+  /* The id stays `modern-4x` — it is in scripts, in `--profile` invocations and
+   * in every pinned expectation — but the NAME no longer claims a version line
+   * the family does not have. */
+  name: 'Modern (2018+ selector map)',
   summary:
-    'The 2018+ 4.x application line (4.8.x / 4.9.x / 4.18.x): Compact Pro, Compact Pro FF, ' +
-    'Compact XR, Nano 300. Full 4 MiB selector map, xorshift128 images under whitening ' +
-    'K=0x13579BDF with a 0x0000FFFF acceptance sum. The only profile whose write path has ' +
-    'been exercised against hardware.',
+    'Every camera whose BeginFirmwareUpgrade exposes the whole 4 MiB part on the plain 2-byte ' +
+    'channel: Compact 4.8/4.16, Compact Pro 4.9/4.18, Compact Pro FF, Compact XR, Mosaic ' +
+    '2.27/10.9, Nano 200 42.x, Nano 300 44.x. Measured confirming all 63 windows at the ' +
+    'addresses this map claims. xorshift128 images under whitening K=0x13579BDF with a ' +
+    '0x0000FFFF acceptance sum. The only profile whose write path has been exercised against ' +
+    'hardware.',
   cipher: MODERN_CIPHER,
   memory: MODERN_MEMORY,
   capabilities: CAPABILITIES,

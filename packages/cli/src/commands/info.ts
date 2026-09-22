@@ -21,10 +21,9 @@ import {
 import type { CommandContext, CommandResult } from '../cli.js';
 import {
   betterProfile,
-  chooseProfile,
+  chooseProfileByProbe,
   cipherDiffers,
   dumpOptionsFrom,
-  evidenceFromDevice,
   heading,
   openSession,
   table,
@@ -251,7 +250,12 @@ export async function analyseCamera(
   session: Session,
   analyseOptions: AnalyseOptions = {},
 ): Promise<{ readonly state: DeviceState; readonly profile: FirmwareProfile }> {
-  const choice = chooseProfile(ctx.options, evidenceFromDevice(session.transport));
+  /* ASKED, NOT GUESSED — and here the guess had a cost beyond a label. This
+   * read arms the boot-config bank, which on the locked 2014-2017 line is
+   * subcommand 3 behind the authenticated channel; picking `generic` off a USB
+   * product string meant arming it with the modern map's plain selector and
+   * reporting "no boot config" for a camera that would have answered. */
+  const choice = await chooseProfileByProbe(ctx, session);
   ctx.reporter.log(
     `acting under profile ${choice.profile.id}${choice.forced ? ' (--profile)' : ''}`,
     'detail',

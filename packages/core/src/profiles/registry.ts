@@ -24,6 +24,7 @@ import type {
   ProfileId,
   ProfileMatch,
 } from './types.js';
+import { compact2014 } from './compact-2014.js';
 import { compact2016 } from './compact-2016.js';
 import { generic, GENERIC_BASELINE } from './generic.js';
 import { legacyAuth } from './legacy-auth.js';
@@ -145,4 +146,5 @@ export function hasCapability(profile: FirmwareProfile, op: CapabilityName): boo
 registerProfile(modern4x);
 registerProfile(legacyAuth);
 registerProfile(compact2016);
+registerProfile(compact2014);
 registerProfile(generic);

@@ -10,7 +10,7 @@
 import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { OP } from '@seek-fw/core';
+import { OP, READ_ONLY_OPS } from '@seek-fw/core';
 import { run } from '../src/cli.js';
 import { EXIT_CANCELLED, EXIT_FAILED, EXIT_OK } from '../src/errors.js';
 import { MemorySink } from '../src/sink.js';
@@ -161,15 +161,17 @@ describe('seek-fw dump', () => {
     const camera = cameraWithFlash(synthetic.flash);
     const { io } = testIo({ backend: fixedBackend([camera]) });
     await run(['dump', '--out', join(dir, 'ro'), '--chunk', '65536'], io, signal());
+    /* ASSERTED AGAINST `READ_ONLY_OPS` ITSELF, not a copy of it. The list used
+     * to be written out here, so adding an opcode to the dump path failed this
+     * test by one number and the fix looked like "add it to the list". Reading
+     * the set means the only way to widen what a dump may send is to widen the
+     * set, where `assertOpSetsDisjoint` and the comment above it are waiting. */
     for (const call of camera.calls) {
-      expect([
-        OP.GET_ERROR_CODE,
-        OP.SET_OPERATION_MODE,
-        OP.GET_OPERATION_MODE,
-        OP.GET_FEATURED_FIRMWARE_DATA,
-        OP.BEGIN_FIRMWARE_UPGRADE,
-      ]).toContain(call.op);
+      expect(READ_ONLY_OPS.has(call.op as never), `opcode ${String(call.op)}`).toBe(true);
     }
+    /* And the probe really did run: the version read is what lets the toolkit
+     * refuse to arm a window on a build where 0x52 is EnterBootloaderMode. */
+    expect(camera.calls.map((c) => c.op)).toContain(OP.GET_FIRMWARE_INFO);
   });
 
   it('saves the partial archive when interrupted, and still exits 130', async () => {
@@ -243,6 +245,7 @@ describe('failure reporting', () => {
 class AbortingSink extends MemorySink {
   private readonly controller: AbortController;
   private readonly after: number;
+  private seen = 0;
 
   constructor(controller: AbortController, after: number) {
     super();
@@ -250,8 +253,19 @@ class AbortingSink extends MemorySink {
     this.after = after;
   }
 
+  /**
+   * Counts the lines that mean WINDOWS ARE BEING READ, not lines.
+   *
+   * It counted every chunk, which was the same thing while the first thing a
+   * dump printed was a window. It is not any more: the capability probe logs
+   * its four questions first, so a plain count fired before a single window had
+   * been read and the "partial archive" under test had no windows in it at all.
+   * Matching the window line keeps the test pinned to its own intent —
+   * interrupt a dump that is under way — instead of to a line number.
+   */
   override write(text: string): void {
     super.write(text);
-    if (this.chunks.length >= this.after) this.controller.abort();
+    if (/0x14[0-9a-f]{6}/i.test(text)) this.seen++;
+    if (this.seen >= this.after) this.controller.abort();
   }
 }
