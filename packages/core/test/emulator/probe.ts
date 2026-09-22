@@ -20,6 +20,7 @@ import { authPayload } from '../../src/profiles/legacy-auth.js';
 import { buildModernWindowMap, FLASH_BASE } from '../../src/profiles/modern-4x.js';
 import type { WindowEntry } from '../../src/profiles/types.js';
 import type { Emulator } from './harness.js';
+import { assertRealHostPath } from './webusb-over-usbip.js';
 
 const HEX = (n: number, w = 2): string => `0x${n.toString(16).toUpperCase().padStart(w, '0')}`;
 
@@ -378,13 +379,13 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
    * going to `no-answer` on all eight, GetErrorCode included, with the Python
    * process alive — and it blamed a wedged endpoint, citing `device stalled
    * status IN bRequest=11` on re-imports. Both halves were wrong (TESTING.md
-   * sec.9.7): that stall is the adapter's `SET_INTERFACE` (sent as
-   * `bmRequestType 0x00`), refused on EVERY import of every row from the first,
-   * and the silence was the emulator's USB/IP server dropping replies. That is
-   * fixed in FW-V1 and every row's delivery is now audited, so a lost reply
-   * fails the row as `InfrastructureDefect` whatever this check concludes. The
-   * check is kept for what it still means: a camera that answered and now does
-   * not, with nothing lost in transit.
+   * sec.9.7): that stall was the adapter's own `SET_INTERFACE`, sent as
+   * `bmRequestType 0x00` — a request USB 2.0 does not define — and refused on
+   * EVERY import of every row from the first; the silence was the emulator's
+   * USB/IP server dropping replies. Both are fixed: FW-V1 no longer drops replies
+   * and every row's delivery is audited, and the adapter's claim now sends
+   * nothing, as a real host's does (sec.9.9). The check is kept for what it still
+   * means: a camera that answered and now does not, with nothing lost in transit.
    *
    * THREE FRESH IMPORTS BEFORE GIVING UP, and the number is not a tolerance:
    * the emulator serves one USB/IP session at a time and frees it
@@ -453,6 +454,12 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
 
   try {
     await transport.open();
+    /* THE PATH A REAL HOST TAKES, OR NO MEASUREMENT. On a real camera the claim
+     * sends nothing and succeeds, so every vendor request below goes out with
+     * interface recipient (0x41/0xC1). For a whole campaign the adapter refused the
+     * claim and the transport silently measured device recipient instead
+     * (TESTING.md sec.9.9); that is now a failure, not a quiet fallback. */
+    assertRealHostPath(device, transport.info, `${emu.entryId}: first open()`);
     wasAnswering = await answersSomething();
 
     const identity: IdentityProbe = {
@@ -667,6 +674,10 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
         await emu.settledStopReason(),
       );
     }
+    /* And the whole row stayed on it: the transport re-claims on every one of the
+     * couple of hundred reopens above, and a refused re-claim would have switched
+     * the recipient mid-row without a word. */
+    assertRealHostPath(device, transport.info, `${emu.entryId}: end of the probe`);
 
     return {
       entryId: emu.entryId,

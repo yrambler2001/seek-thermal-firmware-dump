@@ -30,7 +30,12 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import path from 'node:path';
 
-import { DeliveryLedger, type DeliveryLedgerSnapshot, devlist } from './usbip-client.js';
+import {
+  DeliveryLedger,
+  type DeliveryLedgerSnapshot,
+  devlist,
+  type WireCount,
+} from './usbip-client.js';
 import { UsbIpWebUsbDevice, type UsbIpWebUsbOptions } from './webusb-over-usbip.js';
 
 /* ---- locating the emulator ----------------------------------------- */
@@ -190,6 +195,107 @@ export interface DeliveryAudit {
   /** True when the emulator exited on its own (a Unicorn fault) before the harness
    *  stopped it — the one case in which an unanswered transfer is explained. */
   readonly diedOnItsOwn: boolean;
+  /** What went on the wire, and the emulator's own count of SET_INTERFACE stalls. */
+  readonly wire: WireTally;
+}
+
+/* ---- the wire log, summarised --------------------------------------- */
+
+/**
+ * What one row, or one tier, actually put on the wire — the numbers that say which
+ * path a run measured.
+ *
+ * WHY THESE AND NOT OTHERS. For a whole campaign every emulator row sent its vendor
+ * requests with DEVICE recipient (0x40/0xC0), because the adapter's `claimInterface`
+ * sent a `SET_INTERFACE` a real host never sends, the firmware stalled it, and
+ * `WebUsbTransport` fell back without a word (TESTING.md sec.9.9). On a real host the
+ * claim is silent and the requests go out as 0x41/0xC1. `vendorDevice` must now be
+ * 0 and `setInterfaceSent` must be 0; `setInterfaceStallsLogged` counts the
+ * emulator's own `device stalled ... bRequest=11` lines, so the claim does not rest on
+ * the client counting itself.
+ */
+export interface WireTally {
+  /** Vendor requests with interface recipient: bmRequestType 0x41 / 0xC1. */
+  readonly vendorInterface: number;
+  /** Vendor requests with device recipient: bmRequestType 0x40 / 0xC0. */
+  readonly vendorDevice: number;
+  /** Vendor requests the device stalled — refusals, which are measurements. */
+  readonly vendorStalled: number;
+  readonly setConfigurationSent: number;
+  readonly setInterfaceSent: number;
+  readonly setInterfaceStalled: number;
+  /** Standard requests the device stalled, by `bmRequestType/bRequest`. */
+  readonly standardStalled: Readonly<Record<string, number>>;
+  /** `device stalled ... bRequest=11` lines in the emulator's own log. */
+  readonly setInterfaceStallsLogged: number;
+}
+
+export const NO_WIRE: WireTally = {
+  vendorInterface: 0,
+  vendorDevice: 0,
+  vendorStalled: 0,
+  setConfigurationSent: 0,
+  setInterfaceSent: 0,
+  setInterfaceStalled: 0,
+  standardStalled: {},
+  setInterfaceStallsLogged: 0,
+};
+
+function tallyWire(requests: Readonly<Record<string, WireCount>>, logged: number): WireTally {
+  let vendorInterface = 0;
+  let vendorDevice = 0;
+  let vendorStalled = 0;
+  let setConfigurationSent = 0;
+  let setInterfaceSent = 0;
+  let setInterfaceStalled = 0;
+  const standardStalled: Record<string, number> = {};
+  for (const [key, count] of Object.entries(requests)) {
+    const [bmText = '', reqText = ''] = key.split('/');
+    const bm = Number.parseInt(bmText, 16);
+    const req = Number.parseInt(reqText, 16);
+    const type = bm & 0x60;
+    const recipient = bm & 0x1f;
+    if (type === 0x40) {
+      if (recipient === 0x01) vendorInterface += count.sent;
+      else if (recipient === 0x00) vendorDevice += count.sent;
+      vendorStalled += count.stalled;
+    } else if (type === 0x00) {
+      if (req === 0x09) setConfigurationSent += count.sent;
+      if (req === 0x0b) {
+        setInterfaceSent += count.sent;
+        setInterfaceStalled += count.stalled;
+      }
+      if (count.stalled > 0) standardStalled[key] = count.stalled;
+    }
+  }
+  return {
+    vendorInterface,
+    vendorDevice,
+    vendorStalled,
+    setConfigurationSent,
+    setInterfaceSent,
+    setInterfaceStalled,
+    standardStalled,
+    setInterfaceStallsLogged: logged,
+  };
+}
+
+/** Two tallies, added. */
+export function addWire(a: WireTally, b: WireTally): WireTally {
+  const standardStalled: Record<string, number> = { ...a.standardStalled };
+  for (const [key, n] of Object.entries(b.standardStalled)) {
+    standardStalled[key] = (standardStalled[key] ?? 0) + n;
+  }
+  return {
+    vendorInterface: a.vendorInterface + b.vendorInterface,
+    vendorDevice: a.vendorDevice + b.vendorDevice,
+    vendorStalled: a.vendorStalled + b.vendorStalled,
+    setConfigurationSent: a.setConfigurationSent + b.setConfigurationSent,
+    setInterfaceSent: a.setInterfaceSent + b.setInterfaceSent,
+    setInterfaceStalled: a.setInterfaceStalled + b.setInterfaceStalled,
+    standardStalled,
+    setInterfaceStallsLogged: a.setInterfaceStallsLogged + b.setInterfaceStallsLogged,
+  };
 }
 
 /**
@@ -311,6 +417,12 @@ export class Emulator {
     return this.stopReason();
   }
 
+  /** The emulator's own `urb N ep0: device stalled ... bRequest=11` notes: SET_INTERFACE
+   *  refused, counted by the SERVER. (Vendor wire ids start at 53, so 11 is never one.) */
+  setInterfaceStallsLogged(): number {
+    return this.logLines.filter((line) => /device stalled .*\bbRequest=11\b/.test(line)).length;
+  }
+
   /** The emulator's `---USBIP-SUMMARY---` delivery ledger, once it has exited. */
   deliverySummary(): DeliverySummary | null {
     for (let i = this.logLines.length - 1; i >= 0; i--) {
@@ -419,6 +531,7 @@ export class Emulator {
       server,
       client,
       diedOnItsOwn: this.diedOnItsOwn,
+      wire: tallyWire(client.requests, this.setInterfaceStallsLogged()),
     };
   }
 
@@ -654,13 +767,20 @@ export class RowEmulators {
   }
 
   /** Totals for the summary matrix. */
-  totals(): { emulators: number; delivered: number; received: number; dropped: number } {
+  totals(): {
+    emulators: number;
+    delivered: number;
+    received: number;
+    dropped: number;
+    wire: WireTally;
+  } {
     const audits = this.audits ?? [];
     return {
       emulators: audits.length,
       delivered: audits.reduce((n, a) => n + (a.server?.completions.delivered ?? 0), 0),
       received: audits.reduce((n, a) => n + a.client.repliesReceived, 0),
       dropped: audits.reduce((n, a) => n + (a.server?.completions.dropped ?? 0), 0),
+      wire: audits.reduce((w, a) => addWire(w, a.wire), NO_WIRE),
     };
   }
 }

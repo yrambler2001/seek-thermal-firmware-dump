@@ -13,7 +13,14 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { emulatorDir, loadManifest, type ManifestEntry } from './harness.js';
+import {
+  addWire,
+  emulatorDir,
+  loadManifest,
+  type ManifestEntry,
+  NO_WIRE,
+  type WireTally,
+} from './harness.js';
 
 /* ---- availability ---------------------------------------------------- */
 
@@ -240,6 +247,8 @@ export interface SummaryRow {
     readonly delivered: number;
     readonly received: number;
     readonly dropped: number;
+    /** What this row put on the wire (see `WireTally`). */
+    readonly wire: WireTally;
   };
 }
 
@@ -289,6 +298,22 @@ export function printMatrix(title: string): void {
       `${String(sum('delivered'))} repl(ies) delivered, ${String(sum('received'))} received ` +
       `by the client, ${String(sum('dropped'))} dropped; slowest row ` +
       `${Math.max(...rows.map((r) => r.seconds)).toFixed(1)}s`,
+  );
+  /* THE WIRE LINE. Which recipient the run measured, and whether anything went out
+   * that a real host would not send. `device-recipient` and `SET_INTERFACE` were the
+   * whole matrix and 1,362 stalls a run until 2026-09-22 (TESTING.md sec.9.9); both
+   * are 0 on the real-host path. */
+  const wire = rows.reduce((w, r) => addWire(w, r.delivery.wire), NO_WIRE);
+  const stalled = Object.entries(wire.standardStalled)
+    .map(([key, n]) => `${key} x${String(n)}`)
+    .join(', ');
+  out.push(
+    `wire: vendor requests ${String(wire.vendorInterface)} interface-recipient (0x41/0xC1), ` +
+      `${String(wire.vendorDevice)} device-recipient (0x40/0xC0), ${String(wire.vendorStalled)} ` +
+      `stalled; SET_CONFIGURATION sent ${String(wire.setConfigurationSent)}; SET_INTERFACE sent ` +
+      `${String(wire.setInterfaceSent)}, stalled ${String(wire.setInterfaceStalled)} ` +
+      `(emulator log: ${String(wire.setInterfaceStallsLogged)} 'bRequest=11' stall(s)); ` +
+      `standard requests stalled: ${stalled === '' ? 'none' : stalled}`,
   );
   out.push('');
   for (const row of [...rows].sort((a, b) => b.seconds - a.seconds)) {

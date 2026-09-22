@@ -86,6 +86,20 @@ export interface DeliveryLedgerSnapshot {
   readonly repliesUnmatched: number;
   readonly deadlinesExpired: number;
   readonly urbsAbandoned: number;
+  /** The wire log: every control transfer put on the wire, keyed `bmRequestType/bRequest`. */
+  readonly requests: Readonly<Record<string, WireCount>>;
+}
+
+/** How many control transfers with one `bmRequestType/bRequest` were sent, and how many stalled. */
+export interface WireCount {
+  readonly sent: number;
+  readonly stalled: number;
+}
+
+/** `0xC1/0x4e` — the key the wire log counts a control transfer under. */
+export function wireKey(bmRequestType: number, bRequest: number): string {
+  const h = (n: number): string => `0x${n.toString(16).padStart(2, '0')}`;
+  return `${h(bmRequestType)}/${h(bRequest)}`;
 }
 
 export class DeliveryLedger {
@@ -103,8 +117,38 @@ export class DeliveryLedger {
   deadlinesExpired = 0;
   /** Transfers still unanswered when their session was closed. */
   urbsAbandoned = 0;
+  /**
+   * THE WIRE LOG, by setup. It exists because a request a real host would never
+   * send went out on every import for a whole campaign and nothing here could
+   * say so: the adapter sent `SET_INTERFACE` as `bmRequestType 0x00`, the firmware
+   * stalled it 1,362 times out of 1,362, and `WebUsbTransport` quietly fell back
+   * to device-recipient vendor requests on every row (TESTING.md sec.9.9). Counting
+   * what actually left, per `bmRequestType/bRequest`, makes "which recipient did
+   * this run use" and "what did it stall" a number in the summary instead of a
+   * grep through emulator logs.
+   */
+  private readonly wire = new Map<string, { sent: number; stalled: number }>();
+
+  countSent(bmRequestType: number, bRequest: number): void {
+    const key = wireKey(bmRequestType, bRequest);
+    const c = this.wire.get(key) ?? { sent: 0, stalled: 0 };
+    c.sent++;
+    this.wire.set(key, c);
+  }
+
+  countStalled(bmRequestType: number, bRequest: number): void {
+    const key = wireKey(bmRequestType, bRequest);
+    const c = this.wire.get(key) ?? { sent: 0, stalled: 0 };
+    c.stalled++;
+    this.wire.set(key, c);
+  }
 
   snapshot(): DeliveryLedgerSnapshot {
+    const requests: Record<string, WireCount> = {};
+    for (const key of [...this.wire.keys()].sort()) {
+      const c = this.wire.get(key);
+      if (c) requests[key] = { sent: c.sent, stalled: c.stalled };
+    }
     return {
       sessions: this.sessions,
       urbsSubmitted: this.urbsSubmitted,
@@ -113,6 +157,7 @@ export class DeliveryLedger {
       repliesUnmatched: this.repliesUnmatched,
       deadlinesExpired: this.deadlinesExpired,
       urbsAbandoned: this.urbsAbandoned,
+      requests,
     };
   }
 }
@@ -409,12 +454,14 @@ export class UsbIpSession {
 
     const body: Buffer = data ? Buffer.from(data.slice()) : Buffer.alloc(0);
     const seq = this.submit(0, dirIn, pkt, body, length);
+    this.ledger.countSent(setup.bmRequestType, setup.bRequest);
     try {
       const { status, payload } = await this.settle(seq, timeoutMs);
       if (status !== 0) {
         /* -EPIPE is a stalled endpoint, which is how the firmware refuses a
          * command. The transport above distinguishes the two, so this must. */
         if (status === -32 || status === -9) {
+          this.ledger.countStalled(setup.bmRequestType, setup.bRequest);
           throw new UsbIpStall(
             `control ${String(setup.bRequest)} stalled (status ${String(status)})`,
           );
