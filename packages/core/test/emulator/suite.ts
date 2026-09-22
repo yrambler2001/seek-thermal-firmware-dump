@@ -76,8 +76,14 @@ export const URB_TIMEOUT_MS = Number(process.env.SEEK_EMU_URB_TIMEOUT_MS ?? '300
  * MEASURED SINCE, so the headroom is stated rather than guessed: with the
  * emulator's gated clock (FW-V1 docs/EMULATOR.md sec.13.8) the slowest rows are
  * the 2014 Compacts at ~330 s, and they cost the same under deliberate CPU load,
- * because a gated emulator that is waiting costs no CPU at all. 900 s is ~2.7x
- * the worst row and, unlike before, that margin does not shrink with load.
+ * because a gated emulator that is waiting costs no CPU at all.
+ *
+ * IT WENT TO 1800 s FOR ONE ROUND AND CAME BACK. Re-taking every lost window
+ * as well as every lost command pushed a legacy row past even that, because the
+ * cost is the re-import rather than the transfer; the re-take is now confined
+ * to the commands, where it is one transfer, and the ceiling is back where the
+ * measurement put it. 900 s is ~2.5x the slowest row, and a row that needed a
+ * fresh emulator says so in its own gap reason rather than in this number.
  */
 export const TIER1_TIMEOUT_MS = Number(process.env.SEEK_EMU_TIER1_TIMEOUT_MS ?? '900000');
 export const TIER2_TIMEOUT_MS = Number(process.env.SEEK_EMU_TIER2_TIMEOUT_MS ?? '1800000');

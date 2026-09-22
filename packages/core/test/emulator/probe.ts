@@ -230,15 +230,25 @@ export interface ProbeOptions {
   readonly windowMap?: readonly WindowEntry[];
 }
 
+/**
+ * What a thrown error says the DEVICE did.
+ *
+ * `stall` and `device-error` are answers. Everything else is the host giving
+ * up, which says nothing about the camera — see `ensureMeasurable`.
+ */
+function classify(error: unknown): Exclude<CommandOutcome, 'ok'> {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/stall/i.test(message)) return 'stall';
+  if (/returned 0x/i.test(message)) return 'device-error';
+  return 'no-answer';
+}
+
 async function outcome(run: () => Promise<unknown>): Promise<CommandOutcome> {
   try {
     await run();
     return 'ok';
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (/stall/i.test(message)) return 'stall';
-    if (/returned 0x/i.test(message)) return 'device-error';
-    return 'no-answer';
+    return classify(error);
   }
 }
 
@@ -340,15 +350,48 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
    * ordinary is a camera that answered a moment ago and now answers nothing
    * through three fresh sessions.
    */
-  const ensureMeasurable = async (what: string): Promise<void> => {
+  /**
+   * Throws `ProbeUnmeasurable` when the emulator has stopped executing.
+   *
+   * THIS IS THE ONLY THING THAT DISCARDS A WHOLE ROW, and it is the only one
+   * that should: once the Python process is gone there is no camera left to
+   * ask, so everything measured after that point is a property of this
+   * machine. Eleven corpus rows end here, every one of them on the same
+   * unmodelled bit-band write, and their gap reasons name the faulting address.
+   */
+  const assertEmulatorAlive = async (what: string): Promise<void> => {
+    /* A camera that has answered NOTHING from the start is silent, and silent
+     * is a result. Several corpus builds are exactly that. */
+    if (!wasAnswering || emu.alive) return;
+    throw new ProbeUnmeasurable(
+      `${what}: the emulator process exited during the probe, so nothing measured after ` +
+        'that point is a property of the firmware',
+      await emu.settledStopReason(),
+    );
+  };
+
+  /**
+   * The second way a row stops being measurable, and it looks nothing like the
+   * first: the emulator is still running and the CAMERA is gone.
+   *
+   * `transport.open()` is the only thing that clears a wedged control endpoint,
+   * and on these builds it is itself the request being refused — the emulator
+   * prints `device stalled status IN bRequest=11` on every re-import from some
+   * point on. `WebUsbTransport` treats that refusal as "cannot claim the
+   * interface", falls back to `recipient: 'device'`, and these firmwares do not
+   * answer device-recipient vendor requests, so everything after it reads
+   * `no-answer`. Measured: a row that had answered every command went to
+   * `no-answer` on all eight, GetErrorCode included, with the Python process
+   * still alive and well.
+   *
+   * THREE FRESH IMPORTS BEFORE GIVING UP, and the number is not a tolerance:
+   * the emulator serves one USB/IP session at a time and frees it
+   * asynchronously, so a single refused re-attach is ordinary. A camera that
+   * answered a moment ago and now answers neither liveness opcode through three
+   * of them is gone, and the row is taken again from a fresh process.
+   */
+  const assertCameraStillAnswers = async (what: string): Promise<void> => {
     if (!wasAnswering) return;
-    if (!emu.alive) {
-      throw new ProbeUnmeasurable(
-        `${what}: the emulator process exited during the probe, so nothing measured after ` +
-          'that point is a property of the firmware',
-        await emu.settledStopReason(),
-      );
-    }
     for (let attempt = 0; attempt < 3; attempt++) {
       if (await answersSomething()) return;
       await recover();
@@ -369,9 +412,39 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
    * is only recorded once the camera has proved it is still there.
    */
   const measure = async (what: string, run: () => Promise<unknown>): Promise<CommandOutcome> => {
-    const got = await outcome(run);
-    if (got === 'no-answer') await ensureMeasurable(what);
-    return got;
+    const first = await outcome(run);
+    if (first !== 'no-answer') return first;
+    await assertEmulatorAlive(what);
+    await assertCameraStillAnswers(what);
+    /* TAKEN AGAIN, AND WHATEVER THE SECOND ATTEMPT SAYS IS WHAT IS RECORDED —
+     * including another `no-answer`.
+     *
+     * This is the discriminator, and it took three goes to find. A stall and a
+     * device error code are the firmware answering, and are recorded on the
+     * spot. A `no-answer` is the HOST giving up, and it has two entirely
+     * different causes that look identical on the wire:
+     *
+     *   REPRODUCIBLE — the device really never completes this request. Several
+     *   corpus builds do exactly that: 0.6.0.4 never answers a window probe of
+     *   the hard-blocked bank, and the legacy builds never answer a control IN
+     *   after a refused arm because there is no armed window to read. Those are
+     *   findings and they must survive.
+     *
+     *   LOST — one transfer was abandoned mid-flight under host contention,
+     *   against `WebUsbTransport`'s own 5 s deadline and an emulator three
+     *   orders of magnitude off silicon. That is the residual flake: on one run
+     *   a 1.3.0.8 Compact answered GetErrorCode, GetOperationMode,
+     *   GetFirmwareInfo and GetFeaturedFirmwareData and timed out GetChipID,
+     *   SetFirmwareInfoFeatures and EnsureMode0, having changed its mind about
+     *   nothing.
+     *
+     * Repeating the one measurement from a recovered session separates them:
+     * the first kind times out again, the second does not. It is not a
+     * retry-until-green — the second answer is recorded whatever it is, and a
+     * refusal is never retried at all.
+     */
+    await recover();
+    return outcome(run);
   };
 
   try {
@@ -408,8 +481,15 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
       claimed.set(entry.subcmd, entry.address);
     }
 
-    const windows: WindowProbe[] = [];
-    for (const [subcmd, address] of [...claimed].sort((a, b) => a[0] - b[0])) {
+    /**
+     * One subcommand, measured once. Returns the probe and whether the failure
+     * was a timeout — which the caller re-takes, for the reason in `measure`.
+     */
+    const probeWindow = async (
+      subcmd: number,
+      address: number,
+    ): Promise<{ probe: WindowProbe; lost: boolean }> => {
+      let lost = false;
       let armed = false;
       let errorCode: number | null = null;
       let matchesClaimed = false;
@@ -446,23 +526,47 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
          * clear, and reopening would add a re-import per subcommand to a firmware
          * that already costs three seconds per arm. */
         if (!(e instanceof SeekError && e.code === 'device/mode')) await recover();
-        /* AND CONFIRM THE CAMERA IS STILL THERE. A window that "refused" because
-         * the emulator had already stopped executing is not a refusal; without
-         * this check one dead session was recorded as sixty-three refusals. */
-        await ensureMeasurable(`window probe subcmd ${HEX(subcmd)}`);
+        lost = classify(e) === 'no-answer';
+        if (lost) {
+          /* Only a timeout asks the question. A stall or a device error code is
+           * the firmware answering and needs no liveness check behind it. */
+          await assertEmulatorAlive(`window probe subcmd ${HEX(subcmd)}`);
+          await assertCameraStillAnswers(`window probe subcmd ${HEX(subcmd)}`);
+        }
       }
-      windows.push({
-        subcmd,
-        claimedAddress: HEX(address, 8),
-        armed,
-        errorCode,
-        matchesClaimed,
-        mappedAddresses,
-        mappedTruncated,
-        mappedAddress: mappedAddresses.length === 1 ? (mappedAddresses[0] ?? null) : null,
-        locatorHex,
-        error,
-      });
+      return {
+        lost,
+        probe: {
+          subcmd,
+          claimedAddress: HEX(address, 8),
+          armed,
+          errorCode,
+          matchesClaimed,
+          mappedAddresses,
+          mappedTruncated,
+          mappedAddress: mappedAddresses.length === 1 ? (mappedAddresses[0] ?? null) : null,
+          locatorHex,
+          error,
+        },
+      };
+    };
+
+    const windows: WindowProbe[] = [];
+    for (const [subcmd, address] of [...claimed].sort((a, b) => a[0] - b[0])) {
+      /* MEASURED ONCE, DELIBERATELY, UNLIKE THE COMMANDS BELOW.
+       *
+       * `measure` re-takes a lost command because a command is one transfer.
+       * A window is an arm, a read and — on a refusal — a close-and-reopen,
+       * and the re-import is the expensive part: the emulator serves one
+       * USB/IP session at a time and frees it asynchronously, so under
+       * contention a single reopen can sit out its full 20 s. Re-taking all
+       * 63 windows took one legacy row past 1800 s, measured, and bought
+       * nothing: the window outcomes are the stable half of this probe —
+       * five consecutive regenerations agreed on every one of them — because
+       * a refused arm answers with a stall or a device error code, which is
+       * the firmware speaking and needs no second opinion. `lost` is
+       * therefore recorded rather than acted on. */
+      windows.push((await probeWindow(subcmd, address)).probe);
     }
 
     /* ---- how many bytes a control IN of each size really returns ---- */
@@ -475,7 +579,7 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
         controlInBytes[String(size)] = raw.length;
       } catch {
         controlInBytes[String(size)] = null;
-        await ensureMeasurable(`control-IN ceiling probe at ${String(size)} B`);
+        await assertEmulatorAlive(`control-IN ceiling probe at ${String(size)} B`);
       }
     }
 
