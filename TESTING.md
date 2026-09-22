@@ -913,8 +913,9 @@ the Compact PRO 1.0.3.0 and FF 4.18.2.0 dumps; the Mosaic FF 2.27.1.33 dump; and
 `could not claim interface 0 (control 11 stalled (status -32))`. `SET_INTERFACE` as `0x00`
 stalls and as `0x01` succeeds; `GET_INTERFACE` (`0x81`) returns 0. GetErrorCode,
 GetOperationMode, GetFirmwareInfo and GetChipID return the same bytes as `0xC0` and as
-`0xC1`, and all four stall with `wIndex = 1`. The instruments are FW-V1
-`tools/recipient_fidelity/`.
+`0xC1`, and all four stall with `wIndex = 1`. The instruments are
+`scripts/recipient-fidelity/` (in FW-V1 under `tools/recipient_fidelity/` until
+2026-09-23; §9.10).
 
 #### What the adapter does now
 
@@ -1002,7 +1003,7 @@ The self-test count goes from 125 to 127, all pass.
 
 Whether the adapter change raised the rate is **not established**. It was 0 in 381
 processes in §9.8 and 3 in 198 here, but the stress instrument
-(`tools/recipient_fidelity/stop_stress.ts`) found 0 hangs in 200 trials at this timing
+(`scripts/recipient-fidelity/stop_stress.ts`) found 0 hangs in 200 trials at this timing
 before the fix. The mechanism does not involve the client at all: the self-test reproduces
 it with no socket.
 

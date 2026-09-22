@@ -3,3 +3,5 @@ docs/
 coverage/
 legacy/
 package-lock.json
+# Kept as they were run (scripts/recipient-fidelity/README.md); the README itself is formatted.
+scripts/recipient-fidelity/*.ts

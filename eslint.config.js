@@ -8,7 +8,17 @@ import globals from 'globals';
 // `defineConfig()`, which is what this uses.
 export default defineConfig([
   {
-    ignores: ['**/dist/**', 'docs/**', 'legacy/**', 'coverage/**', '**/*.tsbuildinfo'],
+    ignores: [
+      '**/dist/**',
+      'docs/**',
+      'legacy/**',
+      'coverage/**',
+      '**/*.tsbuildinfo',
+      /* Measurement instruments run with `npx jiti`, kept as they were run: they reach
+       * into the USB/IP adapter's private session through `any` and load the toolkit by
+       * computed dynamic import. scripts/recipient-fidelity/README.md has the reason. */
+      'scripts/recipient-fidelity/**',
+    ],
   },
 
   js.configs.recommended,
