@@ -380,7 +380,12 @@ address the profile _claims_ — so "subcommand 5 exposes 0x14030000" becomes a 
 Across the 51: 26 firmwares confirm all 63 windows; 8 (the 2016 generation and the 1.3.0.8
 Compacts) confirm 25 and refuse 38, which is exactly what `legacy-auth` describes; 16 (the
 2014 Compacts) refuse all 63 because `BeginFirmwareUpgrade` stalls on every subcommand,
-although `modern-4x`'s own summary says it covers the Compact line. The auth probe makes the
+although `modern-4x`'s own summary says it covers the Compact line. _(Superseded 2026-09-23,
+§9.10. Eleven of those sixteen were never measured — the emulator died under them — and with
+bit-band support they are: **9** (0.8.0.0 … 1.3.0.0) serve 25 plain windows, one of them at
+the address their own table gives rather than the one the map claims; **7** (0.3.0.1 …
+0.7.0.8) reach no window. The count of rows confirming 25 at the claimed address is 9, not 8:
+the 2016 generation is seven rows.)_ The auth probe makes the
 observation `DeviceEvidence.authSelectorWorks` says in its own doc comment is "not made
 anywhere yet": on that generation a plain arm of slot A is **refused**, the 18-byte token
 arms it, and a wrong token of the same length is **refused** — so the channel is required and
@@ -511,9 +516,18 @@ That distinction also re-classified rows that were never a flake. Eleven rows we
 `no-answer` on every command; on the 2014 Compacts the emulator **dies**, with
 `UC_ERR_WRITE_UNMAPPED` on a write to `0x42040204` — a Cortex-M bit-band alias, which FW-V1's own
 `docs/EMULATOR_CORPUS.md` says the emulator does not model. Those rows were never a statement about
-firmware, and they no longer read as one.
+firmware, and they no longer read as one. _(2026-09-23: FW-V1 models the bit-band aliases now, and
+the eleven are measured — §9.10. The emulator died during the probe's GetChipID, the second
+vendor request, not in the window probe that noticed it.)_
 
 ### 9.5 The open disagreement, stated as one
+
+> **Resolved 2026-09-23 (§9.10).** The emulator now executes these builds' own dump protocol,
+> and the images win on nine of eleven: 0.8.0.0 … 1.3.0.0 serve 25 windows plainly, with the
+> token accepted, as `legacy-auth` says — except that their own window table sends subcommand
+> 0x0E to 0x140B0000. On 0.7.0.7 and 0.7.0.8 the names in the table are right, but
+> `GetFeaturedFirmwareData` sits in the setter column, so a read cannot be dispatched. The
+> text below is kept as it was written.
 
 For the eleven 2014 Compacts from 0.7.0.7 to 1.3.0.0, **the images and the emulator disagree**, and
 the images are the better evidence:
@@ -1067,3 +1081,125 @@ The toolkit was at `0f69282` and FW-V1 at `c94c61df`, on the same 10-core machin
    (`active_configuration()` mapped to an error) instead of returning `null`. So
    `WebUsbTransport.open()`'s `dev.configuration?.configurationValue` would throw rather
    than configure the device. Not observed: macOS had configured the bench camera.
+
+### 9.10 Bit-band support: the eleven 2014 Compacts, measured (2026-09-23)
+
+FW-V1 `7203bb36` (`emu-corpus`, its Phase 20) models the Cortex-M4 bit-band aliases. This
+repository is at `5abc7c4` (the instruments moved in, below), `f04a7d0` (one adapter fix)
+and `0e1f7c6` (the regenerated pins). **No toolkit source (`packages/*/src`) was changed.**
+
+**What was wrong.** Eleven rows, the Compact images 0.7.0.7 … 1.3.0.0, were pinned as "not
+measurable … [fault: unmapped addr=0x42040204 at PC=…]". That store is one bit of GPDMA
+`INTERRCLR`, written through its bit-band alias by the firmware's `dma_transfers_halt`. The
+emulator mapped the peripheral window and not the alias, so it died on it. FW-V1 traced
+where: FSM state 9 ("Entering SLEEP") calls `streaming_stop` on the device's own time, right
+after the **first** vendor control request. The emulator therefore died during the probe's
+**GetChipID**, the second vendor request, and the probe only noticed at its first window
+arm, which is why every such gap names "window probe subcmd 0x01". FW-V1 now implements the
+aliases as the Cortex-M4 TRM (DDI 0439B §3.7) and Generic User Guide (DUI 0553A §2.2.5)
+define them. A load is one read of the target. A store is one read then one write of the
+target, at the instruction's own size, through the same hooks a direct access runs
+(FW-V1 `docs/EMULATOR_CORPUS.md` §13).
+
+**The re-measure.** `node scripts/update-emulator-expectations.mjs`, both tiers, 392 passed,
+exit 0. **Tier 2 is byte-identical.** In tier 1, **12 of 51 rows change**: the eleven, and
+0.6.0.4, whose only change is the adapter fix below. Every other field of every other row is
+unchanged. Across both regenerations the eleven rows came out the same, apart from that
+serial.
+
+All eleven are **chimeras** on the Compact 4.8.2.1 donor `2229A0YZ7E28`. They enumerate as
+`289D:0010`, `Seek Thermal` / `PIR206 Thermal Camera`, with no serial. The chip id they
+answer, `220029002e009d009200e000`, is the donor's. The profile is `legacy-auth`: the
+registry's own `detectProfile()` scores it 0.75 on the version alone and 0.98 with what tier
+1 observed, a plain arm of slot A refused and the token accepted.
+
+| build                                                                            | windows served by a plain arm                                                                                                     | legacy-auth token                                                        | tier-1 result                                   | matches the firmware's own code                                                                          |
+| -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| 0.8.0.0, 0.9.0.2, 0.9.1.0, 0.10.0.0, 0.9.0.6, 0.9.0.7, 1.0.0.0, 1.2.0.0, 1.3.0.0 | **25 of 63**: 24 confirmed (1, 0x0A…0x21 except 0x0E), **0x0E misplaced to 0x140B0000**; 38 refused (2, 3, 5, 6, 8, 9, 0x22…0x41) | plain arm of slot A refused, 18-byte token accepted, wrong token refused | supported                                       | **yes** — each image's `BeginFirmwareUpgrade` table has 0x140B0000 at entry 0x0E as well as 0x0D         |
+| 0.7.0.7, 0.7.0.8                                                                 | **none readable**: the arms of 1 and 0x0A…0x21 are accepted, every read stalls                                                    | the same                                                                 | known gap: "the selector map reaches no window" | **yes** — their RPC table registers `GetFeaturedFirmwareData` (0x4F) in the setter column with no getter |
+
+**Cross-checked against each row's own method table** (`test/firmware/facts.json`) **and
+the image bytes.** `facts.json` puts `BeginFirmwareUpgrade` at 0x52, `GetFeaturedFirmwareData`
+at 0x4F and `SetFirmwareInfoFeatures` at 0x55 on all eleven, and records the unlock token in
+each (0.7.0.7 @0xAA50 … 1.3.0.0 @0xA5B0). The measurement agrees with every one of those
+names. What `facts.json` cannot say is which column an entry sits in, and that decides 0.7.0.x:
+
+- **The window table.** Every 2014 image, 0.3.0.1 to 1.3.0.0, carries the literal run
+  `0x140A0000, 0x140B0000, 0x140B0000, 0x140D0000`: entry 0x0E repeats 0x0D. In 1.3.0.0
+  the handler's `tbb` loads the literal at `0x1008415C + 4n`, and entries 0x0D and 0x0E
+  are `0x10084190` and `0x10084194`, both 0x140B0000. So 0x140C0000 cannot be armed through
+  `BeginFirmwareUpgrade` at all on these builds. Both 1.3.0.8 images, and FW-V1's
+  reconstruction of 1.3.0.8 (`targets/compact_32k_1_3_0_8/src/rpc_cmds.c`), have
+  0x140C0000. None of the eleven has a reconstruction of its own; 1.3.0.8 is the nearest.
+  The gate is the same code in all of them: modes 2…9 refused on the 2-byte channel, mode 2
+  and modes above 0x21 refused outright, and the 18-byte form memcmp'd against the key.
+- **0.7.0.7 and 0.7.0.8.** Their table's wire-0x4F record is
+  `{name "GetFeaturedFirmwareData", getter 0, setter 0x10083E2D}`. From 0.8.0.0 on it is a
+  getter. The handler is shaped like a reader: it walks the armed window and copies out up
+  to the requested length. But a control-IN request has no getter to dispatch to. Measured
+  over USB/IP with this suite's flags: arms of 1, 0x0A and 0x0B succeed with error code 0,
+  and `GetFeaturedFirmwareData` then stalls at 64, 32, 16 and 8 bytes, where 0.8.0.0 serves
+  data at every size. Whether the bulk transport reaches that handler was not tried. **So the
+  pinned gap text's "(BeginFirmwareUpgrade -> stall)" is true but not the reason.** It is the
+  command probe's plain arm of subcommand 5, which every legacy build refuses by design, and
+  `windowsRefused` here means "armed, and not readable".
+
+**The adapter fix (`f04a7d0`), and the one other row it moved.** These builds' device
+descriptor names `iSerialNumber` 5, and their string table ends at index 3. So
+GET_DESCRIPTOR(STRING, 5) returns the head of the configuration descriptor,
+`09 02 40 00 02 01 00 80 32`. `readString()` decoded that as UTF-16 and reported the serial
+`@Ă耀…`. A real host does not: Linux's `usb_get_string()` answers `-ENODATA` when byte 1 is
+not `USB_DT_STRING` (`drivers/usb/core/message.c`), so no serial is exposed. The adapter now
+does the same, and 0.6.0.4, the one older row with the same descriptor, moves from that
+string to `null`. FW-V1's in-process host already read it as no serial.
+
+#### The measurements
+
+The toolkit is at `0e1f7c6` plus this section, and FW-V1 is at `7203bb36`, on the same 10-core
+machine as §9.8 and §9.9.
+
+| run                                    | exit | passed / failed | wall (vitest)   | slowest row (tier 1 / tier 2) | replies delivered = received | dropped | emulators left | SET_INTERFACE sent / stalled | `bRequest=11` stalls |
+| -------------------------------------- | ---- | --------------- | --------------- | ----------------------------- | ---------------------------- | ------- | -------------- | ---------------------------- | -------------------- |
+| regeneration 1, both tiers             | 0    | 392 / 0 (core)  | 187 s (186.0 s) | 103.1 s / 81.7 s              | 892,120                      | 0       | 0              | 0 / 0                        | 0                    |
+| regeneration 2, both tiers, the pinned | 0    | 392 / 0 (core)  | 184 s           | 104.4 s / 82.8 s              | 892,120                      | 0       | 0              | 0 / 0                        | 0                    |
+| `npm run check` 1                      | 0    | 581 / 0         | 209 s (194.7 s) | 111.2 s / 93.5 s              | 892,120                      | 0       | 0              | 0 / 0                        | 0                    |
+| `npm run check` 2                      | 0    | 581 / 0         | 205 s (190.9 s) | 110.8 s / 89.6 s              | 892,120                      | 0       | 0              | 0 / 0                        | 0                    |
+
+- The two regenerations differ only by the adapter fix (the first ran before it). The
+  second is the one committed.
+- Tier 1 now delivers 19,117 replies, up from §9.9's 16,120: nine rows run the whole probe
+  instead of dying at their second request. Tier 2 is unchanged at 873,003.
+- The wire line reads 18,887 vendor requests as `0x41`/`0xC1` and 0 as `0x40`/`0xC0` in
+  tier 1, and 872,934 / 0 in tier 2. No standard request stalled.
+- The slowest tier-1 row is still 0.6.0.4, CPU-bound as in §9.8. `emulators left` is the
+  `afterAll` leak check, and `pgrep -fl seek_emu.py` was empty after every run.
+- Without the optional inputs, `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run`
+  gives **445 passed | 3 skipped**, exit 0, unchanged.
+- FW-V1 `emu/selftest.py` gives **137 passed, 0 failed, 0 skipped** (196 s), and the same from
+  a copy of `emu/` outside the repository with a fresh venv (199 s).
+
+#### Findings in toolkit source, reported and not patched
+
+1. **`legacy-auth` would write the wrong block on nine builds** (derived from the window
+   measurement and `buildLegacyWindowMap()`; no dump was run on them). The map claims
+   subcommand 0x0E is 0x140C0000. On 0.8.0.0 … 1.3.0.0 that arm serves 0x140B0000, so a
+   dump would store 0x140B0000's bytes at 0x140C0000 and never read 0x140C0000. Nothing
+   in the dump path would notice, and tier 2 cannot see it: none of these builds is a
+   whole dump in the corpus.
+2. **The readable range starts at 0.8.0.0, not 0.7.0.7.** `legacy-auth`'s summary says
+   "Compact 0.7.0.7-1.3.0.8", and `compact-2014`'s `FIRST_READABLE_VERSION` is `'0.7.0.7'`.
+   On 0.7.0.7 and 0.7.0.8 the one read the dump path uses cannot be dispatched over control.
+3. **`facts.json` records names, not columns.** A check that a table entry has a getter
+   where the toolkit reads, and a setter where it writes, would have caught finding 2 from
+   the images alone.
+4. **The derived gap text names the wrong command for 0.7.0.x** (above). Changing it
+   would re-word seven pinned reasons, so it was left as it is and is recorded here.
+
+#### The instruments moved here
+
+`scripts/recipient-fidelity/` holds the three §9.9 instruments. FW-V1 had committed them
+under a new repo-root `tools/recipient_fidelity/`. FW-V1 has had no root `tools/` since its
+codegen root migration, and they import this repository's transport and harness. Their
+README says why lint, format and typecheck skip the three `.ts` files: they reach into the
+adapter's private session on purpose, load the toolkit by computed import, and are kept as
+they were run.
