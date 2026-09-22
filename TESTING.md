@@ -565,3 +565,177 @@ Three things would close it, in order of how much they cost:
 3. **Fix the wedge itself**, which is FW-V1's: `SET_INTERFACE` is stalled on
    every re-import from some point on, and `WebUsbTransport`'s fallback to
    `recipient: 'device'` then silently changes what the probe is asking.
+
+### 9.7 Where the wall time goes (2026-09-22)
+
+The question was why some emulator rows run for minutes while nothing uses any CPU. **Answer:
+it is an emulator defect, not the firmware, the clock gate or the 5 s deadline.** The USB/IP
+server in FW-V1 `emu/seekemu/usbip.py` leaves writer threads orphaned, and those threads **drop
+replies the device has already computed.** The host then waits out its deadline for a reply
+that will never arrive, and neither side is doing anything while it waits. The same mechanism
+is the "one row in fifty-one" residual of §8 and §9.6. Everything below is measured at `497a6f2`
+against FW-V1 `c8d56404`.
+
+**Pre-flight: `npm run check` does not pass.** At the tests it is **565 passed, 16 expected
+fail, 0 failed**, but one suite fails and the exit code is 1; wall 914 s, vitest 900.3 s. The
+failing suite is tier 1's `afterAll`: `1 emulator process(es) were still running at the end`.
+The row behind it is the 0.3.0.1 Compact. It ran into the 900 s row timeout and, being a known
+gap under `test.fails`, **the timeout was counted as its expected failure.** Only the leak
+check noticed.
+
+**How it was measured.** Three instruments:
+
+- `ps` every 2 s over both runs;
+- macOS `sample` on emulator and vitest processes while they sat idle;
+- one full `vitest run` against a scratch copy of the emulator (run B: 774.9 s, exit 0, 565
+  passed, 16 expected fail). That copy carried env-guarded trace points: every URB completion
+  with its emulated cycle count, every gate wait over 0.5 s, every writer start and exit, and
+  every item a writer discarded. The copy was deleted afterwards; nothing of it is committed.
+
+#### The mechanism, caught in the act
+
+The server hands out one import at a time. Each import gets a reader thread and a writer thread,
+and **all writers take from one shared completion queue**, dropping any item that belongs to
+another session. On teardown the reader puts a `('quit', session)` sentinel on that queue. The
+toolkit's `recover()` re-imports within a millisecond of closing. If the new session's writer
+reaches the queue before the old writer wakes, **the new writer takes the old writer's quit and
+drops it**, as a foreign item. The old writer then lives until the emulator exits, pulling items
+from the shared queue and dropping every one that is not its own. From run B, the 0.3.0.1
+Compact (times in seconds since that emulator started):
+
+```
+ 7.278 usbip-conn-51 QUIT 42 put
+ 7.279 usbip-conn-52 ATTACH session 43
+ 7.279 usbip-tx-43   WRITER 43 DISCARDED quit of session 42        <- writer 42 is now an orphan
+ 7.283 MainThread    COMPLETE sess=43 seq=2 status=0 took=2.4ms    (GetOperationMode, answered)
+ 7.283 usbip-tx-42   WRITER 42 DISCARDED submit of session 43 seq=2
+12.282 MainThread    GATE waited 4.998 s with no URB pending; attached=True session=43
+```
+
+The device answered in 2.4 ms. The host never saw the reply and waited out `WebUsbTransport`'s
+5 s deadline. A dropped `SET_INTERFACE` reply costs 30 s instead, because `transport.open()`
+goes through the adapter's own URB deadline. During that wait the emulator is parked in
+`Bridge._gate()`, correctly, since nothing is pending, and `sample` shows the vitest worker's
+main thread in `kevent` in 1,681 of 1,731 samples.
+
+Each lost reply makes the probe do another `recover()`, and each re-import is another chance to
+orphan a writer. With k orphans alive, the live writer wins roughly one completion in k+1. So
+once a process has one orphan it gets worse from there: `sample` in the pre-flight run showed
+`usbip-tx-51` through `usbip-tx-58` alive in the 0.5.0.2 emulator, beside a single live
+connection. A fresh emulator starts with no orphans, which is why `ProbeUnmeasurable`'s
+re-measurement "fixes" the row: **every affected row was re-measured from a fresh emulator in 1
+to 7 s.**
+
+The quit-first check that `0102d307` replaced ended a writer on any quit. That bounded the
+orphans, but it had its own defect. The session-first check that replaced it made an orphan
+permanent.
+
+#### The slow rows, and what each one was doing
+
+| run        | row (entry)                        | row s | emulator CPU | cause                                                                     |
+| ---------- | ---------------------------------- | ----- | ------------ | ------------------------------------------------------------------------- |
+| check (A)  | Compact 0.3.0.1 image              | 900   | 8.0 s (1 %)  | 6 writers alive, 1 connection; hit the 900 s timeout                      |
+| check (A)  | Compact 0.5.0.2 image              | 479   | 4.6 s (1 %)  | 8 writers alive, 1 connection; fresh re-measure 6 s                       |
+| check (A)  | Compact 4.16.1.7-FF image          | 356   | 3.3 s (1 %)  | 7 writers alive, 1 connection; fresh re-measure 3 s                       |
+| check (A)  | Compact 4.8.1.9 image              | 312   | 2.8 s (1 %)  | 4 writers alive, 1 connection; fresh re-measure 4 s                       |
+| check (A)  | Compact PRO 1.0.3.0 `0C21A1M5KP15` | 276   | 1.8 s (1 %)  | 6 writers alive, 2 connections; fresh re-measure 1 s                      |
+| traced (B) | Compact 0.5.0.2 image              | 661.3 | 0.7 s busy   | 640.1 s waiting on 49 dropped replies; 12 orphans; re-measure 7.1 s       |
+| traced (B) | Mosaic 2.27.1.33-FF dump           | 658.3 | 0.9 s busy   | 645.3 s on 45 dropped replies; 15 orphans; re-measure 3.7 s               |
+| traced (B) | Compact 0.3.0.1 image              | 426.6 | 0.8 s busy   | 409.8 s on 38 dropped replies; 7 orphans; re-measure 3.9 s                |
+| traced (B) | Compact 4.8.1.7 image              | 353.5 | 0.7 s busy   | 340.0 s on 24 dropped replies; 10 orphans; re-measure 4 s                 |
+| traced (B) | Compact 1.3.0.8-FF image           | 185.6 | 0.4 s busy   | 175.1 s on 16 dropped replies; 5 orphans; re-measure 2.5 s                |
+| traced (B) | Compact 0.6.0.4 image              | 101.3 | 92.2 s busy  | **not idle**: 127 requests the device never completes, 722 ms of CPU each |
+
+For run A the row time is the sum of that row's emulator lifetimes, first attempt plus re-measure, from the 2 s sampler, and the writer and connection counts are the `usbip-tx-*` and `usbip-conn-*` threads `sample` found in the first emulator while it idled. For run B they are vitest's
+own. **A different set of rows each run, five per run, every one of them started while tier 2's
+six CPU-bound emulators were running** (load average 15–22). Idle, the trigger could not be
+reproduced: 21,200 close-and-reopen cycles against one emulator lost nothing, both on an idle
+machine and under twelve busy loops. So the trigger rate is known only as five processes in
+fifty-six per suite run.
+
+#### The budget, by cause
+
+Tier 1 in run B: 52 tests and 2,608 s of row time. Its file wall of 773.9 s **is** the suite's
+wall; tier 2 finished at 187.2 s and every other file together took under 30 s.
+
+| cause                                                                              | tier-1 row s     | notes                                                                                                                                                                                                                  |
+| ---------------------------------------------------------------------------------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **(g) replies dropped by orphaned writers**                                        | **2,210 (85 %)** | 172 replies in 5 of 56 processes: 55 waits of ~30 s after a dropped `SET_INTERFACE` reply (1,650 s), 112 of ~5 s after a dropped vendor-RPC reply (~560 s); 5 were still being waited on when the emulator was stopped |
+| (d) emulator boot                                                                  | 122              | 56 processes, including the five re-measures                                                                                                                                                                           |
+| (c) CPU-bound URB service                                                          | 117              | 91.7 s of it is 0.6.0.4's 127 unanswered requests, each ended by the emulator's host-harness budget with `-ETIMEDOUT`                                                                                                  |
+| host side, re-import, spawn and teardown                                           | ~159             | the remainder                                                                                                                                                                                                          |
+| (a) deadlines waited out on silent refusals                                        | **0**            | no gate wait over 0.5 s that was not a dropped reply; over control transfers a refusal is a stall, answered in 1–3 ms                                                                                                  |
+| (b) the `SET_INTERFACE` stall                                                      | ~0               | it stalls on **1,362 of 1,362** imports, every row, from the first. It is the baseline, not a wedge signature, and costs 1–3 ms                                                                                        |
+| (e) vitest pool queueing                                                           | 0 on row timers  | rows queued behind the stuck ones still show 3–4 s; but five stuck rows held five of six slots for up to 11 min                                                                                                        |
+| (f) a gate deadlock: the host waits with nothing pending and the device needs time | **0**            | `SetOperationMode` was **never sent**. `GetOperationMode` read 0 on every row, so `ensureMode0()` never slept                                                                                                          |
+
+Tier 2 in run B: 1,025 s of emulator life, of which **817 s is CPU-bound transfer** (80 %), 21 s
+is boot and 0 replies were lost. Tier 2 never re-imports (one import per row), so it cannot
+orphan a writer. It is slow for the reason §8 gives and is not part of this question.
+
+**Hypothesis (f) was tested directly as well as by absence.** On the 0.5.0.2 Compact and the
+4.18.2.0-FF Compact PRO, `SetOperationMode(1)`, then `SetOperationMode(0)`, then
+`GetOperationMode` every 20 ms reads 0 on the first poll. That holds both gated and with
+`--usbip-free-running`: the transition is synchronous, and nothing on this path needs device
+time to pass while the host sleeps.
+
+**The deadline was never close.** Across 892,004 answered URBs in run B (status 0 or a stall),
+the device's own work per transfer was at most **94,048 emulated cycles** (p50 63,299, which is
+≤ 0.5 ms of device time at 204 MHz). The slowest wall-clock reply was **68 ms** (p99.99 21.6 ms),
+with twelve emulators competing for CPU. §8 and §9.6 attribute the residual to "three orders of
+magnitude slower than silicon against a 5 s wall-clock deadline". That is not what happened: no
+reply comes within 70× of the deadline, and **the replies that "timed out" were dequeued and dropped
+by the wrong thread.**
+
+**Without the defect**, tier 1's row time would be about 350 s. At six at once, and with the
+longest clean row at 101 s, tier 1 would finish well inside tier 2's 187 s, and `npm test` would
+be tier-2-bound at roughly 190 s instead of 775–900 s. **That is arithmetic from run B, not a
+measurement; the fix has not been made.**
+
+#### What this corrects in §8 and §9
+
+- "`ensureMode0()`'s three-second settle on each of 63 arms (~330 s a row)": in the traced run
+  no row sent `SetOperationMode` at all. From a fresh emulator the 2014 Compacts that answer took
+  3.9–7.1 s; 0.6.0.4 took 101 s, all of it CPU. Nothing here reproduces the settle. The long
+  2014 rows seen here were this defect; whether the earlier 330 s figure was too cannot be told
+  after the fact.
+- "`device stalled status IN bRequest=11` on every re-import from some point on": it is on
+  every import from the first, on every row, healthy or not.
+- "The emulator's slowness against the 5 s deadline": see above. The §9.6 residual (two rows
+  whose last two commands read `no-answer`) is what this mechanism produces when the dropped
+  replies land on the last measurements. That exact variant was not observed in these two runs;
+  the timeout variant (run A) and five recovered rows (run B) were.
+
+#### Fixes, ranked by value against risk (none implemented)
+
+1. **Emulator: route completions per session** (FW-V1 `emu/seekemu/usbip.py`). Give each import
+   its own queue for completions, unlinks and its quit, so a writer can never dequeue another
+   session's item. Count dropped completions in `Bridge.summary()`, and add a self-test that
+   forces the interleaving (a delay between `detach()` and the quit) and asserts zero drops and
+   at most one live writer. This removes 2,210 of 2,608 s of tier-1 row time, the 900 s hang,
+   and by mechanism the residual. It changes delivery only; the device's answers, the gate and
+   the cycle counts are untouched, so no test measures anything different. **Low risk, highest
+   value.**
+2. **Harness: make a dropped reply impossible to mistake for firmware silence.** The emulator
+   already counts URBs completed; have the harness compare that with what the client received,
+   and raise `ProbeUnmeasurable` naming "completed by the device, never delivered". Cheap, loud,
+   changes no measurement, and guards fix 1 against regressing.
+3. **Harness: a known gap must not pass on a timeout.** `test.fails` turned run A's 900 s hang
+   into a green "expected failure". Assert the gap's own condition and let any other error,
+   a timeout included, fail the row. Low risk.
+4. **Harness fidelity, and a separate decision because it changes what is measured.**
+   `UsbIpWebUsbDevice.claimInterface` sends `SET_INTERFACE` as `bmRequestType 0x00`. USB 2.0
+   §9.4.10 requires `0x01`, and neither WebUSB's `claimInterface` nor `libusb_claim_interface`
+   sends anything at all. It stalls on every import, so **every row in both tiers has run with
+   `WebUsbTransport` fallen back to `recipient: 'device'`**. On a real camera the toolkit uses
+   `interface`. The same request as `0x01` succeeds on 4.8.1.9, 0.5.0.2 and 4.18.2.0-FF. Fixing
+   it is right, but it changes every vendor request's recipient, so it needs a regeneration and
+   a reviewed diff. It is not a speed fix; each stall costs 1–3 ms.
+5. **Not recommended now:** shortening the emulator's 20,000-step host-harness budget that
+   0.6.0.4 pays 127 times. That budget is 1.32 M cycles against a worst observed answer of 94,048,
+   so there is room. But the row is off the critical path once fix 1 is in, and shortening it
+   changes when the emulator declares a request unanswered.
+
+**Deliberately not proposed:** lowering `WebUsbTransport`'s 5 s (toolkit source, and not the
+cause), lowering the adapter's 30 s URB deadline (it would make each dropped reply cheaper and
+the defect harder to see), and any retry.
