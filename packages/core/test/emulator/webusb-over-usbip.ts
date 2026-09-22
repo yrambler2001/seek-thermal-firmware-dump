@@ -188,7 +188,15 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
      * one refused re-import left the transport closed and turned every later
      * subcommand into a timeout, so the same firmware measured 25 of 63 windows
      * in one run and 1 of 63 in the next. Retrying until the slot frees is what
-     * makes the measurement a property of the firmware instead of the load. */
+     * makes the measurement a property of the firmware instead of the load.
+     *
+     * THE CHURN THIS CREATES IS REAL WORK FOR THE SERVER, and it found three
+     * defects there on 2026-09-22 — a `quit` sentinel outliving its session and
+     * silencing the next one, a detach eating its successor's completions, and a
+     * listen backlog of 4 dropping SYNs (1 re-import in 300 paid a second of TCP
+     * retransmit). All three are fixed in FW-V1's `emu/` and covered by its
+     * self-test; see docs/EMULATOR.md sec.13.8. This retry stays regardless: the
+     * single import slot is the protocol's, not a bug. */
     const deadline = Date.now() + REOPEN_TIMEOUT_MS;
     let last: unknown;
     for (;;) {

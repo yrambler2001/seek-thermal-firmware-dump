@@ -72,6 +72,12 @@ export const URB_TIMEOUT_MS = Number(process.env.SEEK_EMU_URB_TIMEOUT_MS ?? '300
  * of deliberate waiting by the toolkit's own design. At 300 s two firmwares hit
  * the wall. This is a ceiling on failure, not a wait: nothing sleeps to make a
  * test pass, and no number here was moved until a result looked right.
+ *
+ * MEASURED SINCE, so the headroom is stated rather than guessed: with the
+ * emulator's gated clock (FW-V1 docs/EMULATOR.md sec.13.8) the slowest rows are
+ * the 2014 Compacts at ~330 s, and they cost the same under deliberate CPU load,
+ * because a gated emulator that is waiting costs no CPU at all. 900 s is ~2.7x
+ * the worst row and, unlike before, that margin does not shrink with load.
  */
 export const TIER1_TIMEOUT_MS = Number(process.env.SEEK_EMU_TIER1_TIMEOUT_MS ?? '900000');
 export const TIER2_TIMEOUT_MS = Number(process.env.SEEK_EMU_TIER2_TIMEOUT_MS ?? '1800000');

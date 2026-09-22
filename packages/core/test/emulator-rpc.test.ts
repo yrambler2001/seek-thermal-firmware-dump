@@ -22,32 +22,65 @@
  * transport, `SeekDevice`, the profile tables — is the toolkit's real code.
  *
  * ---------------------------------------------------------------------
- * THIS TIER IS NOT YET FULLY REPRODUCIBLE, AND THE NUMBER IS MEASURED.
+ * REPRODUCIBLE, AND THE WORD IS MEASURED RATHER THAN CLAIMED.
  *
- * Two consecutive regenerations on the same machine, same seed, same worker
- * count, agreed on 42 of the 51 firmware rows byte for byte. The other nine
- * differed in twelve fields:
+ * It was not. Two consecutive regenerations on the same machine, same seed, same
+ * worker count, used to agree on 42 of the 51 firmware rows and differ on nine,
+ * across twelve fields — six `commands`, three `auth`, one `controlInBytes`, one
+ * `windows`. Every one of those is a field that elapsed device time can move.
  *
- *   commands        6 rows  one opcode flips between 'ok' and 'no-answer'
- *   auth            3 rows  authAccepted / wrongTokenAccepted flip
- *   controlInBytes  1 row   the 32-byte probe returns 32 or nothing
- *   windows         1 row   compact_pro 1.0.3.0-FF image: 1 or 25 confirmed
+ * The cause was on the emulator's side of the wire and is now fixed there; no
+ * toolkit source was involved in either the bug or the fix.
  *
- * The cause is on the emulator side of the wire, not in the toolkit: under CPU
- * contention (five to eleven emulated cameras on ten cores) the emulated device
- * intermittently does not answer a control transfer inside the 30 s URB
- * deadline, and the endpoint it was talking through then has to be recovered.
- * Three mitigations are already in — the readiness probe is polled rather than
- * asked once, every independent measurement runs from a recovered transport,
- * and the USB/IP re-import is retried until the single import slot frees — and
- * together they took this from "the same firmware measures 25 of 63 windows in
- * one run and 1 of 63 in the next, routinely" down to one row in fifty-one.
+ *   THE CLOCK. The emulated part has no clock — its notion of time is retired
+ *   emulated work — so while a client was thinking between two transfers the
+ *   guest kept executing at a rate set by HOST LOAD. Measured: the same firmware
+ *   and the same sixteen transfers gave a different cycle count at every
+ *   completion on two consecutive runs, and 0.5 s of pause between transfers
+ *   multiplied the device's elapsed time 6.6x. `--usbip` now GATES the clock on
+ *   host activity: nothing outstanding, nothing retired. The same sixteen
+ *   transfers then cost 63,258 cycles each, exactly, at any pacing.
  *
- * IT IS NOT ZERO. A re-run can therefore go red on one of those nine rows
- * without anything having changed. That is a limitation OF THIS SUITE and it is
- * written down rather than hidden behind a tolerance: the honest fix is to make
- * the emulated device answer deterministically, not to stop asserting. Until
- * then, read a red row here against this list before believing it.
+ *   THE RE-IMPORT. `recover()` below is close-and-reopen, a couple of hundred
+ *   times per row, and three defects lived in that churn — a `quit` sentinel
+ *   outliving its session and stopping the NEXT session's writer thread, a
+ *   detach eating the completions of the session that had replaced it, and a
+ *   listen backlog of 4 dropping SYNs. The first of those is what made one
+ *   firmware per run answer `no-answer` to a command it had in fact computed.
+ *
+ * WHERE IT STANDS. Five consecutive regenerations — one of them under deliberate
+ * CPU load, load average 161 — produced BYTE-IDENTICAL expectations for all 51
+ * rows. No field is excluded from the pin, and nothing here retries to get green:
+ * a retry that changed a recorded value would make this file a story about the
+ * retry.
+ *
+ * AND THE CONFIGURATION IS PART OF THE CLAIM. All of that is `vitest run
+ * --project core` with SEEK_EMU_TIER2=none — these suites alone. Six such runs,
+ * 306 row-measurements, zero divergence. Run them alongside the rest of the
+ * repository's suite (`npm run check`, or a bare `vitest run`) and about ONE ROW
+ * IN FIFTY-ONE wedges: five failing rows over four such runs, a DIFFERENT row
+ * every time. The signature never varies — `device stalled status IN
+ * bRequest=11` on every re-import from some point on, the row costs 180–420 s
+ * instead of 4, and its commands read `no-answer`. `transport.open()` is the only
+ * thing that clears a wedged control endpoint, and it is the request being
+ * stalled, so it never recovers.
+ *
+ * THAT LAST ONE IS NOT THE EMULATOR'S CLOCK OR ITS TEARDOWN — both were fixed and
+ * measured. It is the coupling neither side may remove: three orders of magnitude
+ * slower than silicon, against `WebUsbTransport`'s own 5 s wall-clock deadline.
+ * Under enough host contention one transfer is abandoned mid-flight and these
+ * builds then refuse SET_INTERFACE for the rest of the row. Lengthening that
+ * deadline would mean changing the toolkit's real code, which is the one thing
+ * this suite must not do. So: `npm run check` does not currently pass, one row at
+ * a time, and reading a lone red row against this paragraph is the first thing to
+ * do before believing the firmware changed.
+ *
+ * WHAT IS STILL LOAD-SENSITIVE IN PRINCIPLE. The emulator runs three orders of
+ * magnitude slower than silicon and `WebUsbTransport` applies a 5 s wall-clock
+ * deadline per transfer — the toolkit's own, deliberately unchanged. Nothing
+ * measured here comes near it any more, but that pairing is the one remaining
+ * route by which host speed could reach a result, so read a lone red row against
+ * it before believing the firmware changed. FW-V1 docs/EMULATOR.md sec.13.8.
  * ==================================================================== */
 
 import { afterAll, describe, expect, it } from 'vitest';

@@ -378,21 +378,61 @@ anywhere yet": on that generation a plain arm of slot A is **refused**, the 18-b
 arms it, and a wrong token of the same length is **refused** — so the channel is required and
 the token really is compared.
 
-**Tier 1 is not yet fully reproducible, and the number is measured.** Two consecutive
-regenerations on the same machine agreed on **42 of 51** firmware rows byte for byte; nine
-differed in twelve fields (six `commands`, three `auth`, one `controlInBytes`, one
-`windows`). The cause is on the emulator side of the wire: under contention the emulated
-device intermittently does not answer a control transfer inside the 30 s deadline. Three
-mitigations are already in (polled readiness, a recovered transport before every independent
-measurement, a retried USB/IP re-import) and took it from routine to one row in fifty-one —
-but not to zero, so a re-run can go red without anything having changed. That is a
-limitation of this suite, written down rather than papered over with a tolerance.
+**Tier 1 is reproducible, and that word is measured rather than claimed.** It was not.
+Two consecutive regenerations on the same machine used to agree on **42 of 51** firmware
+rows byte for byte; nine differed in twelve fields (six `commands`, three `auth`, one
+`controlInBytes`, one `windows`). Every one of those is a field elapsed device time can
+move, and that is exactly what was moving. **No toolkit source was involved in the bug or
+in the fix** — both were on the emulator's side of the wire (FW-V1 `docs/EMULATOR.md`
+§13.8, `docs/EMULATOR_CORPUS.md` §12):
 
-**Runtime, stated rather than hidden.** Tier 1 over all 51 is ~18 min at five concurrent
-emulators, dominated by builds that pay `ensureMode0()`'s three-second settle on each of 63
-arms. Tier 2 over the 15 dumps is ~10 min. `SEEK_EMU_TIER2=none` skips tier 2;
-`SEEK_EMU_WORKERS` sets the concurrency (it is per suite _file_, so two files in flight
-double it).
+- **The clock.** The emulated part has no clock; its notion of time is retired emulated
+  work. While a client was thinking between two transfers the guest kept executing at a
+  rate set by **host load** — measured, the same sixteen transfers gave a different cycle
+  count at every completion on two consecutive runs, and half a second of host pause
+  between transfers multiplied the device's elapsed time **6.6×**. `--usbip` now gates the
+  clock on host activity: nothing outstanding, nothing retired.
+- **The re-import.** `recover()` is close-and-reopen, a couple of hundred times per row,
+  and three defects lived in that churn. The one that mattered: a `quit` sentinel left
+  behind by a dead session stopped the **next** session's writer thread, so a healthy
+  device answered nothing for one session and one command came back `no-answer`.
+
+**Five consecutive regenerations — one of them under deliberate CPU load, load average
+10 → 161 — now produce byte-identical expectations for all 51 rows** (666.9 s, 679.7 s
+loaded, 670.9 s for the last three; `0 of 51` differing between every consecutive pair).
+No field is excluded from the pin, and nothing retries to make a row green.
+
+**One residual failure mode is left, it is quantified, and it means `npm run check` does
+not pass.** Every run above was `vitest run --project core` with `SEEK_EMU_TIER2=none` —
+the emulator suites alone. Across six such runs (five regenerating, one asserting) that is
+**306 row-measurements with zero divergence**. Run the emulator suites alongside the rest
+of this repository's suite instead — `npm run check`, or a bare `vitest run` — and roughly
+**one row in fifty-one wedges**: five failing rows across four such runs, _a different row
+each time_ (`compact_xr 4.8.2.1`, `compact_pro 4.18.2.0-FF`, `compact_pro 1.0.3.2-FF`,
+`nano_200` …), never the same one twice.
+
+The signature never varies: the row costs 180–420 s instead of 4, the emulator log shows
+`device stalled status IN bRequest=11` on **every** re-import from some point on, and the
+commands after it read `no-answer`. That is the control endpoint wedged — and
+`transport.open()`, which is the only thing that clears a wedge, is itself the request
+being stalled, so it never recovers.
+
+**What is left is not the emulator's clock and not its teardown; both of those were fixed
+and measured.** It is the one coupling neither side may remove: the emulator runs three
+orders of magnitude slower than silicon while `WebUsbTransport` applies its own **5 s
+wall-clock deadline** per transfer. Under enough host contention one transfer is abandoned
+mid-flight, and on these builds the firmware then refuses `SET_INTERFACE` for the rest of
+the row. Shortening the work is not possible; lengthening the deadline would mean changing
+the toolkit's real code, which is the one thing this suite must not do, and would make the
+measurement a measurement of the change. It is written down here rather than hidden behind
+a tolerance or a retry.
+
+**Runtime, stated rather than hidden.** Tier 1 over all 51 is ~11 min at six concurrent
+emulators, dominated by the 2014 Compacts, which pay `ensureMode0()`'s three-second settle
+on each of 63 arms (~330 s a row). **Load barely moves it** — 666 s idle against 678 s at
+load average 50–100 — because a gated emulator that is waiting costs no CPU at all. Tier 2
+over the 15 dumps is ~10 min. `SEEK_EMU_TIER2=none` skips tier 2; `SEEK_EMU_WORKERS` sets
+the concurrency (it is per suite _file_, so two files in flight double it).
 
 Skips exactly as §4 rule 1 demands: `SEEK_EMU_DIR` absent → loud skip on stderr, exit 0.
 With neither optional input: **404 passed | 3 skipped**, exit 0. With the dump corpus but no

@@ -282,16 +282,17 @@ export class Emulator {
 
     /* The READY line says the socket is bound; this says the DEVICE answers.
      *
-     * POLLED, NOT ASKED ONCE, AND THE REASON IS A MEASURED ONE. The emulator's
-     * USB/IP server refuses `OP_REQ_DEVLIST` when its own internal enumeration
-     * has not finished within ten seconds (`usbip.py _devlist_reply`). A 2014
-     * Compact takes 9-11 s to get there on an idle machine — and this suite runs
-     * six emulators per suite file with two files in flight, so on a ten-core
-     * machine that boundary is crossed and nine firmwares came back
-     * "devlist refused" purely from CPU contention. Re-spawning does not help,
-     * because it restarts the same clock; asking again does, because the ten
-     * seconds are per request. So the readiness probe retries until the caller's
-     * own deadline, and the emulator is killed only if it never gets there.
+     * STILL POLLED, THOUGH THE REASON IT HAD TO BE IS GONE. The emulator's server
+     * used to refuse `OP_REQ_DEVLIST` when its own enumeration had not finished
+     * within ten seconds of HOST time (`usbip.py`, `ready.wait(10.0)`). A 2014
+     * Compact takes 9-11 s to get there on an idle machine, so under the
+     * contention of several exported cameras nine firmwares came back "devlist
+     * refused" with nothing wrong with them, and only asking again — the ten
+     * seconds were per request — got past it. As of 2026-09-22 that wall clock is
+     * gone: the server waits on its own liveness, so one call now blocks until
+     * the device is published or the emulator run has ended. The retry is kept
+     * because it costs nothing, covers a server that is still binding its port,
+     * and keeps this working against an older emulator.
      *
      * A failure must not leak the child: it is already registered, and `start()`
      * retries, so an un-killed one would sit there burning a core until the

@@ -23,7 +23,7 @@
       "commands": {
         "GetErrorCode": "ok",
         "GetOperationMode": "ok",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
+        "GetFeaturedFirmwareData(unarmed)": "stall",
         "GetFirmwareInfo": "ok",
         "GetChipID": "ok",
         "BeginFirmwareUpgrade": "stall",
@@ -499,7 +499,7 @@
         "productName": "PIR206 Thermal Camera",
         "serialNumber": "@Ă耀�"
       },
-      "chipIdHex": null,
+      "chipIdHex": "220029002e009d009200e000",
       "commands": {
         "GetErrorCode": "no-answer",
         "GetOperationMode": "no-answer",
@@ -1121,7 +1121,7 @@
         "GetFirmwareInfo": "ok",
         "GetChipID": "ok",
         "BeginFirmwareUpgrade": "ok",
-        "SetFirmwareInfoFeatures": "no-answer",
+        "SetFirmwareInfoFeatures": "ok",
         "EnsureMode0": "ok"
       },
       "controlInBytes": {
@@ -1357,7 +1357,7 @@
         "GetFirmwareInfo": "ok",
         "GetChipID": "ok",
         "BeginFirmwareUpgrade": "stall",
-        "SetFirmwareInfoFeatures": "no-answer",
+        "SetFirmwareInfoFeatures": "ok",
         "EnsureMode0": "ok"
       },
       "controlInBytes": {
@@ -1960,7 +1960,7 @@
         "GetErrorCode": "ok",
         "GetOperationMode": "ok",
         "GetFeaturedFirmwareData(unarmed)": "ok",
-        "GetFirmwareInfo": "no-answer",
+        "GetFirmwareInfo": "ok",
         "GetChipID": "ok",
         "BeginFirmwareUpgrade": "ok",
         "SetFirmwareInfoFeatures": "ok",
@@ -2005,7 +2005,7 @@
       "commands": {
         "GetErrorCode": "ok",
         "GetOperationMode": "ok",
-        "GetFeaturedFirmwareData(unarmed)": "no-answer",
+        "GetFeaturedFirmwareData(unarmed)": "ok",
         "GetFirmwareInfo": "ok",
         "GetChipID": "ok",
         "BeginFirmwareUpgrade": "ok",
@@ -2279,7 +2279,7 @@
       },
       "chipIdHex": "0e001c00630093009200e600",
       "commands": {
-        "GetErrorCode": "no-answer",
+        "GetErrorCode": "ok",
         "GetOperationMode": "ok",
         "GetFeaturedFirmwareData(unarmed)": "ok",
         "GetFirmwareInfo": "ok",
