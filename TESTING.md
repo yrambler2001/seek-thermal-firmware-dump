@@ -528,3 +528,40 @@ support in the emulator — which is FW-V1's to add, and is already on its unmod
 Until then the toolkit treats them as ordinary `legacy-auth` cameras, which is what their own
 command tables say they are, and the emulator rows for them are tracked gaps whose reason says
 "not measurable", not "the firmware refused".
+
+### 9.6 The residual, measured over four runs
+
+`npm run check`, four consecutive runs on the same machine, same commit:
+
+| run | result                                     | wall   |
+| --- | ------------------------------------------ | ------ |
+| 1   | 565 passed, 16 expected fail, **0 failed** | 326 s  |
+| 2   | 565 passed, 16 expected fail, **0 failed** | ~400 s |
+| 3   | 565 passed, 16 expected fail, **0 failed** | ~400 s |
+| 4   | 563 passed, 16 expected fail, **2 failed** | 671 s  |
+
+So it is **not zero**, and the honest number is **2 rows in 204 row-measurements
+(1.0 %)**, all four failures in the one run that took twice as long as the
+others. Before this work the same suite lost about one row in fifty-one (2 %),
+every run, and lost it _silently_ — the row was pinned as a finding about
+firmware.
+
+What is left is narrower and is named: on the slow run the only two fields that
+moved were `SetFirmwareInfoFeatures` and `EnsureMode0`, which are the **last two
+measurements the probe takes**. The wedge begins there and the row ends before
+the re-take can get a second answer that differs. Both are `no-answer` — a host
+deadline, never a refusal — so nothing false was recorded about the firmware;
+the run simply went red.
+
+Three things would close it, in order of how much they cost:
+
+1. **Take the two cheap commands earlier.** They are last because the selector
+   map is the measurement that matters and runs first, before anything can
+   wedge the endpoint. Moving these two to just after the identity read costs
+   nothing and puts them where the endpoint is still clean.
+2. **Re-take the whole command block, not one command.** The block is eight
+   transfers; a lost one is currently re-taken alone, into an endpoint that may
+   already be wedged.
+3. **Fix the wedge itself**, which is FW-V1's: `SET_INTERFACE` is stalled on
+   every re-import from some point on, and `WebUsbTransport`'s fallback to
+   `recipient: 'device'` then silently changes what the probe is asking.
