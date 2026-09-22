@@ -322,6 +322,16 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
         255,
       );
       if (raw.length < 2) return null;
+      /* A REAL HOST DROPS A "STRING" THAT IS NOT A STRING DESCRIPTOR.
+       *
+       * Linux's usb_get_string() answers -ENODATA when byte 1 is not USB_DT_STRING
+       * (drivers/usb/core/message.c), so the kernel caches no such string and the
+       * WebUSB and node-usb views above it report none. The 2014 Compacts are why
+       * this matters: their device descriptor names iSerialNumber 5 and their string
+       * table ends at index 3, so string 5 comes back as the head of the
+       * configuration descriptor (09 02 40 00 02 01 00 80 32). Decoding that as
+       * UTF-16 invented a serial number no real host would show. */
+      if (raw[1] !== DESC_STRING) return null;
       const body = raw.subarray(2, raw[0] ?? raw.length);
       return new TextDecoder('utf-16le').decode(body);
     } catch {
