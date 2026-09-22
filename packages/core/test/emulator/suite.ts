@@ -73,10 +73,14 @@ export const URB_TIMEOUT_MS = Number(process.env.SEEK_EMU_URB_TIMEOUT_MS ?? '300
  * the wall. This is a ceiling on failure, not a wait: nothing sleeps to make a
  * test pass, and no number here was moved until a result looked right.
  *
- * MEASURED SINCE, so the headroom is stated rather than guessed: with the
- * emulator's gated clock (FW-V1 docs/EMULATOR.md sec.13.8) the slowest rows are
- * the 2014 Compacts at ~330 s, and they cost the same under deliberate CPU load,
- * because a gated emulator that is waiting costs no CPU at all.
+ * MEASURED SINCE, so the headroom is stated rather than guessed. The "2014
+ * Compacts at ~330 s" this comment used to quote were the emulator's USB/IP
+ * server dropping replies (TESTING.md sec.9.7): no row sent SetOperationMode at
+ * all. With that fixed (sec.9.8) the slowest row is the 0.6.0.4 Compact, CPU-bound
+ * on 127 requests the device never completes: 107-151 s idle, 332 s under twelve
+ * busy loops. The ceiling is deliberately left where it was — lowering a deadline
+ * is not how a lost reply gets found — and a row that hits it now FAILS, gap or
+ * not, instead of passing as an expected failure.
  *
  * IT WENT TO 1800 s FOR ONE ROUND AND CAME BACK. Re-taking every lost window
  * as well as every lost command pushed a legacy row past even that, because the
@@ -103,10 +107,18 @@ export const READ_CHUNK = Number(process.env.SEEK_EMU_CHUNK ?? '64');
  * recorded as it answered; nothing here can turn a refusal into an `ok`.
  *
  * Three, because the failure it covers is a per-process event: the emulated
- * part faulted on an instruction this emulator does not model, or one transfer
- * was abandoned mid-flight under host contention. A fresh process is a fresh
- * draw, and a row that comes up unmeasurable three times running is telling you
- * something real — which is then written down in those words.
+ * part faulted on an instruction this emulator does not model, or a session died
+ * with nothing to say for itself. A fresh process is a fresh draw, and a row that
+ * comes up unmeasurable three times running is telling you something real — which
+ * is then written down in those words.
+ *
+ * IT CANNOT HIDE A LOST REPLY. "One transfer abandoned mid-flight under host
+ * contention" used to be listed here as a cause; it was the emulator's USB/IP
+ * server dropping replies it had computed (TESTING.md sec.9.7), and a fresh
+ * process "fixed" it by starting with no orphaned writer. Every process a row
+ * starts is now audited by `RowEmulators`, discarded attempts included, so an
+ * attempt thrown away because a reply went missing fails the row as an
+ * `InfrastructureDefect` instead of being re-measured into silence.
  */
 export const PROBE_ATTEMPTS = Number(process.env.SEEK_EMU_PROBE_ATTEMPTS ?? '3');
 
@@ -128,13 +140,61 @@ export function scratchFile(name: string): string {
  * does over a real transport, not a routine update.
  *
  * A firmware that could not be measured is recorded with a `gap` carrying the
- * reason. The suite then runs it under `test.fails`, so the gap is a TRACKED
- * EXPECTATION: it stays green while it is still broken, and turns the suite RED
- * the day it starts working, which is the prompt to promote it.
+ * reason, and the gap is a TRACKED EXPECTATION with three outcomes, each asserted
+ * explicitly by `assertRecordedGap()` below:
+ *
+ *   - the same gap, for the same recorded reason  -> green;
+ *   - no gap any more                              -> RED: promote the row;
+ *   - a different reason, a timeout, an infrastructure defect, anything else
+ *                                                  -> RED.
+ *
+ * WHY NOT `test.fails`, WHICH IS WHAT THIS USED TO BE. `test.fails` passes on ANY
+ * throw, so it could not tell "the gap is still there" from "the row hung for 900
+ * s and vitest killed it". It did exactly that on 2026-09-22: a known-gap row hit
+ * its timeout because the emulator's USB/IP server was dropping replies, the
+ * timeout was counted as that row's expected failure, and only the leaked-emulator
+ * check noticed anything at all (TESTING.md sec.9.7). A gap row is now an ordinary
+ * test that measures the row exactly as the regenerator does and asserts the
+ * SPECIFIC recorded gap; the ratchet (a closed gap forces promotion) is kept, and
+ * the escape hatch is gone.
  */
 
 export interface KnownGap {
   readonly reason: string;
+}
+
+/**
+ * The gap contract, shared by both tiers. `measured` is the gap the regenerator
+ * WOULD record for this run — derived by the same code — and `pinned` is the one in
+ * the expectations file.
+ */
+export function assertRecordedGap(
+  entryId: string,
+  measured: KnownGap | null,
+  pinned: KnownGap | null,
+): void {
+  if (pinned === null) {
+    if (measured !== null) {
+      throw new Error(
+        `${entryId} is pinned as fully measured, and this run could not measure it: ` +
+          measured.reason,
+      );
+    }
+    return;
+  }
+  if (measured === null) {
+    /* THE RATCHET. Red on purpose: the row is better than its pin says. */
+    throw new Error(
+      `${entryId} was a known gap (${pinned.reason}) and is now fully measured — ` +
+        'regenerate the expectations and promote it',
+    );
+  }
+  if (measured.reason !== pinned.reason) {
+    throw new Error(
+      `${entryId}: the recorded gap CHANGED.\n  pinned:   ${pinned.reason}\n` +
+        `  measured: ${measured.reason}`,
+    );
+  }
 }
 
 export interface ExpectationFile<T> {
@@ -174,6 +234,13 @@ export interface SummaryRow {
   readonly status: 'supported' | 'known-gap' | 'failed';
   readonly detail: string;
   readonly seconds: number;
+  /** The audited delivery of every emulator process this row started. */
+  readonly delivery: {
+    readonly emulators: number;
+    readonly delivered: number;
+    readonly received: number;
+    readonly dropped: number;
+  };
 }
 
 const rows: SummaryRow[] = [];
@@ -212,6 +279,16 @@ export function printMatrix(title: string): void {
   out.push(
     `${'TOTAL'.padEnd(20)}  ${String(ok).padStart(9)}  ${String(gap).padStart(9)}  ` +
       String(bad).padStart(6),
+  );
+  /* THE DELIVERY LINE. Every emulator process of every row, audited against the
+   * client's own count; `dropped` is the number that was 172 on 2026-09-22. */
+  const sum = (k: 'emulators' | 'delivered' | 'received' | 'dropped'): number =>
+    rows.reduce((n, r) => n + r.delivery[k], 0);
+  out.push(
+    `delivery: ${String(sum('emulators'))} emulator process(es) audited; ` +
+      `${String(sum('delivered'))} repl(ies) delivered, ${String(sum('received'))} received ` +
+      `by the client, ${String(sum('dropped'))} dropped; slowest row ` +
+      `${Math.max(...rows.map((r) => r.seconds)).toFixed(1)}s`,
   );
   out.push('');
   for (const row of [...rows].sort((a, b) => b.seconds - a.seconds)) {

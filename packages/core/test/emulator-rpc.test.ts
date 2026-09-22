@@ -54,41 +54,35 @@
  * a retry that changed a recorded value would make this file a story about the
  * retry.
  *
- * AND THE CONFIGURATION IS PART OF THE CLAIM. All of that is `vitest run
- * --project core` with SEEK_EMU_TIER2=none — these suites alone. Six such runs,
- * 306 row-measurements, zero divergence. Run them alongside the rest of the
- * repository's suite (`npm run check`, or a bare `vitest run`) and about ONE ROW
- * IN FIFTY-ONE wedges: five failing rows over four such runs, a DIFFERENT row
- * every time. The signature never varies — `device stalled status IN
- * bRequest=11` on every re-import from some point on, the row costs 180–420 s
- * instead of 4, and its commands read `no-answer`. `transport.open()` is the only
- * thing that clears a wedged control endpoint, and it is the request being
- * stalled, so it never recovers.
+ * AND THE CONFIGURATION WAS PART OF THE CLAIM, UNTIL THE LAST CAUSE WAS FOUND.
+ * All of that was `vitest run --project core` with tier 2 off. Run alongside the
+ * rest of the repository's suite, about one row in fifty-one used to go quiet for
+ * minutes and read `no-answer`. That was not the 5 s deadline and not the firmware:
+ * the emulator's USB/IP server shared ONE completion queue between sessions, the
+ * next session's writer could take the old writer's `quit`, and the orphaned writer
+ * then dropped replies the device had computed in 2 ms (TESTING.md sec.9.7; FW-V1
+ * Phase 17). FW-V1 now gives every session its own queue (Phase 18), and this file
+ * now proves, per row, that nothing was lost:
  *
- * THAT LAST ONE IS NOT THE EMULATOR'S CLOCK OR ITS TEARDOWN — both were fixed and
- * measured. It is the coupling neither side may remove: three orders of magnitude
- * slower than silicon, against `WebUsbTransport`'s own 5 s wall-clock deadline.
- * Under enough host contention one transfer is abandoned mid-flight and these
- * builds then refuse SET_INTERFACE for the rest of the row. Lengthening that
- * deadline would mean changing the toolkit's real code, which is the one thing
- * this suite must not do. So: `npm run check` does not currently pass, one row at
- * a time, and reading a lone red row against this paragraph is the first thing to
- * do before believing the firmware changed.
+ *   EVERY ROW IS AUDITED. Each emulator process a row starts — re-measures included
+ *   — is stopped with SIGTERM, prints its delivery ledger, and `RowEmulators`
+ *   compares it with what the client received. A dropped reply, a mismatch, or a
+ *   transfer left unanswered by a live emulator throws `InfrastructureDefect`,
+ *   which is never recorded and never classified as firmware silence.
  *
- * WHAT IS STILL LOAD-SENSITIVE IN PRINCIPLE. The emulator runs three orders of
- * magnitude slower than silicon and `WebUsbTransport` applies a 5 s wall-clock
- * deadline per transfer — the toolkit's own, deliberately unchanged. Nothing
- * measured here comes near it any more, but that pairing is the one remaining
- * route by which host speed could reach a result, so read a lone red row against
- * it before believing the firmware changed. FW-V1 docs/EMULATOR.md sec.13.8.
+ *   NO ROW RUNS UNDER `test.fails`. A known gap asserts its SPECIFIC recorded
+ *   reason (`assertRecordedGap`), so a timeout or an infrastructure error fails a
+ *   gap row exactly as it fails any other, and a gap that closes still forces
+ *   promotion.
  * ==================================================================== */
 
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { Emulator, liveEmulatorCount } from './emulator/harness.js';
+import { liveEmulatorCount, RowEmulators } from './emulator/harness.js';
 import { probeTier1, ProbeUnmeasurable, type Tier1Result } from './emulator/probe.js';
 import {
   announceSkip,
+  assertRecordedGap,
   BOOT_TIMEOUT_MS,
   EMU_DIR,
   ENTRIES,
@@ -184,6 +178,119 @@ function gapReason(error: unknown): string {
   return text.replace(/\s*\n\s*/g, ' | ').trim();
 }
 
+/**
+ * One row, measured — EXACTLY what the regenerator records, gap included.
+ *
+ * Both modes call this, so the gap an assertion compares against the pin is derived
+ * by the same code that wrote the pin. It never throws for a measurement that could
+ * not be made: that becomes the row's gap, with its reason, as it always has. What
+ * it does not decide is whether the instrument was sound — `RowEmulators` audits
+ * that afterwards, and an infrastructure defect never reaches the record.
+ */
+async function measureRow(
+  entry: (typeof ENTRIES)[number],
+  row: RowEmulators,
+): Promise<RpcExpectation & { gap: KnownGap | null }> {
+  try {
+    /* RE-MEASURED FROM A FRESH EMULATOR, NEVER RETRIED IN PLACE.
+     *
+     * `ProbeUnmeasurable` means the camera stopped being there — the emulator's
+     * own run ended, or the session died and three fresh imports did not bring it
+     * back. Retrying the remaining commands on the corpse would record this
+     * machine's load as the firmware's behaviour. So the whole row is taken again
+     * from a new process, and NOTHING about the discarded attempt is recorded — but
+     * it IS audited: every process goes through `RowEmulators`, so an attempt that
+     * was discarded because replies went missing fails the row as infrastructure
+     * instead of being re-measured into silence.
+     */
+    let got: Tier1Result | null = null;
+    const unmeasurable: string[] = [];
+    for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+      const truth = scratchFile(`t1_${entry.id}_a${String(attempt)}.bin`);
+      const emu = await row.start(EMU_DIR!, {
+        entryId: entry.id,
+        fillSeed: FILL_SEED,
+        fillScope: FILL_SCOPE,
+        flashOut: truth,
+        readyTimeoutMs: BOOT_TIMEOUT_MS,
+      });
+      try {
+        got = await probeTier1(emu, {
+          groundTruthPath: truth,
+          urbTimeoutMs: URB_TIMEOUT_MS,
+        });
+        break;
+      } catch (error) {
+        if (!(error instanceof ProbeUnmeasurable)) throw error;
+        unmeasurable.push(
+          `attempt ${String(attempt)}: ${error.message}` +
+            (error.emulatorStopReason === null ? '' : ` [${error.emulatorStopReason}]`),
+        );
+        await emu.stop();
+        /* A FAULT IS NOT RE-DRAWN. `worthRetrying` is false when the emulator
+         * stopped on an instruction it cannot execute, which it will reach again at
+         * the same point on a fresh process. Only a session that died with nothing
+         * to say for itself gets another go. */
+        if (!error.worthRetrying) break;
+      }
+    }
+    if (got === null) {
+      throw new ProbeUnmeasurable(
+        `not measurable in ${String(unmeasurable.length)} attempt(s) from fresh ` +
+          `emulators:\n  ${unmeasurable.join('\n  ')}`,
+      );
+    }
+    const now = summarize(got, entry);
+    /* THE GAP IS DERIVED FROM THE MEASUREMENT, NEVER DECLARED BY HAND.
+     *
+     * A firmware the selector map reaches NOTHING on is the gap this tier is
+     * about: `modern-4x` says in its own summary that it covers the Compact line,
+     * and on these builds BeginFirmwareUpgrade stalls on every one of the 63
+     * subcommands, so the dump path cannot read them at all. */
+    return {
+      ...now,
+      gap:
+        now.windowsConfirmed.length === 0
+          ? {
+              reason:
+                `the selector map reaches no window: ${String(now.windowsRefused.length)} ` +
+                `of 63 subcommands refused (BeginFirmwareUpgrade -> ` +
+                `${now.commands.BeginFirmwareUpgrade ?? '?'})`,
+            }
+          : null,
+    };
+  } catch (error) {
+    /* A measurement that could not be made, recorded as the gap it is. */
+    return {
+      kind: entry.kind,
+      family: entry.family,
+      product: entry.product,
+      version: entry.version,
+      identity: {
+        vendorId: '',
+        productId: '',
+        manufacturerName: null,
+        productName: null,
+        serialNumber: null,
+      },
+      chipIdHex: null,
+      commands: {},
+      controlInBytes: {},
+      windowsConfirmed: [],
+      windowsMisplaced: [],
+      windowsMisplacedTo: {},
+      windowsRefused: [],
+      auth: {
+        plainAccepted: false,
+        authAccepted: false,
+        wrongTokenAccepted: false,
+        subcmd: 5,
+      },
+      gap: { reason: gapReason(error).slice(0, 300) },
+    };
+  }
+}
+
 /* ---- the suite ------------------------------------------------------- */
 
 if (EMU_DIR === null) announceSkip('emulator RPC surface (tier 1)');
@@ -198,8 +305,8 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
         note:
           'Per-firmware RPC surface, measured over USB/IP against the FW-V1 emulator. ' +
           'Generated by `node scripts/update-emulator-expectations.mjs`; never edit by hand. ' +
-          'A `gap` records a firmware that could not be measured and why; the suite runs ' +
-          'those under test.fails, so one that starts working turns the suite red.',
+          'A `gap` records a firmware that could not be measured and why; the suite asserts ' +
+          'that exact reason, so one that starts working (or changes) turns the suite red.',
         generatedBy: 'packages/core/test/emulator-rpc.test.ts (SEEK_EMU_REGEN=1)',
         fill: { seed: FILL_SEED, scope: FILL_SCOPE },
         readChunk: 64,
@@ -227,125 +334,51 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
 
   for (const entry of ENTRIES) {
     const want = pinned?.firmwares[entry.id] ?? null;
-    const gap = want?.gap ?? null;
+    const pinnedGap = want?.gap ?? null;
     const title =
-      gap === null
+      pinnedGap === null
         ? `${entry.id} — identity, chip id, selector map, auth`
-        : `${entry.id} — KNOWN GAP: ${gap.reason}`;
+        : `${entry.id} — KNOWN GAP: ${pinnedGap.reason}`;
 
-    /* A known gap is a TRACKED EXPECTATION, not a skip: `test.fails` keeps the
-     * suite green while the gap is real and turns it red the moment it closes. */
-    const run = REGENERATING ? it.concurrent : gap === null ? it.concurrent : it.concurrent.fails;
-
-    run(title, { timeout: TIER1_TIMEOUT_MS }, async () => {
+    /* EVERY ROW IS AN ORDINARY TEST — a known gap included. See `assertRecordedGap`
+     * in emulator/suite.ts for why `test.fails` is gone and what replaced it. */
+    it.concurrent(title, { timeout: TIER1_TIMEOUT_MS }, async () => {
       const started = Date.now();
-      let status: 'supported' | 'known-gap' | 'failed' = gap === null ? 'supported' : 'known-gap';
+      const row = new RowEmulators(entry.id);
+      let status: 'supported' | 'known-gap' | 'failed' = 'failed';
       let detail = '';
-      let emu: Emulator | null = null;
       try {
-        /* RE-MEASURED FROM A FRESH EMULATOR, NEVER RETRIED IN PLACE.
-         *
-         * `ProbeUnmeasurable` means the camera stopped being there — the
-         * emulator's own run ended, or the session died and three fresh imports
-         * did not bring it back. Retrying the remaining commands on the corpse
-         * would record this machine's load as the firmware's behaviour, which is
-         * exactly the flake this replaced. So the whole row is taken again from
-         * a new process, and NOTHING about the discarded attempt is recorded:
-         * this is not a retry-until-green, it is a refusal to write down a
-         * measurement that was not made. A row that is unmeasurable every time
-         * becomes a gap saying so.
-         */
-        let got: Tier1Result | null = null;
-        const unmeasurable: string[] = [];
-        for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
-          const truth = scratchFile(`t1_${entry.id}_a${String(attempt)}.bin`);
-          emu = await Emulator.start(EMU_DIR!, {
-            entryId: entry.id,
-            fillSeed: FILL_SEED,
-            fillScope: FILL_SCOPE,
-            flashOut: truth,
-            readyTimeoutMs: BOOT_TIMEOUT_MS,
-          });
-          try {
-            got = await probeTier1(emu, {
-              groundTruthPath: truth,
-              urbTimeoutMs: URB_TIMEOUT_MS,
-            });
-            break;
-          } catch (error) {
-            if (!(error instanceof ProbeUnmeasurable)) throw error;
-            unmeasurable.push(
-              `attempt ${String(attempt)}: ${error.message}` +
-                (error.emulatorStopReason === null ? '' : ` [${error.emulatorStopReason}]`),
-            );
-            await emu.stop();
-            emu = null;
-            /* A FAULT IS NOT RE-DRAWN. `worthRetrying` is false when the
-             * emulator stopped on an instruction it cannot execute, which it
-             * will reach again at the same point on a fresh process — three
-             * attempts would spend fifteen minutes reproducing a result already
-             * in hand. Only a session that died with nothing to say for itself
-             * gets another go. */
-            if (!error.worthRetrying) break;
-          }
-        }
-        if (got === null) {
-          throw new ProbeUnmeasurable(
-            `not measurable in ${String(unmeasurable.length)} attempt(s) from fresh ` +
-              `emulators:\n  ${unmeasurable.join('\n  ')}`,
-          );
-        }
-        const now = summarize(got, entry);
+        const now = await measureRow(entry, row);
+        /* THE DELIVERY AUDIT COMES FIRST, BEFORE ANYTHING IS RECORDED OR COMPARED.
+         * A row whose emulator lost a reply has measured the transport, not the
+         * firmware, so neither the regenerator nor the assertions may see it. */
+        await row.assertDelivery();
         detail =
-          `${String(now.windowsConfirmed.length)} windows confirmed, ` +
-          `${String(now.windowsMisplaced.length)} misplaced, ` +
-          `${String(now.windowsRefused.length)} refused`;
+          now.gap === null
+            ? `${String(now.windowsConfirmed.length)} windows confirmed, ` +
+              `${String(now.windowsMisplaced.length)} misplaced, ` +
+              `${String(now.windowsRefused.length)} refused`
+            : now.gap.reason;
 
         if (REGENERATING) {
-          /* THE GAP IS DERIVED FROM THE MEASUREMENT, NEVER DECLARED BY HAND.
-           *
-           * A firmware the selector map reaches NOTHING on is the gap this tier
-           * is about: `modern-4x` says in its own summary that it covers the
-           * Compact line, and on these builds BeginFirmwareUpgrade stalls on
-           * every one of the 63 subcommands, so the dump path cannot read them
-           * at all. Recording that as a tracked expectation is the honest form:
-           * it stays green while it is true and goes red the day a profile
-           * change makes one of them readable. */
-          measured[entry.id] = {
-            ...now,
-            gap:
-              now.windowsConfirmed.length === 0
-                ? {
-                    reason:
-                      `the selector map reaches no window: ${String(now.windowsRefused.length)} ` +
-                      `of 63 subcommands refused (BeginFirmwareUpgrade -> ` +
-                      `${now.commands.BeginFirmwareUpgrade ?? '?'})`,
-                  }
-                : null,
-          };
-          return;
-        }
-
-        /* A KNOWN GAP ASSERTS ONE THING: THE GAP IS STILL THERE.
-         *
-         * Nothing else, on purpose. If it also re-asserted the pinned numbers,
-         * a firmware that STARTED working would fail those first and
-         * `test.fails` would pass on that failure — a ratchet that never fires.
-         * So the only claim here is `at least one window is readable`: false
-         * today (the test throws, `test.fails` is green), and the day it becomes
-         * true the test passes, `test.fails` goes RED, and that red is the
-         * prompt to regenerate and promote the row. */
-        if (gap !== null) {
-          expect(
-            now.windowsConfirmed.length,
-            `${entry.id} was a known gap (${gap.reason}) and is now readable — ` +
-              'regenerate the expectations and promote it',
-          ).toBeGreaterThan(0);
+          measured[entry.id] = now;
+          status = now.gap === null ? 'supported' : 'known-gap';
           return;
         }
 
         expect(want, `${entry.id} is not in ${RPC_EXPECTATIONS}`).not.toBeNull();
         if (want === null) return;
+
+        /* ---- the gap, if any: the SAME one, for the SAME reason ---- */
+        try {
+          assertRecordedGap(entry.id, now.gap, pinnedGap);
+        } catch (error) {
+          throw new Error(
+            `${error instanceof Error ? error.message : String(error)}\n` +
+              `--- emulator log ---\n${row.lastLog()}`,
+            { cause: error },
+          );
+        }
 
         /* ---- identity, read off the wire ---- */
         expect(now.identity, 'USB identity').toEqual(want.identity);
@@ -374,45 +407,13 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
 
         /* ---- the authenticated channel, as an observation ---- */
         expect(now.auth, 'auth-token accept/refuse on a protected bank').toEqual(want.auth);
+        status = now.gap === null ? 'supported' : 'known-gap';
       } catch (error) {
-        status = gap === null ? 'failed' : 'known-gap';
+        status = 'failed';
         detail = gapReason(error);
-        if (REGENERATING) {
-          measured[entry.id] = {
-            kind: entry.kind,
-            family: entry.family,
-            product: entry.product,
-            version: entry.version,
-            identity: {
-              vendorId: '',
-              productId: '',
-              manufacturerName: null,
-              productName: null,
-              serialNumber: null,
-            },
-            chipIdHex: null,
-            commands: {},
-            controlInBytes: {},
-            windowsConfirmed: [],
-            windowsMisplaced: [],
-            windowsMisplacedTo: {},
-            windowsRefused: [],
-            auth: {
-              plainAccepted: false,
-              authAccepted: false,
-              wrongTokenAccepted: false,
-              subcmd: 5,
-            },
-            gap: { reason: detail.slice(0, 300) },
-          };
-          return;
-        }
-        if (emu !== null) {
-          const log = emu.log(25);
-          throw new Error(`${detail}\n--- emulator log ---\n${log}`, { cause: error });
-        }
         throw error;
       } finally {
+        await row.finish();
         record({
           entryId: entry.id,
           family: entry.family,
@@ -422,8 +423,8 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
           status,
           detail,
           seconds: (Date.now() - started) / 1000,
+          delivery: row.totals(),
         });
-        await emu?.stop();
       }
     });
   }

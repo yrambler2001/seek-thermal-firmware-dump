@@ -66,6 +66,57 @@ export class UsbIpStall extends UsbIpError {
   }
 }
 
+/**
+ * What the CLIENT side of every USB/IP session to one emulator actually saw.
+ *
+ * WHY IT EXISTS. A reply the server computed and then lost is indistinguishable, on
+ * the wire, from a device that did not answer: the transfer times out either way,
+ * and the probe used to write `no-answer` down as a fact about the firmware. That is
+ * exactly what an orphaned writer thread in the emulator's USB/IP server did, 172
+ * times in one suite run (FW-V1 docs/EMULATOR_CAMPAIGN_LOG.md, Phase 17). The server
+ * now keeps a delivery ledger and prints it on exit; this is the other half, and the
+ * harness compares the two (`Emulator.auditDelivery`). One ledger is shared by every
+ * session a test opens against one emulator, re-imports included.
+ */
+export interface DeliveryLedgerSnapshot {
+  readonly sessions: number;
+  readonly urbsSubmitted: number;
+  readonly unlinksSent: number;
+  readonly repliesReceived: number;
+  readonly repliesUnmatched: number;
+  readonly deadlinesExpired: number;
+  readonly urbsAbandoned: number;
+}
+
+export class DeliveryLedger {
+  /** Successful OP_REQ_IMPORTs. */
+  sessions = 0;
+  /** CMD_SUBMITs sent. */
+  urbsSubmitted = 0;
+  /** CMD_UNLINKs sent — only ever after a client-side URB deadline expired. */
+  unlinksSent = 0;
+  /** RET_SUBMIT and RET_UNLINK PDUs read off the wire. */
+  repliesReceived = 0;
+  /** ... of which nobody was waiting for any more: the client had given up first. */
+  repliesUnmatched = 0;
+  /** Client-side deadlines that expired on a URB or an unlink. */
+  deadlinesExpired = 0;
+  /** Transfers still unanswered when their session was closed. */
+  urbsAbandoned = 0;
+
+  snapshot(): DeliveryLedgerSnapshot {
+    return {
+      sessions: this.sessions,
+      urbsSubmitted: this.urbsSubmitted,
+      unlinksSent: this.unlinksSent,
+      repliesReceived: this.repliesReceived,
+      repliesUnmatched: this.repliesUnmatched,
+      deadlinesExpired: this.deadlinesExpired,
+      urbsAbandoned: this.urbsAbandoned,
+    };
+  }
+}
+
 export interface UsbIpDevice {
   readonly path: string;
   readonly busid: string;
@@ -230,10 +281,13 @@ export class UsbIpSession {
   private readonly waiting = new Map<number, (r: { status: number; payload: Buffer }) => void>();
   private seq = 0;
   private stopped = false;
+  private readonly ledger: DeliveryLedger;
 
-  private constructor(f: Framed, device: UsbIpDevice) {
+  private constructor(f: Framed, device: UsbIpDevice, ledger: DeliveryLedger) {
     this.f = f;
     this.device = device;
+    this.ledger = ledger;
+    ledger.sessions++;
     this.devid = (device.busnum << 16) | device.devnum;
     void this.pump().catch(() => {
       this.stopped = true;
@@ -245,6 +299,7 @@ export class UsbIpSession {
     port: number,
     busid: string,
     timeoutMs = 5000,
+    ledger: DeliveryLedger = new DeliveryLedger(),
   ): Promise<UsbIpSession> {
     const f = await open(host, port, timeoutMs);
     const b = Buffer.alloc(32);
@@ -255,7 +310,7 @@ export class UsbIpSession {
       f.destroy();
       throw new UsbIpError(`OP_REQ_IMPORT ${busid} refused`);
     }
-    return new UsbIpSession(f, parseDevice(await f.read(DEVICE_RECORD)));
+    return new UsbIpSession(f, parseDevice(await f.read(DEVICE_RECORD)), ledger);
   }
 
   private async pump(): Promise<void> {
@@ -274,10 +329,13 @@ export class UsbIpSession {
       } else {
         status = head.readInt32BE(20);
       }
+      this.ledger.repliesReceived++;
       const w = this.waiting.get(seqnum);
       if (w) {
         this.waiting.delete(seqnum);
         w({ status, payload });
+      } else {
+        this.ledger.repliesUnmatched++;
       }
     }
   }
@@ -293,6 +351,7 @@ export class UsbIpSession {
     head.writeInt32BE(dirIn ? length : data.length, 24);
     if (setup) setup.copy(head, 40);
     this.f.write(dirIn ? head : Buffer.concat([head, data]));
+    this.ledger.urbsSubmitted++;
     return seq;
   }
 
@@ -304,6 +363,7 @@ export class UsbIpSession {
     head.writeUInt32BE(this.devid, 8);
     head.writeUInt32BE(victim, 20);
     this.f.write(head);
+    this.ledger.unlinksSent++;
     return seq;
   }
 
@@ -317,6 +377,7 @@ export class UsbIpSession {
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           this.waiting.delete(seq);
+          this.ledger.deadlinesExpired++;
           reject(new UsbIpTimeout(`URB ${String(seq)} timed out after ${String(timeoutMs)} ms`));
         }, timeoutMs);
       }
@@ -375,6 +436,10 @@ export class UsbIpSession {
 
   close(): void {
     this.stopped = true;
+    /* A transfer still waiting here was ABANDONED: its caller had already given up
+     * (a transport-level deadline) or the camera went away. Counted, because on a
+     * live emulator it means a reply was not waited for. */
+    this.ledger.urbsAbandoned += this.waiting.size;
     for (const [, resolve] of this.waiting) resolve({ status: -108, payload: Buffer.alloc(0) });
     this.waiting.clear();
     this.f.destroy();

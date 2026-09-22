@@ -14,6 +14,15 @@
  * fill report; the harness waits for that line and then for `OP_REQ_DEVLIST` to
  * answer. A firmware that never gets that far fails with the emulator's own
  * stderr attached, which is the diagnosis.
+ *
+ * THE DELIVERY RULE. A reply the emulator produced and then lost looks, from
+ * this side of the socket, exactly like a camera that did not answer — and for a
+ * whole suite run it was recorded as one (FW-V1 Phase 17: 172 replies dropped by
+ * orphaned writer threads). So every emulator is stopped with SIGTERM, which makes
+ * it print its delivery ledger (`---USBIP-SUMMARY---`), and `auditDelivery()`
+ * compares that ledger with what the client side counted. Any dropped reply, any
+ * mismatch, any ledger missing is an `InfrastructureDefect`: it fails the row,
+ * gap or not, and is never written down as firmware behaviour.
  * ==================================================================== */
 
 import { type ChildProcess, spawn } from 'node:child_process';
@@ -21,7 +30,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import path from 'node:path';
 
-import { devlist } from './usbip-client.js';
+import { DeliveryLedger, type DeliveryLedgerSnapshot, devlist } from './usbip-client.js';
 import { UsbIpWebUsbDevice, type UsbIpWebUsbOptions } from './webusb-over-usbip.js';
 
 /* ---- locating the emulator ----------------------------------------- */
@@ -146,6 +155,68 @@ export interface ReadyLine {
   readonly fill: FillReport | null;
 }
 
+/** The emulator's own delivery ledger: `seek_emu.py --usbip`'s `---USBIP-SUMMARY---`
+ *  line, printed once every writer thread has been joined (FW-V1 seekemu/usbip.py,
+ *  `Bridge.accounting()`). */
+export interface DeliverySummary {
+  readonly reason: string;
+  readonly sessions: number;
+  readonly balanced: boolean;
+  readonly completions: {
+    readonly produced: number;
+    readonly delivered: number;
+    readonly dropped: number;
+    readonly unresolved: number;
+  };
+  readonly dropped_by_reason: Readonly<Record<string, number>>;
+  readonly urbs: {
+    readonly submitted: number;
+    readonly answered: number;
+    readonly unlinked: number;
+    readonly dropped: number;
+    readonly outstanding: number;
+  };
+  readonly writers_alive: number;
+  readonly writers_stuck: number;
+}
+
+/** One emulator process's delivery, audited. `violations` empty means every reply
+ *  the device produced reached the client and nothing was left unanswered. */
+export interface DeliveryAudit {
+  readonly entryId: string;
+  readonly violations: readonly string[];
+  readonly server: DeliverySummary | null;
+  readonly client: DeliveryLedgerSnapshot;
+  /** True when the emulator exited on its own (a Unicorn fault) before the harness
+   *  stopped it — the one case in which an unanswered transfer is explained. */
+  readonly diedOnItsOwn: boolean;
+}
+
+/**
+ * A defect in the measuring instrument, not a property of the firmware.
+ *
+ * NEVER RECORDED, NEVER ABSORBED. It is thrown after the row's emulators have been
+ * stopped and audited, it is not a `ProbeUnmeasurable` (so no re-measure hides it),
+ * the regenerator does not turn it into a gap, and no row runs under `test.fails` —
+ * so it fails the suite whichever row it happens on.
+ */
+export class InfrastructureDefect extends Error {
+  readonly audits: readonly DeliveryAudit[];
+  constructor(entryId: string, audits: readonly DeliveryAudit[], cause?: unknown) {
+    const lines = audits.flatMap((a, i) =>
+      a.violations.map((v) => `  emulator ${String(i + 1)} of ${String(audits.length)}: ${v}`),
+    );
+    super(
+      `INFRASTRUCTURE DEFECT on ${entryId} — the emulator/USB-IP transport lost or ` +
+        `mis-delivered replies, so nothing this row measured is a statement about the ` +
+        `firmware:\n${lines.join('\n')}`,
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = 'InfrastructureDefect';
+    this.audits = audits;
+  }
+}
+
 export interface StartOptions {
   readonly entryId: string;
   /** `--fill-erased SEED`; omit to serve the vendored bytes unchanged. */
@@ -158,18 +229,34 @@ export interface StartOptions {
   readonly urbTimeoutMs?: number;
 }
 
+/** How long a SIGTERM'd emulator gets to join its threads and print its ledger. A
+ *  backstop, not a wait: a healthy one exits in well under a second. */
+const STOP_GRACE_MS = 30_000;
+
 export class Emulator {
   readonly entryId: string;
   readonly ready: ReadyLine;
+  /** Everything the client side sent and received, over every session to this emulator. */
+  readonly ledger = new DeliveryLedger();
   private readonly child: ChildProcess;
   private readonly logLines: string[];
+  private readonly closed: Promise<void>;
   private stopped = false;
+  private killed = false;
+  private diedOnItsOwn = false;
 
-  private constructor(entryId: string, child: ChildProcess, ready: ReadyLine, log: string[]) {
+  private constructor(
+    entryId: string,
+    child: ChildProcess,
+    ready: ReadyLine,
+    log: string[],
+    closed: Promise<void>,
+  ) {
     this.entryId = entryId;
     this.child = child;
     this.ready = ready;
     this.logLines = log;
+    this.closed = closed;
   }
 
   /** The emulator's own output. Attached to every failure, because the reason a
@@ -204,25 +291,135 @@ export class Emulator {
   }
 
   /**
-   * The stop reason, after giving the child's stdout a moment to arrive.
+   * The stop reason, once the child's stdout has been read to the end.
    *
    * THE RACE IS REAL AND IT COSTS FIVE MINUTES A ROW WHEN IT IS LOST. Node sets
    * `exitCode` on the `exit` event, but the final stdout chunks — which is
    * where `stopped:` and `fault:` live — can still be in flight. A caller that
    * reads `stopReason()` the instant it notices the process is gone gets null,
    * concludes the death was a random session loss, and re-measures a
-   * deterministic Unicorn fault from scratch. Waiting a beat for the pipe to
-   * drain is the difference between "this firmware faults here, recorded" and
-   * three identical five-minute reruns.
+   * deterministic Unicorn fault from scratch.
+   *
+   * It used to wait a fixed 750 ms for the pipe to drain, which is a guess about
+   * host load. It now waits for the child's `close` event — every stdio stream at
+   * end-of-file — which is the actual condition, bounded only as a backstop.
    */
-  async settledStopReason(waitMs = 750): Promise<string | null> {
-    const deadline = Date.now() + waitMs;
-    for (;;) {
-      const reason = this.stopReason();
-      if (reason !== null) return reason;
-      if (this.alive || Date.now() >= deadline) return null;
-      await new Promise((resolve) => setTimeout(resolve, 50));
+  async settledStopReason(backstopMs = 15_000): Promise<string | null> {
+    const reason = this.stopReason();
+    if (reason !== null || this.alive) return reason;
+    await Promise.race([this.closed, new Promise((resolve) => setTimeout(resolve, backstopMs))]);
+    return this.stopReason();
+  }
+
+  /** The emulator's `---USBIP-SUMMARY---` delivery ledger, once it has exited. */
+  deliverySummary(): DeliverySummary | null {
+    for (let i = this.logLines.length - 1; i >= 0; i--) {
+      const line = this.logLines[i] ?? '';
+      if (line.startsWith('---USBIP-SUMMARY--- ')) {
+        try {
+          return JSON.parse(line.slice('---USBIP-SUMMARY--- '.length)) as DeliverySummary;
+        } catch {
+          return null;
+        }
+      }
     }
+    return null;
+  }
+
+  /**
+   * Did every reply the emulator produced reach this client? Call after `stop()`.
+   *
+   * The rules, and why each is a defect of the instrument rather than a finding:
+   *
+   *  - the ledger must exist: an emulator that did not print it was killed or
+   *    crashed, and nothing can be said about what it delivered;
+   *  - `dropped` must be 0 and the ledger must balance: a reply the device
+   *    produced and the client never got is what Phase 17 recorded as `no-answer`;
+   *  - no writer thread may outlive its session;
+   *  - what the server says it delivered must equal what the client read, and
+   *    nothing may arrive after the client stopped waiting for it;
+   *  - and, unless the emulator died on its own (a Unicorn fault, which the probe
+   *    records as such), nothing may be left unanswered: no URB outstanding at
+   *    exit, no transfer abandoned by the client, no client deadline expired. The
+   *    device answers every request in under 100 ms (Phase 17: slowest of 892,004
+   *    was 68 ms), so a deadline that expired on a live emulator means the answer
+   *    was not waited for, and whatever was recorded instead is not the firmware's.
+   */
+  auditDelivery(): DeliveryAudit {
+    const server = this.deliverySummary();
+    const client = this.ledger.snapshot();
+    const v: string[] = [];
+    if (server === null) {
+      v.push(
+        'the emulator exited without printing its ---USBIP-SUMMARY--- delivery ledger' +
+          (this.killed ? ' (it did not stop on SIGTERM and had to be killed)' : ''),
+      );
+    } else {
+      const c = server.completions;
+      if (c.dropped > 0) {
+        v.push(
+          `the emulator DROPPED ${String(c.dropped)} of ${String(c.produced)} repl(ies) it ` +
+            `produced: ${JSON.stringify(server.dropped_by_reason)}`,
+        );
+      }
+      if (!server.balanced || c.unresolved !== 0) {
+        v.push(
+          `the emulator's ledger does not balance: ${String(c.unresolved)} repl(ies) ` +
+            'neither delivered nor counted as dropped',
+        );
+      }
+      if (server.writers_alive > 0 || server.writers_stuck > 0) {
+        v.push(
+          `${String(server.writers_alive)} writer thread(s) outlived their session ` +
+            `(${String(server.writers_stuck)} stuck at teardown)`,
+        );
+      }
+      if (client.repliesReceived !== c.delivered) {
+        v.push(
+          `the emulator delivered ${String(c.delivered)} repl(ies) and the client read ` +
+            String(client.repliesReceived),
+        );
+      }
+      if (client.sessions !== server.sessions) {
+        v.push(
+          `the emulator opened ${String(server.sessions)} session(s) and the client saw ` +
+            String(client.sessions),
+        );
+      }
+      if (!this.diedOnItsOwn && server.urbs.outstanding > 0) {
+        v.push(
+          `${String(server.urbs.outstanding)} URB(s) were still unanswered when the harness ` +
+            'stopped a live emulator',
+        );
+      }
+    }
+    if (client.repliesUnmatched > 0) {
+      v.push(
+        `${String(client.repliesUnmatched)} repl(ies) arrived after the client had stopped ` +
+          'waiting for them',
+      );
+    }
+    if (!this.diedOnItsOwn) {
+      if (client.urbsAbandoned > 0) {
+        v.push(
+          `the client closed a session with ${String(client.urbsAbandoned)} transfer(s) ` +
+            'still unanswered by a live emulator',
+        );
+      }
+      if (client.deadlinesExpired > 0) {
+        v.push(
+          `${String(client.deadlinesExpired)} USB/IP deadline(s) expired on the client ` +
+            'against a live emulator',
+        );
+      }
+    }
+    return {
+      entryId: this.entryId,
+      violations: v,
+      server,
+      client,
+      diedOnItsOwn: this.diedOnItsOwn,
+    };
   }
 
   static async start(dir: string, options: StartOptions): Promise<Emulator> {
@@ -277,6 +474,11 @@ export class Emulator {
       env: { ...process.env, PYTHONUNBUFFERED: '1' },
     });
     live.add(child);
+    const closed = new Promise<void>((resolve) => {
+      child.once('close', () => {
+        resolve();
+      });
+    });
 
     const lines: string[] = [];
     const ready = await new Promise<ReadyLine>((resolve, reject) => {
@@ -349,7 +551,7 @@ export class Emulator {
     for (;;) {
       try {
         await devlist('127.0.0.1', ready.port, 15_000);
-        return new Emulator(options.entryId, child, ready, lines);
+        return new Emulator(options.entryId, child, ready, lines, closed);
       } catch (error) {
         if (Date.now() >= deadline || child.exitCode !== null) {
           lastError = error;
@@ -369,25 +571,96 @@ export class Emulator {
 
   /** A `WebUsbDevice` over this emulator, for `new WebUsbTransport(...)`. */
   attach(options: UsbIpWebUsbOptions = {}): Promise<UsbIpWebUsbDevice> {
-    return UsbIpWebUsbDevice.attach('127.0.0.1', this.ready.port, this.ready.busid, options);
+    return UsbIpWebUsbDevice.attach('127.0.0.1', this.ready.port, this.ready.busid, {
+      ...options,
+      ledger: this.ledger,
+    });
   }
 
-  /** Idempotent. Safe on a process that has already died. */
+  /**
+   * Idempotent. Safe on a process that has already died.
+   *
+   * SIGTERM, and then WAIT for the process to finish its own shutdown: the emulator
+   * stops its server, joins every writer thread and only then prints its delivery
+   * ledger, which `auditDelivery()` needs. SIGKILL is the backstop, and an emulator
+   * that needs it fails the audit — it did not stop, so nobody knows what it
+   * delivered.
+   */
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
     live.delete(this.child);
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
-    const gone = new Promise<void>((resolve) => {
-      this.child.once('exit', () => {
-        resolve();
-      });
-    });
+    if (this.child.exitCode !== null || this.child.signalCode !== null) {
+      this.diedOnItsOwn = true;
+      await Promise.race([this.closed, new Promise((resolve) => setTimeout(resolve, 15_000))]);
+      return;
+    }
     this.child.kill('SIGTERM');
     const timer = setTimeout(() => {
+      this.killed = true;
       this.child.kill('SIGKILL');
-    }, 5000);
-    await gone;
+    }, STOP_GRACE_MS);
+    await this.closed;
     clearTimeout(timer);
+  }
+}
+
+/**
+ * Every emulator process one test row starts, stopped and audited together.
+ *
+ * A row may start several — `ProbeUnmeasurable` re-measures from a fresh process —
+ * and every one of them is audited, the discarded attempts included: an attempt
+ * thrown away because replies went missing is exactly the defect that must not
+ * be re-measured into silence.
+ */
+export class RowEmulators {
+  readonly entryId: string;
+  private readonly started: Emulator[] = [];
+  private audits: DeliveryAudit[] | null = null;
+
+  constructor(entryId: string) {
+    this.entryId = entryId;
+  }
+
+  async start(dir: string, options: StartOptions): Promise<Emulator> {
+    const emu = await Emulator.start(dir, options);
+    this.started.push(emu);
+    return emu;
+  }
+
+  /** The last emulator's log, for a failure message. */
+  lastLog(tail = 25): string {
+    return this.started.at(-1)?.log(tail) ?? '(no emulator was started)';
+  }
+
+  /** Stop every emulator this row started and audit each. Idempotent. */
+  async finish(): Promise<readonly DeliveryAudit[]> {
+    if (this.audits !== null) return this.audits;
+    const audits: DeliveryAudit[] = [];
+    for (const emu of this.started) {
+      await emu.stop();
+      audits.push(emu.auditDelivery());
+    }
+    this.audits = audits;
+    return audits;
+  }
+
+  /** Throws `InfrastructureDefect` if any audited emulator lost or mis-delivered a reply. */
+  async assertDelivery(cause?: unknown): Promise<void> {
+    const audits = await this.finish();
+    if (audits.some((a) => a.violations.length > 0)) {
+      throw new InfrastructureDefect(this.entryId, audits, cause);
+    }
+  }
+
+  /** Totals for the summary matrix. */
+  totals(): { emulators: number; delivered: number; received: number; dropped: number } {
+    const audits = this.audits ?? [];
+    return {
+      emulators: audits.length,
+      delivered: audits.reduce((n, a) => n + (a.server?.completions.delivered ?? 0), 0),
+      received: audits.reduce((n, a) => n + a.client.repliesReceived, 0),
+      dropped: audits.reduce((n, a) => n + (a.server?.completions.dropped ?? 0), 0),
+    };
   }
 }

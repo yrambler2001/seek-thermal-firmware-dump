@@ -374,15 +374,17 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
    * The second way a row stops being measurable, and it looks nothing like the
    * first: the emulator is still running and the CAMERA is gone.
    *
-   * `transport.open()` is the only thing that clears a wedged control endpoint,
-   * and on these builds it is itself the request being refused — the emulator
-   * prints `device stalled status IN bRequest=11` on every re-import from some
-   * point on. `WebUsbTransport` treats that refusal as "cannot claim the
-   * interface", falls back to `recipient: 'device'`, and these firmwares do not
-   * answer device-recipient vendor requests, so everything after it reads
-   * `no-answer`. Measured: a row that had answered every command went to
-   * `no-answer` on all eight, GetErrorCode included, with the Python process
-   * still alive and well.
+   * This was written against a symptom — a row that had answered every command
+   * going to `no-answer` on all eight, GetErrorCode included, with the Python
+   * process alive — and it blamed a wedged endpoint, citing `device stalled
+   * status IN bRequest=11` on re-imports. Both halves were wrong (TESTING.md
+   * sec.9.7): that stall is the adapter's `SET_INTERFACE` (sent as
+   * `bmRequestType 0x00`), refused on EVERY import of every row from the first,
+   * and the silence was the emulator's USB/IP server dropping replies. That is
+   * fixed in FW-V1 and every row's delivery is now audited, so a lost reply
+   * fails the row as `InfrastructureDefect` whatever this check concludes. The
+   * check is kept for what it still means: a camera that answered and now does
+   * not, with nothing lost in transit.
    *
    * THREE FRESH IMPORTS BEFORE GIVING UP, and the number is not a tolerance:
    * the emulator serves one USB/IP session at a time and frees it
@@ -430,13 +432,15 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
      *   after a refused arm because there is no armed window to read. Those are
      *   findings and they must survive.
      *
-     *   LOST — one transfer was abandoned mid-flight under host contention,
-     *   against `WebUsbTransport`'s own 5 s deadline and an emulator three
-     *   orders of magnitude off silicon. That is the residual flake: on one run
-     *   a 1.3.0.8 Compact answered GetErrorCode, GetOperationMode,
+     *   LOST — the device answered and the reply never reached the client. On
+     *   one run a 1.3.0.8 Compact answered GetErrorCode, GetOperationMode,
      *   GetFirmwareInfo and GetFeaturedFirmwareData and timed out GetChipID,
      *   SetFirmwareInfoFeatures and EnsureMode0, having changed its mind about
-     *   nothing.
+     *   nothing. That was once blamed on the 5 s deadline; it was the emulator's
+     *   USB/IP server dropping replies (TESTING.md sec.9.7), now fixed in FW-V1,
+     *   and a lost reply is no longer left for this re-take to paper over: the
+     *   row's delivery audit (`RowEmulators`) fails it as an infrastructure
+     *   defect whatever the re-take says.
      *
      * Repeating the one measurement from a recovered session separates them:
      * the first kind times out again, the second does not. It is not a

@@ -28,7 +28,7 @@ import type {
   WebUsbInTransferResult,
   WebUsbOutTransferResult,
 } from '../../src/protocol/webusb.js';
-import { UsbIpSession, UsbIpStall } from './usbip-client.js';
+import { DeliveryLedger, UsbIpSession, UsbIpStall } from './usbip-client.js';
 
 const STANDARD_IN = 0x80;
 const REQ_GET_DESCRIPTOR = 0x06;
@@ -54,6 +54,12 @@ function requestType(setup: WebUsbControlSetup, dirIn: boolean): number {
 export interface UsbIpWebUsbOptions {
   /** Per-URB deadline in milliseconds. */
   readonly urbTimeoutMs?: number;
+  /**
+   * Where every session this device opens — the first import and every re-import —
+   * counts what it sent and received. `Emulator.attach` passes its own, so the
+   * harness can compare the client's count against the emulator's delivery ledger.
+   */
+  readonly ledger?: DeliveryLedger;
 }
 
 export class UsbIpWebUsbDevice implements WebUsbDevice {
@@ -68,6 +74,7 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
   private session: UsbIpSession;
   private readonly timeoutMs: number;
   private readonly where: { host: string; port: number; busid: string };
+  private readonly ledger: DeliveryLedger;
   /** Raw 18-byte device descriptor, as the device returned it. */
   deviceDescriptor: Uint8Array = new Uint8Array(0);
   /** How many times `open()` had to re-import the device after a `close()`. */
@@ -77,10 +84,12 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     session: UsbIpSession,
     timeoutMs: number,
     where: { host: string; port: number; busid: string },
+    ledger: DeliveryLedger,
   ) {
     this.session = session;
     this.timeoutMs = timeoutMs;
     this.where = where;
+    this.ledger = ledger;
     this.vendorId = session.device.idVendor;
     this.productId = session.device.idProduct;
   }
@@ -92,12 +101,14 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     busid: string,
     options: UsbIpWebUsbOptions = {},
   ): Promise<UsbIpWebUsbDevice> {
-    const session = await UsbIpSession.attach(host, port, busid);
-    const device = new UsbIpWebUsbDevice(session, options.urbTimeoutMs ?? DEFAULT_URB_TIMEOUT_MS, {
-      host,
-      port,
-      busid,
-    });
+    const ledger = options.ledger ?? new DeliveryLedger();
+    const session = await UsbIpSession.attach(host, port, busid, undefined, ledger);
+    const device = new UsbIpWebUsbDevice(
+      session,
+      options.urbTimeoutMs ?? DEFAULT_URB_TIMEOUT_MS,
+      { host, port, busid },
+      ledger,
+    );
     device.opened = true;
     await device.readIdentity();
     return device;
@@ -190,13 +201,17 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
      * in one run and 1 of 63 in the next. Retrying until the slot frees is what
      * makes the measurement a property of the firmware instead of the load.
      *
-     * THE CHURN THIS CREATES IS REAL WORK FOR THE SERVER, and it found three
+     * THE CHURN THIS CREATES IS REAL WORK FOR THE SERVER, and it found four
      * defects there on 2026-09-22 — a `quit` sentinel outliving its session and
-     * silencing the next one, a detach eating its successor's completions, and a
-     * listen backlog of 4 dropping SYNs (1 re-import in 300 paid a second of TCP
-     * retransmit). All three are fixed in FW-V1's `emu/` and covered by its
-     * self-test; see docs/EMULATOR.md sec.13.8. This retry stays regardless: the
-     * single import slot is the protocol's, not a bug. */
+     * silencing the next one, a detach eating its successor's completions, a listen
+     * backlog of 4 dropping SYNs (1 re-import in 300 paid a second of TCP
+     * retransmit), and — the one that cost 2,210 s a run — the next session's
+     * writer taking the old writer's `quit`, which orphaned the old writer and let
+     * it drop later sessions' replies. The last is fixed STRUCTURALLY (one reply
+     * queue per session) in FW-V1's `emu/`, forced deterministically by its
+     * self-test, and every row here now checks the emulator's delivery ledger
+     * against what this adapter received (`Emulator.auditDelivery`). This retry
+     * stays regardless: the single import slot is the protocol's, not a bug. */
     const deadline = Date.now() + REOPEN_TIMEOUT_MS;
     let last: unknown;
     for (;;) {
@@ -205,6 +220,8 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
           this.where.host,
           this.where.port,
           this.where.busid,
+          undefined,
+          this.ledger,
         );
         this.reopens++;
         this.opened = true;

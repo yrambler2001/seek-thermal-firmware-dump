@@ -393,50 +393,36 @@ in the fix** — both were on the emulator's side of the wire (FW-V1 `docs/EMULA
   between transfers multiplied the device's elapsed time **6.6×**. `--usbip` now gates the
   clock on host activity: nothing outstanding, nothing retired.
 - **The re-import.** `recover()` is close-and-reopen, a couple of hundred times per row,
-  and three defects lived in that churn. The one that mattered: a `quit` sentinel left
-  behind by a dead session stopped the **next** session's writer thread, so a healthy
-  device answered nothing for one session and one command came back `no-answer`.
+  and four defects lived in that churn. The first three were fixed in FW-V1 Phase 16; the
+  fourth — the next session's writer taking the old writer's `quit`, which orphaned the
+  old writer and let it drop later sessions' replies — was the residual of §9.6, was
+  diagnosed in §9.7 and is fixed structurally in §9.8.
 
 **Five consecutive regenerations — one of them under deliberate CPU load, load average
 10 → 161 — now produce byte-identical expectations for all 51 rows** (666.9 s, 679.7 s
 loaded, 670.9 s for the last three; `0 of 51` differing between every consecutive pair).
 No field is excluded from the pin, and nothing retries to make a row green.
 
-**One residual failure mode is left, it is quantified, and it means `npm run check` does
-not pass.** Every run above was `vitest run --project core` with `SEEK_EMU_TIER2=none` —
-the emulator suites alone. Across six such runs (five regenerating, one asserting) that is
-**306 row-measurements with zero divergence**. Run the emulator suites alongside the rest
-of this repository's suite instead — `npm run check`, or a bare `vitest run` — and roughly
-**one row in fifty-one wedges**: five failing rows across four such runs, _a different row
-each time_ (`compact_xr 4.8.2.1`, `compact_pro 4.18.2.0-FF`, `compact_pro 1.0.3.2-FF`,
-`nano_200` …), never the same one twice.
+**The residual failure mode this section used to describe is gone, and it was never the
+deadline.** Alongside the rest of the suite, about one row in fifty-one used to go quiet
+for minutes and read `no-answer`; this section attributed that to a slow emulator against
+`WebUsbTransport`'s 5 s deadline. §9.7 measured it instead: the emulator's USB/IP server
+was dropping replies it had computed in milliseconds. §9.8 has the fix, the per-row
+delivery audit that now guards it, and three consecutive green `npm run check` runs.
 
-The signature never varies: the row costs 180–420 s instead of 4, the emulator log shows
-`device stalled status IN bRequest=11` on **every** re-import from some point on, and the
-commands after it read `no-answer`. That is the control endpoint wedged — and
-`transport.open()`, which is the only thing that clears a wedge, is itself the request
-being stalled, so it never recovers.
-
-**What is left is not the emulator's clock and not its teardown; both of those were fixed
-and measured.** It is the one coupling neither side may remove: the emulator runs three
-orders of magnitude slower than silicon while `WebUsbTransport` applies its own **5 s
-wall-clock deadline** per transfer. Under enough host contention one transfer is abandoned
-mid-flight, and on these builds the firmware then refuses `SET_INTERFACE` for the rest of
-the row. Shortening the work is not possible; lengthening the deadline would mean changing
-the toolkit's real code, which is the one thing this suite must not do, and would make the
-measurement a measurement of the change. It is written down here rather than hidden behind
-a tolerance or a retry.
-
-**Runtime, stated rather than hidden.** Tier 1 over all 51 is ~11 min at six concurrent
-emulators, dominated by the 2014 Compacts, which pay `ensureMode0()`'s three-second settle
-on each of 63 arms (~330 s a row). **Load barely moves it** — 666 s idle against 678 s at
-load average 50–100 — because a gated emulator that is waiting costs no CPU at all. Tier 2
-over the 15 dumps is ~10 min. `SEEK_EMU_TIER2=none` skips tier 2; `SEEK_EMU_WORKERS` sets
-the concurrency (it is per suite _file_, so two files in flight double it).
+**Runtime, stated rather than hidden** (measured 2026-09-22, §9.8). Tier 1 over all 51
+takes **108 s** on its own at six concurrent emulators; its critical path is the 0.6.0.4
+Compact, ~107–124 s of CPU-bound work on 127 requests the device never completes. The ~11
+min this paragraph used to quote, and the "~330 s a row" it blamed on `ensureMode0()`, were
+the dropped-reply defect (§9.7). Tier 2 over the 15 dumps runs alongside it, and the whole
+`npm test` is **216–254 s** idle, bound by tier 2's fifteen round trips (three waves of
+six, ~70–140 s each). `SEEK_EMU_TIER2=none` skips tier 2; `SEEK_EMU_WORKERS` sets the
+concurrency (it is per suite _file_, so two files in flight double it).
 
 Skips exactly as §4 rule 1 demands: `SEEK_EMU_DIR` absent → loud skip on stderr, exit 0.
-With neither optional input: **404 passed | 3 skipped**, exit 0. With the dump corpus but no
-emulator: **472 passed | 2 skipped**.
+With neither optional input: **445 passed | 3 skipped**, exit 0 (re-measured 2026-09-22).
+With the dump corpus but no emulator: **513 passed | 2 skipped**, exit 0 (re-measured the
+same day; it was 472 when this paragraph was first written).
 
 ---
 
@@ -507,6 +493,11 @@ suite discards that attempt entirely and re-measures from a **new emulator**, up
 Nothing about a discarded attempt is recorded, and a stall or a device error code — the device
 speaking — is still measured once and written down as it answered.
 
+§9.7 later showed that "the camera stopped answering" was the emulator dropping replies, and that
+a fresh emulator "fixed" it only by starting without an orphaned writer. Since §9.8 every attempt
+— discarded ones included — is audited against the emulator's delivery ledger, so a lost reply
+fails the row as an infrastructure defect instead of being re-measured into silence.
+
 That distinction also re-classified rows that were never a flake. Eleven rows were pinned with
 `no-answer` on every command; on the 2014 Compacts the emulator **dies**, with
 `UC_ERR_WRITE_UNMAPPED` on a write to `0x42040204` — a Cortex-M bit-band alias, which FW-V1's own
@@ -540,31 +531,17 @@ command tables say they are, and the emulator rows for them are tracked gaps who
 | 3   | 565 passed, 16 expected fail, **0 failed** | ~400 s |
 | 4   | 563 passed, 16 expected fail, **2 failed** | 671 s  |
 
-So it is **not zero**, and the honest number is **2 rows in 204 row-measurements
-(1.0 %)**, all four failures in the one run that took twice as long as the
-others. Before this work the same suite lost about one row in fifty-one (2 %),
-every run, and lost it _silently_ — the row was pinned as a finding about
-firmware.
+So it was **not zero**: 2 rows in 204 row-measurements (1.0 %), all four failures in the one
+run that took twice as long as the others, both last-two measurements (`SetFirmwareInfoFeatures`,
+`EnsureMode0`) reading `no-answer`.
 
-What is left is narrower and is named: on the slow run the only two fields that
-moved were `SetFirmwareInfoFeatures` and `EnsureMode0`, which are the **last two
-measurements the probe takes**. The wedge begins there and the row ends before
-the re-take can get a second answer that differs. Both are `no-answer` — a host
-deadline, never a refusal — so nothing false was recorded about the firmware;
-the run simply went red.
-
-Three things would close it, in order of how much they cost:
-
-1. **Take the two cheap commands earlier.** They are last because the selector
-   map is the measurement that matters and runs first, before anything can
-   wedge the endpoint. Moving these two to just after the identity read costs
-   nothing and puts them where the endpoint is still clean.
-2. **Re-take the whole command block, not one command.** The block is eight
-   transfers; a lost one is currently re-taken alone, into an endpoint that may
-   already be wedged.
-3. **Fix the wedge itself**, which is FW-V1's: `SET_INTERFACE` is stalled on
-   every re-import from some point on, and `WebUsbTransport`'s fallback to
-   `recipient: 'device'` then silently changes what the probe is asking.
+**What this section concluded from that is superseded.** It read the residual as a wedged control
+endpoint and proposed three client-side mitigations (reorder the probe, re-take whole blocks, and
+fix a `SET_INTERFACE` "wedge" in FW-V1). §9.7 measured it instead: the emulator's USB/IP server was
+**dropping replies the device had already computed**, and `SET_INTERFACE` stalls on every import
+of every row from the first, so it was never a wedge signature. None of the three mitigations was
+made, and none is needed; §9.8 has the fix and the measurements after it (three consecutive
+green `npm run check` runs, 0 dropped replies).
 
 ### 9.7 Where the wall time goes (2026-09-22)
 
@@ -576,8 +553,9 @@ that will never arrive, and neither side is doing anything while it waits. The s
 is the "one row in fifty-one" residual of §8 and §9.6. Everything below is measured at `497a6f2`
 against FW-V1 `c8d56404`.
 
-**Pre-flight: `npm run check` does not pass.** At the tests it is **565 passed, 16 expected
-fail, 0 failed**, but one suite fails and the exit code is 1; wall 914 s, vitest 900.3 s. The
+**Pre-flight (at `497a6f2`; fixed in §9.8): `npm run check` did not pass.** At the tests it
+was **565 passed, 16 expected fail, 0 failed**, but one suite failed and the exit code was 1;
+wall 914 s, vitest 900.3 s. The
 failing suite is tier 1's `afterAll`: `1 emulator process(es) were still running at the end`.
 The row behind it is the 0.3.0.1 Compact. It ran into the 900 s row timeout and, being a known
 gap under `test.fails`, **the timeout was counted as its expected failure.** Only the leak
@@ -689,8 +667,11 @@ by the wrong thread.**
 
 **Without the defect**, tier 1's row time would be about 350 s. At six at once, and with the
 longest clean row at 101 s, tier 1 would finish well inside tier 2's 187 s, and `npm test` would
-be tier-2-bound at roughly 190 s instead of 775–900 s. **That is arithmetic from run B, not a
-measurement; the fix has not been made.**
+be tier-2-bound at roughly 190 s instead of 775–900 s. That was arithmetic from run B. **Measured
+after the fix (§9.8):** tier 1's row time is **347 s** on its own and 433–525 s inside the full
+suite; `npm test` is tier-2-bound as predicted but at **216–254 s** idle, not 190 s, because tier
+2's fifteen round trips (three waves of six, 70–140 s each) run slower alongside tier 1 than they
+did in run B.
 
 #### What this corrects in §8 and §9
 
@@ -706,9 +687,9 @@ measurement; the fix has not been made.**
   replies land on the last measurements. That exact variant was not observed in these two runs;
   the timeout variant (run A) and five recovered rows (run B) were.
 
-#### Fixes, ranked by value against risk (none implemented)
+#### Fixes, ranked by value against risk (1–3 implemented in §9.8; 4 and 5 not)
 
-1. **Emulator: route completions per session** (FW-V1 `emu/seekemu/usbip.py`). Give each import
+1. **DONE (§9.8). Emulator: route completions per session** (FW-V1 `emu/seekemu/usbip.py`). Give each import
    its own queue for completions, unlinks and its quit, so a writer can never dequeue another
    session's item. Count dropped completions in `Bridge.summary()`, and add a self-test that
    forces the interleaving (a delay between `detach()` and the quit) and asserts zero drops and
@@ -716,14 +697,14 @@ measurement; the fix has not been made.**
    and by mechanism the residual. It changes delivery only; the device's answers, the gate and
    the cycle counts are untouched, so no test measures anything different. **Low risk, highest
    value.**
-2. **Harness: make a dropped reply impossible to mistake for firmware silence.** The emulator
+2. **DONE (§9.8). Harness: make a dropped reply impossible to mistake for firmware silence.** The emulator
    already counts URBs completed; have the harness compare that with what the client received,
    and raise `ProbeUnmeasurable` naming "completed by the device, never delivered". Cheap, loud,
    changes no measurement, and guards fix 1 against regressing.
-3. **Harness: a known gap must not pass on a timeout.** `test.fails` turned run A's 900 s hang
+3. **DONE (§9.8). Harness: a known gap must not pass on a timeout.** `test.fails` turned run A's 900 s hang
    into a green "expected failure". Assert the gap's own condition and let any other error,
    a timeout included, fail the row. Low risk.
-4. **Harness fidelity, and a separate decision because it changes what is measured.**
+4. **NOT DONE — a separate decision. Harness fidelity, because it changes what is measured.**
    `UsbIpWebUsbDevice.claimInterface` sends `SET_INTERFACE` as `bmRequestType 0x00`. USB 2.0
    §9.4.10 requires `0x01`, and neither WebUSB's `claimInterface` nor `libusb_claim_interface`
    sends anything at all. It stalls on every import, so **every row in both tiers has run with
@@ -739,3 +720,138 @@ measurement; the fix has not been made.**
 **Deliberately not proposed:** lowering `WebUsbTransport`'s 5 s (toolkit source, and not the
 cause), lowering the adapter's 30 s URB deadline (it would make each dropped reply cheaper and
 the defect harder to see), and any retry.
+
+### 9.8 The fix, the delivery audit, and what a known gap asserts now (2026-09-22)
+
+§9.7's fixes 1–3, made. Measured at this commit against FW-V1 `9bad9852` (`emu-corpus`, its
+Phase 18).
+
+#### Fix 1, in the emulator: nothing shared between sessions
+
+Each USB/IP import is a session with **its own reply queue and its own writer thread**. A reply
+goes on the queue of the session its URB arrived on or on none; the teardown's stop marker goes
+on that session's queue, which no other thread reads, and the writer is joined before the session
+is reported closed. A reply for a session that no longer exists is **counted as dropped, with its
+reason** — never routed to another session, never silently discarded. The emulator now stops on
+SIGTERM as it does on Ctrl-C and prints its **delivery ledger** as one line after joining every
+writer (a real one: three imports of the Compact PRO 1.0.3.0-FF `0B14A1JULD54` dump):
+
+```
+---USBIP-SUMMARY--- {"balanced": true, "completions": {"delivered": 11, "dropped": 0,
+  "produced": 11, "unresolved": 0}, "dropped_by_reason": {}, "reason": "host script complete",
+  "sessions": 3, "urbs": {"answered": 11, "dropped": 0, "outstanding": 0, "submitted": 11,
+  "unlinked": 0}, "writers_alive": 0, "writers_stuck": 0}
+```
+
+FW-V1's `selftest.py` forces §9.7's interleaving deterministically — the old session's writer is
+held off its queue while the next session imports — and requires that the new session gets every
+reply, that no writer outlives its session, and that the dropped counter is exact. Against the
+pre-fix server it fails 5 runs of 5; against this one it passes 5 of 5.
+
+#### Fix 2, in this harness: a lost reply is an infrastructure defect, never a finding
+
+`Emulator.stop()` sends SIGTERM and waits for the process to finish its own shutdown (SIGKILL is
+only a 30 s backstop, and needing it fails the audit). The USB/IP client keeps its own ledger —
+`DeliveryLedger` in `emulator/usbip-client.ts`, shared by every session a row opens against one
+emulator, re-imports included — and `Emulator.auditDelivery()` compares the two. A row fails with
+`InfrastructureDefect` if, for **any** emulator process it started:
+
+| rule                                                                                    | what it catches                                                             |
+| --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| the emulator printed no `---USBIP-SUMMARY---`                                           | an emulator that was killed or crashed: nobody knows what it delivered      |
+| `completions.dropped > 0`                                                               | a reply the device produced and the server could not deliver                |
+| the ledger does not balance (`unresolved != 0`)                                         | a reply that vanished without being counted — the shape of the original bug |
+| a writer thread alive or stuck                                                          | a writer outliving its session                                              |
+| server `delivered` ≠ client `repliesReceived`, or server `sessions` ≠ client `sessions` | a reply sent and never read; an import the client never saw                 |
+| client `repliesUnmatched > 0`                                                           | a reply that arrived after the client had stopped waiting                   |
+| on a **live** emulator: URBs outstanding, transfers abandoned, client deadlines hit     | the client gave up on a device that answers every request in < 100 ms       |
+
+The last rule is relaxed only when the emulator **died on its own** (a Unicorn fault, which the
+probe records as that row's gap): then an unanswered transfer is explained. Everything else still
+applies to those rows.
+
+`RowEmulators` (harness.ts) tracks every emulator a row starts, and the audit runs **before**
+anything is recorded or compared, in both modes. `InfrastructureDefect` is not a
+`ProbeUnmeasurable`, so the re-measure-from-a-fresh-emulator path cannot hide it — a discarded
+attempt is audited too — and the regenerator does not turn it into a gap. The summary matrix ends
+with a delivery line per tier, e.g.
+`delivery: 51 emulator process(es) audited; 17347 repl(ies) delivered, 17347 received by the
+client, 0 dropped; slowest row 122.3s`.
+
+#### Fix 3, in this harness: a known gap asserts ITS gap, and nothing else passes
+
+`test.fails` is gone from both tiers. It passed on any throw, so it could not tell "the gap is
+still there" from "the row hung for 900 s" — which is exactly what it did on 2026-09-22 (§9.7,
+pre-flight). The replacement has three parts:
+
+1. **One measurement function for both modes.** `measureRow()` in each suite returns exactly what
+   the regenerator records, gap included: a gap derived from the measurement ("the selector map
+   reaches no window: …", "N/M windows read; …") or from a measurement that could not be made
+   ("not measurable in 1 attempt(s) … [fault: unmapped addr=0x42040204 at PC=…]"). So the gap an
+   assertion checks was computed by the code that wrote the pin.
+2. **Every row is an ordinary `it.concurrent`.** A vitest timeout, a thrown error, a leaked
+   emulator (the `afterAll` count) or an `InfrastructureDefect` fails a gap row exactly as it fails
+   any other.
+3. **`assertRecordedGap(entryId, measured, pinned)`** (suite.ts) has three outcomes: the same gap
+   with the **same recorded reason** is green; **no gap any more** is red with "was a known gap …
+   and is now fully measured — regenerate the expectations and promote it" (the ratchet, kept);
+   a **different reason** is red and prints both. After that, a gap row's other pinned fields
+   (identity, command outcomes, windows, auth) are asserted like any row's.
+
+One consequence for reading the counts: the 16 known-gap rows used to show as "16 expected fail";
+they now pass as ordinary tests, so a green run reads **581 passed** where it used to read
+"565 passed, 16 expected fail".
+
+#### The measurements
+
+Machine: 10 cores, with a desktop session running beside the suite. "Load" is `uptime`'s
+1-minute average sampled every 10 s.
+
+| run                                                   | exit | passed / expected-fail / failed | wall (vitest) | slowest row (tier 1 / tier 2) | replies delivered = received | dropped | emulators left | peak load |
+| ----------------------------------------------------- | ---- | ------------------------------- | ------------- | ----------------------------- | ---------------------------- | ------- | -------------- | --------- |
+| `npm run check` 1                                     | 0    | 581 / 0 / 0                     | 269 s (254 s) | 150.6 s / 142.1 s             | 890,380                      | 0       | 0              | 153       |
+| `npm run check` 2, **twelve `yes` busy loops** beside | 0    | 581 / 0 / 0                     | 577 s (550 s) | 332.4 s / 246.7 s             | 890,380                      | 0       | 0              | 378       |
+| `npm run check` 3                                     | 0    | 581 / 0 / 0                     | 232 s (216 s) | 122.3 s / 106.5 s             | 890,380                      | 0       | 0              | 102       |
+| `npm test` alone                                      | 0    | 581 / 0 / 0                     | 219 s         | 123.9 s / 104.1 s             | 890,380                      | 0       | 0              | —         |
+| tier 1 alone (`SEEK_EMU_TIER2=none`)                  | 0    | 376 passed, 1 skipped           | 108 s         | 107.0 s / —                   | 17,347                       | 0       | 0              | —         |
+
+- **`npm test` is 216–254 s idle**, against §9.7's arithmetic of ~190 s and the 775–900 s it
+  took with the defect. It is bound by tier 2. The slowest tier-1 row, every run, is the 0.6.0.4
+  Compact: CPU-bound on 127 requests the device never completes (each ends at the emulator's host
+  budget and is recorded `no-answer`, as it was before). Tier 1 alone went from ~670 s to 108 s.
+- Across the three checks, `npm test`, the regeneration below and the tier-1-alone run, **381
+  emulator processes were audited and 0 replies were dropped**. Before the fix the residual hit 5
+  of 56 processes per suite run; it did not recur.
+- **Expectations unchanged.** `node scripts/update-emulator-expectations.mjs` (both tiers, 204 s):
+  **0 of 51** tier-1 rows and **0 of 15** tier-2 rows differ from the pins;
+  `expectations.roundtrip.json` is byte-identical. `expectations.rpc.json` differs in one line,
+  its file-level `note`, which described `test.fails` and now describes the reason check.
+- Without the optional inputs: `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run` → **445
+  passed | 3 skipped**, exit 0 (unchanged). With the dump corpus and no emulator: **513 passed | 2
+  skipped**.
+
+#### The negative tests, each reverted afterwards
+
+| injected                                                                                  | result                                                                                                                                                                                                      |
+| ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| the emulator drops its 40th reply and **counts** it (scratch copy of `emu/`)              | exit 1; the known-gap row 0.3.0.1 **and** a supported row fail: "the emulator DROPPED 1 of 263 repl(ies) it produced: {"INJECTED …":1}" + "the client closed a session with 1 transfer(s) still unanswered" |
+| the emulator discards its 40th reply and counts it **nowhere** (the original bug's shape) | exit 1: "the emulator's ledger does not balance: 1 repl(ies) neither delivered nor counted as dropped" + the abandoned transfer                                                                             |
+| `SEEK_EMU_TIER1_TIMEOUT_MS=3000` on the known-gap row 0.3.0.1                             | exit 1: "Test timed out in 3000ms" on the gap row, and the `afterAll` leak check ("1 emulator process(es) were still running at the end")                                                                   |
+| a supported row pinned as a gap                                                           | exit 1: "… was a known gap (…) and is now fully measured — regenerate the expectations and promote it"                                                                                                      |
+| a gap's pinned reason changed (`-> stall` to `-> no-answer`)                              | exit 1: "the recorded gap CHANGED." with both reasons printed                                                                                                                                               |
+
+#### What is still open
+
+- **§9.7 fix 4, the `SET_INTERFACE` recipient**, is untouched on purpose: `claimInterface` still
+  sends `bmRequestType 0x00`, it still stalls on every import, and every vendor request is still
+  measured with `recipient: 'device'`. Changing it changes what is measured and needs its own
+  regeneration and a reviewed diff.
+- **0.6.0.4's margin.** Its never-completed requests take at most ~0.85 s each idle and ~2.6 s
+  each at load 378 (the row's time over its 127 requests), against `WebUsbTransport`'s 5 s. If
+  one ever crossed it, the client would abandon the transfer and the audit would fail the row as
+  infrastructure — correctly, since what the probe recorded would then be the host's deadline, not
+  the device's answer — so `npm run check` would go red under that much load rather than record
+  anything false. Not observed.
+- The re-measure-from-a-fresh-emulator path (`PROBE_ATTEMPTS`) is kept. It can no longer hide a
+  lost reply (every attempt is audited); whether it still earns its place is not settled here.
+- No toolkit source (`packages/*/src`) was changed.
