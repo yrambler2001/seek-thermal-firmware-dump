@@ -1740,7 +1740,8 @@ and the token text), `0545094` (the version read), `2951543` (the pins it change
 `aae8ea0` (coverage). FW-V1 is at `653ee4f5` and nothing in it changed. **The fifth task, a
 cheaper answer for unanswered requests on the emulator, is not done** (§12.5). The final
 `npm run check` could not be run cleanly either: another program on the same machine was
-stopping emulator processes (§12.6).
+stopping emulator processes (§12.6). A later fix, `18e0f85`, makes the device read arm only
+what the firmware's plan contains (§12.8).
 
 ### 12.1 The web app asks the camera which family it is
 
@@ -2028,15 +2029,87 @@ docs check would have failed from that commit until `5947229`, which is the rebu
    `gmake -C codegen verify-noop`, and a dated FW-V1 campaign-log entry. None of it applies
    while `emu/` is unchanged.
 
+**Fixed since this section was written:** `readDeviceInfo` armed a slot the plan does not
+contain. It is fixed in `18e0f85`, with tests that fail on the old code (§12.8).
+
 **Open, reported and not patched:**
 
-- **`readDeviceInfo` can arm a slot the plan does not contain.** It looks each slot up in the
-  plan and, if the plan has no entry, falls back to the slot descriptor's own subcommand
-  (`device-info.ts`, the slots loop). Under `compact-2014`, whose plan is empty (§12.4), a
-  device read on a camera that passes the identity gate would therefore still arm the three
-  slot selectors. This is from reading the code, not a run. It is not a safety hole: the gate
-  has already said 0x52 is BeginFirmwareUpgrade on that build. But it contradicts the
-  profile's "nothing is readable".
 - The web tests use a scripted camera, not the emulator. The browser path has never been run
   against an emulated firmware; the emulator suites drive the toolkit through the USB/IP
   adapter and `WebUsbTransport`, which is the same transport the browser uses.
+
+### 12.8 The device read arms only what the plan contains (fixed after §12.7)
+
+**What was wrong.** `readDeviceInfo` looked each slot up in the plan and, when the plan had no
+entry, armed the slot descriptor's own subcommand. `compact-2014` plans nothing for any
+version (§12.4), so a hand-picked `compact-2014` on a camera past the identity gate sent
+BeginFirmwareUpgrade 7, 8 and 9. §12.7 found this by reading; a run on the fake camera now
+confirms it: the new test got `[7, 8, 9]` where it expects no arm. It was not a safety hole,
+because `identityGate` refuses every build older than 0.8.0.0 before any arm. But it
+contradicted the plan.
+
+**What changed** (`18e0f85`):
+
+- **Slots: the plan's entry or nothing.** A slot with no window in the plan is not armed. Its
+  reason reads "not readable on firmware 4.18.2.0: its plan (none: no read handler on this
+  generation) has no window at 0x14050000, so nothing was armed for it". It counts as unread,
+  so it blocks flashing like a slot whose read failed, and its `subcmd` is null.
+  `SlotState.subcmd` is now the selector that was armed, taken from the plan, not the
+  descriptor's label. `info --json` prints `subcmd: null` for such a slot.
+- **The same pattern, twice more, both for the upgrade-target selector** (subcommand 0 on the
+  post-2018 line). `confirmUpgradeTarget` in the device read armed
+  `profile.boot.updateTargetSubcmd` without asking the plan, and `writeFirmware` armed that
+  same profile number. The read now arms it only when the running build's table has a plain
+  row for it, and records the result as `DeviceState.updateTargetSubcmd`. The write arms that
+  value, and refuses without sending anything when it is null. A flash-capable profile whose
+  table lacks the row also gets a `flashBlockedBy` line.
+- **For that, `modern-4x`'s table gains row 0 with no address** (so does `generic`'s, which
+  borrows it). Every post-2018 image switches on mode 0 and computes the block. All 14 in
+  `facts.json` record mode 0 as computed, and every variant of FW-V1's
+  `cmd_BeginFirmwareUpgrade.c` has `fw_op_dest = fw_update_slot_address()` there. A row with no address is never a window and never
+  places a sweep's bytes, so no plan's windows, gaps or table name change. The legacy tables
+  already had row 0, and their profiles name no upgrade selector (`updateTargetSubcmd: -1`).
+
+**Looked at and left alone, on purpose:**
+
+- `probeSelectorChannel` arms subcommands 5 (plain and 18-byte) and 1 without a plan. It runs
+  before any profile is chosen, in order to choose one, so there is no plan to take them from.
+  It sends nothing until `identityGate` passes.
+- `runSweep` arms every subcommand in the profile's `sweepRange`. Probing selectors the plan
+  does not name is the point of a sweep. It takes only placement from the plan, and
+  `compact-2014` refuses it by capability, with an empty range as well.
+- `runDump` arms `plan.windows` and nothing else.
+- The device read's firmware-info reads (`SetFirmwareInfoFeatures` 1, 20, 17, 10) and its
+  serial read (`SetRamDataFeatures(0)`, then `GetFeaturedFirmwareData`) select info and RAM
+  records, not flash windows. The plan says nothing about them, and they go out only after
+  the gate, as before.
+
+**Tests.** All six fail on the old code (source reverted, tests kept):
+
+| test (file)                                                                                        | on the old code                                                         |
+| -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| arms no slot the plan leaves out: compact-2014 picked by hand, past the gate (`workflows`)         | `4.18.2.0: expected [ 7, 8, 9 ] to deeply equal []`                     |
+| reports the selector the plan armed a slot with, never a guessed one                               | `expected [ 85, 88, 89 ] to deeply equal [ 5, 8, 9 ]`                   |
+| arms the upgrade-target selector only when this firmware's own table has it                        | `expected [ 3, 2, 5, 8, 9, +0 ] to not include +0`                      |
+| writeFirmware refuses an analysis whose firmware's table has no upgrade-target selector            | `expected 'device/error-code' to be 'flash/refused'`: it armed 0 anyway |
+| carries selector 0 in the family's table as a computed row that reads nothing (`profiles`)         | `modern-4x: expected [] to have a length of 1 but got +0`               |
+| has a mode 0 on every post-2018 image, computed, as the upgrade-target row says (`firmware-facts`) | `expected undefined to be null`                                         |
+
+The fake camera now records the subcommand of every BeginFirmwareUpgrade (`FakeCamera.arms`).
+No existing assertion changed. `makeDeviceState` gained the new field.
+
+**Pinned emulator results.** Not re-run: another session was using the emulators. They are
+expected to stay the same. Neither suite calls `readDeviceInfo`, `writeFirmware` or
+`runSweep`. They use the probe, `readRunningFirmware`, `identityGate`, `detectProfile`,
+`runDump`, and a plan's `windows`, `unreachable` and `table`. The only plan change is a row
+with no address, which leaves those three as they were. This still has to be confirmed by a
+re-run.
+
+**Checks at `18e0f85`, without the emulator:**
+
+| check                                                           | result                                                  |
+| --------------------------------------------------------------- | ------------------------------------------------------- |
+| `npm run format:check`, `npm run lint`, `npm run typecheck`     | exit 0, exit 0, exit 0                                  |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run`        | exit 0, 547 passed, 3 skipped                           |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npm run test:coverage` | exit 0, 547 passed, 3 skipped; profiles functions 100 % |
+| `npm run build` twice, then `git status --porcelain -- docs`    | identical files both times; clean after the commit      |
