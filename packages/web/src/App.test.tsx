@@ -44,7 +44,7 @@ afterEach(() => {
 });
 
 describe('App — dump view', () => {
-  it('renders the connect panel, both dump actions and the read options', () => {
+  it('renders the connect panel, both dump actions, the expert override and the read options', () => {
     window.location.hash = '#/';
     const { container, unmount } = render(<App support={READY} />);
 
@@ -53,8 +53,17 @@ describe('App — dump view', () => {
     expect(buttonByText(container, 'Forget device')).toBeTruthy();
     expect(buttonByText(container, 'Start dump')).toBeTruthy();
     expect(buttonByText(container, 'Dump all selectors (0x00–0xFF)')).toBeTruthy();
-    expect(buttonByText(container, 'Dump legacy firmware')).toBeTruthy();
+    expect(buttonByText(container, 'Dump as this family')).toBeTruthy();
     expect(buttonByText(container, 'Choose dump file…')).toBeTruthy();
+
+    /* The camera picks the family; nobody has to. The old pair of buttons —
+     * one per firmware line — is gone, and the hand-picked family is an
+     * override with a real label, defaulting to what the old legacy button
+     * forced. */
+    expect(container.textContent).not.toContain('Dump legacy firmware');
+    const manual = container.querySelector<HTMLSelectElement>('#manualProfile');
+    expect(manual?.value).toBe('legacy-auth');
+    expect(container.querySelector('label[for="manualProfile"]')).toBeTruthy();
 
     /* Every option input is a real control with a real label. */
     for (const id of [
@@ -87,7 +96,7 @@ describe('App — dump view', () => {
 
     expect(buttonByText(container, 'Connect device').disabled).toBe(true);
     expect(buttonByText(container, 'Start dump').disabled).toBe(true);
-    expect(buttonByText(container, 'Dump legacy firmware').disabled).toBe(true);
+    expect(buttonByText(container, 'Dump as this family').disabled).toBe(true);
     /* The whole reason the support banner is worded the way it is. */
     expect(buttonByText(container, 'Choose dump file…').disabled).toBe(false);
     expect(container.textContent).toContain('This browser cannot access USB devices.');
@@ -144,6 +153,7 @@ function stubFlashApi(overrides: Partial<FlashPanelApi>): FlashPanelApi {
     infoReporter: result.current.a,
     flashReporter: result.current.b,
     deviceState: null,
+    refusal: null,
     prepared: null,
     readingInfo: false,
     writing: false,

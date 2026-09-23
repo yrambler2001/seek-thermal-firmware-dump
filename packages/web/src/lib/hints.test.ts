@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { CancelledError, SeekError } from '@seek-fw/core';
 import {
+  FIRMWARE_TOO_OLD_HINT,
   HOLDING_HINT,
   UDEV_HINT,
   WINDOWS_HINT,
@@ -79,6 +80,26 @@ describe('hintFor', () => {
       'leaves the flash untouched',
     );
     expect(hintFor(new SeekError('image/key-table', 'wrong keys'), MAC)).toContain('name and all');
+  });
+
+  it('does not tell the owner of a pre-0.8 camera to pick another family', () => {
+    /* planForDevice's refusal of a build that predates the dump protocol
+     * carries the version it read; no family changes that answer. */
+    const tooOld = new SeekError(
+      'profile/unsupported',
+      'refusing to dump: firmware 0.3.0.1 predates the dump protocol',
+      { detail: { firmwareVersion: '0.3.0.1', capability: 'dump', profile: 'modern-4x' } },
+    );
+    expect(hintFor(tooOld, MAC)).toBe(FIRMWARE_TOO_OLD_HINT);
+    expect(hintFor(tooOld, MAC)).toContain('Decrypt a dump you already have');
+
+    /* A family that cannot do the job is a different refusal, with a remedy. */
+    const capability = new SeekError(
+      'profile/unsupported',
+      'Early Compact (pre-0.8) does not support dump: …',
+      { detail: { profile: 'compact-2014', capability: 'dump', reason: '…' } },
+    );
+    expect(hintFor(capability, MAC)).toContain('Leave the family on auto');
   });
 
   it('stays quiet when it has nothing to add', () => {

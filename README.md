@@ -108,23 +108,30 @@ bootloader will accept. A **profile** captures one firmware family:
 | Profile        | Family                                                                                                             | Dump   | Decrypt | Flash   |
 | -------------- | ------------------------------------------------------------------------------------------------------------------ | ------ | ------- | ------- |
 | `modern-4x`    | 2018 and later: Compact 4.8/4.16, Compact Pro 4.9/4.18, Compact XR, Mosaic 2.27/10.9, Nano 200 42.x, Nano 300 44.x | yes    | yes     | **yes** |
-| `legacy-auth`  | 2014-2017 locked line: Compact 0.7.0.7-1.3.0.8, Compact PRO 1.0.3.x                                                | yes    | yes     | no      |
+| `legacy-auth`  | 2014-2017 locked line: Compact 0.8.0.0-1.3.0.8, Compact PRO 1.0.3.x                                                | yes    | yes     | no      |
 | `compact-2016` | the same locked protocol with the 2016 cipher (K=0, acceptance sum 0)                                              | yes    | yes     | no      |
-| `compact-2014` | Compact builds older than 0.7.0.7 — no read command exists in their RPC table                                      | **no** | yes     | no      |
+| `compact-2014` | Compact builds older than 0.8.0.0 — no read handler exists in their RPC table                                      | **no** | yes     | no      |
 | `generic`      | fallback when the family cannot be identified                                                                      | yes    | yes     | no      |
 
 The profile is detected from evidence — and, on an attached camera, from **asking it**. Before a
-dump or a sweep the CLI sends four read-only transfers (`--no-probe` turns this off): the running
-firmware's version, a plain 2-byte arm of a bank the locked line protects, the 18-byte
-authenticated arm of the same bank, and a read of a bank that is open on every line. Those answers
-separate the families directly, where a USB product string or an acceptance sum only correlates
-with them. `--profile <id>` overrides detection and skips the probe.
+dump, a sweep or a device-info read, both the CLI and the web app send up to four read-only
+transfers (`--no-probe` turns this off on the CLI): the running firmware's version, then — only
+if that build can be read at all — a plain 2-byte arm of a bank the locked line protects, the
+18-byte authenticated arm of the same bank, and a read of a bank that is open on every line. Those
+answers separate the families directly, where a USB product string or an acceptance sum only
+correlates with them. The web app has no "modern" and "legacy" buttons any more: it asks, and
+says why when it will not read a camera. `--profile <id>`, or the web app's hand-picked family,
+overrides detection and skips the probe — but not the version check: the run still reads the
+version first and refuses a camera that does not report it, or runs a build older than 0.8.0.0,
+whatever family was named.
 
 **`compact-2014` refuses to dump, and that refusal is the point.** Every decrypted image carries
 its own RPC method table — wire id = index + 53 — and recovering it from all 36 images in the
 reference corpus shows five builds (0.3.0.1, 0.5.0.2, 0.5.1.0, 0.5.1.3, 0.6.0.4) with no
 `GetFeaturedFirmwareData` at all: wire id `0x4F` is `UploadFirmwareRowSize` there, so nothing can
-read a window however it is armed. On 0.3.0.1, `0x52` — the id a dump arms 63 windows with — is
+read a window however it is armed. On 0.7.0.7 and 0.7.0.8 it is in the table with its handler in
+the write (setter) column only, so the control-IN read a dump sends cannot be dispatched either;
+0.8.0.0 is the first build with a read handler. On 0.3.0.1, `0x52` — the id a dump arms 63 windows with — is
 `EnterBootloaderMode`. Dumping such a camera would not fail; it would send it 63 requests to leave
 the application. The facts are committed in `packages/core/test/firmware/facts.json` and asserted
 by `packages/core/test/firmware-facts.test.ts`.
@@ -169,16 +176,22 @@ same tool rather than two implementations that drift.
 
 ## Read-only by design
 
-The dump view — the default page — can issue exactly five vendor commands. That is its entire
+The dump view — the default page — can issue exactly six vendor commands. That is its entire
 vocabulary, and there is no code path to anything else:
 
-| Opcode | Name                    | Dir | Why                                                                                                     |
-| ------ | ----------------------- | --- | ------------------------------------------------------------------------------------------------------- |
-| `0x35` | GetErrorCode            | IN  | check status after each step                                                                            |
-| `0x3c` | SetOperationMode        | OUT | only to select mode 0, and only if not already there                                                    |
-| `0x3d` | GetOperationMode        | IN  | read the current mode                                                                                   |
-| `0x4f` | GetFeaturedFirmwareData | IN  | the actual flash read                                                                                   |
-| `0x52` | BeginFirmwareUpgrade    | OUT | volatile read-window selector only — it selects which block subsequent reads return, and writes nothing |
+| Opcode | Name                    | Dir | Why                                                                                                      |
+| ------ | ----------------------- | --- | -------------------------------------------------------------------------------------------------------- |
+| `0x4e` | GetFirmwareInfo         | IN  | the running firmware version, read first: it picks the build's own selector table, or refuses the camera |
+| `0x35` | GetErrorCode            | IN  | check status after each step                                                                             |
+| `0x3c` | SetOperationMode        | OUT | only to select mode 0, and only if not already there                                                     |
+| `0x3d` | GetOperationMode        | IN  | read the current mode                                                                                    |
+| `0x4f` | GetFeaturedFirmwareData | IN  | the actual flash read                                                                                    |
+| `0x52` | BeginFirmwareUpgrade    | OUT | volatile read-window selector only — it selects which block subsequent reads return, and writes nothing  |
+
+Until the camera has reported its firmware version only three of the six go out, and only as
+reads — `GetFirmwareInfo`, `GetOperationMode` and `GetErrorCode`, the reads that mean the same thing
+on every one of the 36 images examined — because a command number does not mean the same thing on
+every build.
 
 `SetFeaturedFirmwareData`, `CompleteMemoryUpgrade`, `ResetDevice` and every upload, commit and erase
 command are absent from this view. `USBDevice.reset()` is never called either; the retry path just

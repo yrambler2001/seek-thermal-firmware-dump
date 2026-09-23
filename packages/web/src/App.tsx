@@ -3,11 +3,12 @@
  * Connect panel that both views share — then whichever view the hash selects.
  *
  * All the state that outlives a view lives here (the device, the run lock, the
- * options form, the firmware-profile choice), so switching tabs mid-run does
+ * options form, the firmware-profile choices), so switching tabs mid-run does
  * not disturb anything.
  */
 
 import { useCallback, useMemo, useState, type ReactElement } from 'react';
+import type { ProfileId } from '@seek-fw/core';
 import { AppHeader } from './components/AppHeader';
 import { ConnectSection } from './components/ConnectSection';
 import { Prose } from './components/Prose';
@@ -15,9 +16,10 @@ import { SupportBanner } from './components/SupportBanner';
 import { useConnectionTest } from './hooks/useConnectionTest';
 import { useDevice } from './hooks/useDevice';
 import { useDumpPanel } from './hooks/useDumpPanel';
-import { useFlashPanel, type ProfileChoice } from './hooks/useFlashPanel';
+import { useFlashPanel } from './hooks/useFlashPanel';
 import { useOfflineDecrypt } from './hooks/useOfflineDecrypt';
 import { useRunner } from './hooks/useRunner';
+import type { ProfileChoice } from './lib/identify';
 import { DEFAULT_OPTIONS_FORM, type OptionsFailure, type OptionsForm } from './lib/options';
 import { useRoute } from './lib/routing';
 import { detectSupport, readBrowserEnvironment, type SupportStatus } from './lib/support';
@@ -38,30 +40,37 @@ export function App({ support }: AppProps = {}): ReactElement {
   const [options, setOptions] = useState<OptionsForm>(DEFAULT_OPTIONS_FORM);
   const [optionsFailure, setOptionsFailure] = useState<OptionsFailure | null>(null);
   const [profileChoice, setProfileChoice] = useState<ProfileChoice>('auto');
+  /* The dump view's expert override. It starts on the legacy family because
+   * that is what the page's old "Dump legacy firmware" button forced, and it
+   * is only ever used when someone presses its own button. */
+  const [manualProfile, setManualProfile] = useState<ProfileId>('legacy-auth');
 
   const onOptionsFailure = useCallback((failure: OptionsFailure | null): void => {
     setOptionsFailure(failure);
   }, []);
 
+  /* The camera is asked which family it is; nobody picks. */
   const dump = useDumpPanel({
     id: 'dump',
     runner,
     device,
     form: options,
-    profileId: 'modern-4x',
+    choice: 'auto',
     dirPrefix: 'seek_flash4m_',
     sweepPrefix: 'seek_selectors_',
     onOptionsFailure,
   });
 
-  const legacy = useDumpPanel({
-    id: 'legacy',
+  /* The same runs under a family picked by hand — which still read and check
+   * the firmware version before anything is armed. */
+  const manual = useDumpPanel({
+    id: 'manual',
     runner,
     device,
     form: options,
-    profileId: 'legacy-auth',
-    dirPrefix: 'seek_flash4m_legacy_',
-    sweepPrefix: 'seek_selectors_legacy_',
+    choice: manualProfile,
+    dirPrefix: `seek_flash4m_${manualProfile}_`,
+    sweepPrefix: `seek_selectors_${manualProfile}_`,
     onOptionsFailure,
   });
 
@@ -149,7 +158,9 @@ export function App({ support }: AppProps = {}): ReactElement {
         {route === 'dump' ? (
           <DumpView
             dump={dump}
-            legacy={legacy}
+            manual={manual}
+            manualProfile={manualProfile}
+            onManualProfile={setManualProfile}
             offline={offline}
             connected={device.device !== null}
             busy={runner.busy}

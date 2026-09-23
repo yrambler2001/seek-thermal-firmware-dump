@@ -1,11 +1,21 @@
 /**
- * The read-only runs: "Start dump" and "Dump all selectors", for both the
- * modern selector map and the legacy authenticated one.
+ * The read-only runs: "Start dump" and "Dump all selectors".
  *
- * The original had `runDump` and `runOldDump` as two near-identical functions
- * and a `runSweep(kind)` that branched on a string. Core unified all of that
- * behind one pair of workflows parameterised by the firmware profile, so this
- * hook is the same code twice over with a different `profileId`.
+ * The camera says which family it is. A run with `choice: 'auto'` asks it
+ * first (`chooseActingProfile` → core's `identifyCamera`: the version, then —
+ * only when that build can be read — one plain arm, one token arm and one read)
+ * and dumps under the family that answers point to, with that build's own
+ * selector table (`planForDevice`). The original page had the user pick
+ * instead: `runDump` for the post-2018 map and `runOldDump` for the locked
+ * 2014-2017 line, as two buttons. A panel with a hand-picked `choice` is the
+ * expert override; it skips the questions and nothing else — the workflow
+ * still reads the version and refuses a camera that does not name its build or
+ * predates the dump protocol, whichever family was picked.
+ *
+ * A REFUSAL IS SHOWN, NOT JUST LOGGED. "The camera would not say which build it
+ * runs" and "this build has no read command" are answers the user has to act
+ * on, and they end the run before anything is read, so the panel keeps them in
+ * `refusal` for the view to put in front of the user.
  *
  * Cancelling is not a failure. Core stops the selector loop and still returns a
  * complete result — the partial image, a manifest that records which windows
@@ -14,20 +24,25 @@
  * whatever has been read so far".
  */
 
-import { useCallback, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   CancelledError,
   SeekDevice,
   errorMessage,
-  getProfile,
   isoStamp,
   runDump,
   runSweep,
-  type ProfileId,
   type WorkflowContext,
 } from '@seek-fw/core';
 import { downloadArchive, mib } from '../lib/download';
 import { logHint } from '../lib/hints';
+import {
+  chooseActingProfile,
+  refusalOf,
+  type ActingProfile,
+  type ProfileChoice,
+  type Refusal,
+} from '../lib/identify';
 import {
   asOptionsFailure,
   readOptions,
@@ -46,8 +61,9 @@ export interface DumpPanelParams {
   readonly runner: Runner;
   readonly device: DeviceHandle;
   readonly form: OptionsForm;
-  readonly profileId: ProfileId;
-  /** `seek_flash4m_` or `seek_flash4m_legacy_`, as the original named them. */
+  /** 'auto' asks the camera; a profile id is the expert override. */
+  readonly choice: ProfileChoice;
+  /** `seek_flash4m_`, as the original named the archive. */
   readonly dirPrefix: string;
   readonly sweepPrefix: string;
   readonly onOptionsFailure: (failure: OptionsFailure | null) => void;
@@ -56,22 +72,34 @@ export interface DumpPanelParams {
 export interface DumpPanelApi {
   readonly reporter: ReporterHandle;
   readonly running: boolean;
+  /** What the last run acted under, once that was settled; null before, or after a refusal. */
+  readonly acting: ActingProfile | null;
+  /** Why the last run was refused before it read anything, or null. */
+  readonly refusal: Refusal | null;
   start: (mode: DumpMode) => Promise<void>;
   cancel: () => void;
 }
 
-/** The original's cancel copy for these two panels. */
+/** The original's cancel copy for these panels. */
 const CANCELLING = 'Cancelling — will save whatever has been read so far ...';
 
 export function useDumpPanel(params: DumpPanelParams): DumpPanelApi {
-  const { id, runner, device, form, profileId, dirPrefix, sweepPrefix, onOptionsFailure } = params;
+  const { id, runner, device, form, choice, dirPrefix, sweepPrefix, onOptionsFailure } = params;
   const reporter = useReporter('Idle.');
   const running = runner.active === id;
+  const [acting, setActing] = useState<ActingProfile | null>(null);
+  const [refusal, setRefusal] = useState<Refusal | null>(null);
+
+  /* What one camera said is not what the next one will: a connect, a
+   * disconnect or a swap drops it, as the flash view drops its analysis. */
+  useEffect(() => {
+    setActing(null);
+    setRefusal(null);
+  }, [device.generation]);
 
   const execute = useCallback(
     async (mode: DumpMode, signal: AbortSignal): Promise<void> => {
       const options = readOptions(form);
-      const profile = getProfile(profileId);
       const transport = device.makeTransport({
         recipient: options.recipient,
         onWarning: (message) => {
@@ -79,13 +107,6 @@ export function useDumpPanel(params: DumpPanelParams): DumpPanelApi {
         },
       });
       const client = new SeekDevice(transport, { reporter: reporter.reporter, signal });
-      const ctx: WorkflowContext = {
-        device: client,
-        profile,
-        detection: null,
-        reporter: reporter.reporter,
-        signal,
-      };
       const dumpOptions = {
         chunk: options.chunk,
         gapFill: options.gapFill,
@@ -97,6 +118,17 @@ export function useDumpPanel(params: DumpPanelParams): DumpPanelApi {
 
       try {
         await transport.open();
+        const chosen = await chooseActingProfile(client, choice, mode, (text, level) => {
+          reporter.reporter.log(text, level);
+        });
+        setActing(chosen);
+        const ctx: WorkflowContext = {
+          device: client,
+          profile: chosen.profile,
+          detection: chosen.detection,
+          reporter: reporter.reporter,
+          signal,
+        };
         const result =
           mode === 'sweep' ? await runSweep(ctx, dumpOptions) : await runDump(ctx, dumpOptions);
 
@@ -114,7 +146,7 @@ export function useDumpPanel(params: DumpPanelParams): DumpPanelApi {
          * partial archive earns. */
         const partial = result.cancelled ? ' (cancelled)' : '';
         if ('selectorsArmed' in result) {
-          const [first, last] = profile.sweepRange;
+          const [first, last] = chosen.profile.sweepRange;
           reporter.reporter.progress(
             1,
             1,
@@ -133,7 +165,7 @@ export function useDumpPanel(params: DumpPanelParams): DumpPanelApi {
         await transport.close();
       }
     },
-    [device, dirPrefix, form, profileId, reporter, sweepPrefix],
+    [choice, device, dirPrefix, form, reporter, sweepPrefix],
   );
 
   const start = useCallback(
@@ -141,6 +173,8 @@ export function useDumpPanel(params: DumpPanelParams): DumpPanelApi {
       runner.start(id, async (signal) => {
         reporter.reset('Starting ...');
         onOptionsFailure(null);
+        setActing(null);
+        setRefusal(null);
         try {
           await execute(mode, signal);
         } catch (error) {
@@ -152,9 +186,18 @@ export function useDumpPanel(params: DumpPanelParams): DumpPanelApi {
             reporter.setStatus('Cancelled.');
             return;
           }
+          const refused = refusalOf(error);
+          if (refused !== null) {
+            setActing(null);
+            setRefusal(refused);
+          }
           reporter.log(`ERROR: ${errorMessage(error)}`, 'error');
           logHint(reporter.log, error);
-          reporter.setStatus('Failed — see the log above.');
+          reporter.setStatus(
+            refused === null
+              ? 'Failed — see the log above.'
+              : 'Refused — nothing was read. See the message above the log.',
+          );
         } finally {
           reporter.flush();
         }
@@ -168,5 +211,8 @@ export function useDumpPanel(params: DumpPanelParams): DumpPanelApi {
     reporter.log('cancel requested', 'warn');
   }, [reporter, runner]);
 
-  return useMemo(() => ({ reporter, running, start, cancel }), [reporter, running, start, cancel]);
+  return useMemo(
+    () => ({ reporter, running, acting, refusal, start, cancel }),
+    [reporter, running, acting, refusal, start, cancel],
+  );
 }

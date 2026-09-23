@@ -53,14 +53,20 @@ function expectAll(text: string, phrases: readonly string[]): void {
 const DUMP_COPY: readonly string[] = [
   /* the read-only promise */
   'Read-only: this view issues no flash write, erase, upload, commit, or reset command.',
-  'This page can issue exactly five vendor commands. That is its entire vocabulary — there is no code path to anything else:',
+  'This page can issue exactly six vendor commands. That is its entire vocabulary — there is no code path to anything else:',
+  'Until the camera has reported its firmware version, only three of the six are sent, and only as reads: GetFirmwareInfo, GetOperationMode and GetErrorCode.',
   'USBDevice.reset() is never called either; the retry path just closes and reopens the handle.',
 
-  /* the legacy-dump caveats */
+  /* detection, and the one check nothing skips */
+  'A camera that does not report its version, or runs a build older than 0.8.0.0, is not read at all, and the page says why.',
+  'It cannot skip the safety check. Whatever you pick, the run reads the firmware version first and refuses a camera that does not report it, or one running a build older than 0.8.0.0',
+
+  /* the legacy-dump caveats (corrected 2026-09-23: the token was called
+   * build-specific, and it is one value in 22 of the 36 images examined) */
   'It is still read-only: the token only arms a read window, and nothing is ever written.',
-  'Needs a connected device (step 1). If the normal dump already reads every window, use that instead — this is only for units where it stalls.',
-  'One caveat. The unlock token is build-specific; the one built in was recovered from a Compact PRO (PIR324) unit.',
-  'On firmware with a different token the protected banks just stall and are gap-filled — the same result as the normal dump, and still safe.',
+  'It is one 16-byte value, not one per build: the identical bytes are in 22 of the 36 firmware images examined',
+  'and in none of the 14 images from 2018 on, which have no token check at all.',
+  'On a build that refused it, the protected banks would just stall and be gap-filled — the same result as a dump without it, and still safe.',
 
   /* the offline decryptor's promise */
   'This part works in every browser, including Safari and iOS, because it needs no USB access.',
@@ -73,6 +79,8 @@ const DUMP_COPY: readonly string[] = [
   'If you do want a strictly complete byte-for-byte image — to diff flash against a reference, say — read it over SWD/J-Link or with an SPI programmer.',
 
   /* the read-only opcode table, every row */
+  'GetFirmwareInfo',
+  "the running firmware version, read first: it decides which build's selector table the dump uses, and a camera that does not report one is not read",
   'GetErrorCode',
   'check status after each step',
   'SetOperationMode',
@@ -138,6 +146,19 @@ describe('safety copy is carried verbatim', () => {
     expectAll(text, DUMP_COPY);
     expectAll(text, PLATFORM_COPY);
     unmount();
+  });
+
+  it('never calls the unlock token build-specific, on either view', () => {
+    /* It was false: firmware-facts.test.ts finds the same 16 bytes, exactly
+     * once each, in all 22 images from 2014-2017, and in none of the 14 later
+     * ones. A caveat that says otherwise tells the user a camera might need a
+     * token this page does not have. */
+    for (const hash of ['#/', '#/flash']) {
+      const { text, unmount } = viewText(hash);
+      expect(text.toLowerCase(), hash).not.toMatch(/build[- ]specific|per[- ]build token/);
+      expect(text, hash).not.toContain('recovered from a Compact PRO (PIR324) unit');
+      unmount();
+    }
   });
 
   it('the flash view keeps every bricking warning and explainer', () => {

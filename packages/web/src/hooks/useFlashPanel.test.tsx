@@ -15,9 +15,18 @@
 
 import { act } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { OP, WebUsbTransport, type WebUsbDevice } from '@seek-fw/core';
+import {
+  OP,
+  SAFE_BEFORE_IDENTITY,
+  WebUsbTransport,
+  hex,
+  type Opcode,
+  type WebUsbDevice,
+} from '@seek-fw/core';
 import { renderHook } from '../test-helpers';
+import type { ProfileChoice } from '../lib/identify';
 import { DEFAULT_OPTIONS_FORM } from '../lib/options';
+import { scriptedCamera } from '../test-fixtures';
 import { useFlashPanel } from './useFlashPanel';
 import { useRunner } from './useRunner';
 import type { DeviceHandle } from './useDevice';
@@ -81,13 +90,13 @@ function deviceHandle(camera: WebUsbDevice): DeviceHandle {
   };
 }
 
-function useHarness(camera: WebUsbDevice) {
+function useHarness(camera: WebUsbDevice, profileChoice: ProfileChoice = 'auto') {
   const runner = useRunner();
   const panel = useFlashPanel({
     runner,
     device: deviceHandle(camera),
     form: DEFAULT_OPTIONS_FORM,
-    profileChoice: 'auto',
+    profileChoice,
     onOptionsFailure: () => undefined,
   });
   return { panel, runner };
@@ -173,4 +182,84 @@ describe('useFlashPanel', () => {
 
     unmount();
   }, 30_000);
+});
+
+describe('Read device info asks the camera which family it is', () => {
+  it('reads a locked 2016 camera under legacy-auth on auto, where it used to read modern-4x', async () => {
+    const { camera } = scriptedCamera({ version: [1, 0, 3, 0], legacy: true });
+    const { result, unmount } = renderHook(() => useHarness(camera));
+    await act(async () => {
+      await result.current.panel.readInfo();
+    });
+    expect(result.current.panel.refusal).toBeNull();
+    expect(result.current.panel.deviceState?.profile.id).toBe('legacy-auth');
+    expect(result.current.panel.deviceState?.version).toBe('1.0.3.0');
+    unmount();
+  }, 30_000);
+
+  it('shows why, and arms nothing, when the camera does not report its version', async () => {
+    const { camera, calls } = scriptedCamera({ version: null });
+    const { result, unmount } = renderHook(() => useHarness(camera));
+    await act(async () => {
+      await result.current.panel.readInfo();
+    });
+    const refusal = result.current.panel.refusal;
+    expect(refusal?.code).toBe('device/version-unknown');
+    expect(refusal?.message).toContain('refusing to read the device info');
+    expect(result.current.panel.deviceState).toBeNull();
+    expect(result.current.panel.infoReporter.progress.text).toBe(
+      'Refused — nothing was armed. See the message below the log.',
+    );
+    for (const call of calls) {
+      expect(call.dir, hex(call.request)).toBe('in');
+      expect(SAFE_BEFORE_IDENTITY.has(call.request as Opcode), hex(call.request)).toBe(true);
+    }
+    unmount();
+  });
+
+  it('refuses 0.3.0.1 under a hand-picked family too, with GetFirmwareInfo the only request', async () => {
+    for (const choice of ['modern-4x', 'legacy-auth', 'compact-2014'] as const) {
+      const { camera, calls } = scriptedCamera({ version: [0, 3, 0, 1], legacy: true });
+      const { result, unmount } = renderHook(() => useHarness(camera, choice));
+      await act(async () => {
+        await result.current.panel.readInfo();
+      });
+      expect(result.current.panel.refusal?.code, choice).toBe('profile/unsupported');
+      expect(result.current.panel.refusal?.message, choice).toContain(
+        'firmware 0.3.0.1 predates the dump protocol',
+      );
+      expect(result.current.panel.deviceState, choice).toBeNull();
+      expect(
+        calls.map((call) => call.request),
+        choice,
+      ).toEqual([OP.GET_FIRMWARE_INFO]);
+      unmount();
+    }
+  });
+
+  it('forgets a refusal when the camera changes', async () => {
+    const { camera } = scriptedCamera({ version: null });
+    let generation = 1;
+    const { result, rerender, unmount } = renderHook(() => {
+      const runner = useRunner();
+      const panel = useFlashPanel({
+        runner,
+        device: { ...deviceHandle(camera), generation },
+        form: DEFAULT_OPTIONS_FORM,
+        profileChoice: 'auto',
+        onOptionsFailure: () => undefined,
+      });
+      return { panel, runner };
+    });
+    await act(async () => {
+      await result.current.panel.readInfo();
+    });
+    expect(result.current.panel.refusal).not.toBeNull();
+    act(() => {
+      generation = 2;
+      rerender();
+    });
+    expect(result.current.panel.refusal).toBeNull();
+    unmount();
+  });
 });

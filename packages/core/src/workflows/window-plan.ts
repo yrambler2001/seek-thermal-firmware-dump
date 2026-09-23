@@ -11,8 +11,13 @@
  * ==================================================================== */
 
 import { SeekError } from '../errors.js';
-import type { WindowPlan } from '../profiles/types.js';
-import { identityGate, readRunningFirmware, type RunningFirmware } from './capability.js';
+import type { ProfileId, WindowPlan } from '../profiles/types.js';
+import {
+  identityGate,
+  readRunningFirmware,
+  type IdentityGate,
+  type RunningFirmware,
+} from './capability.js';
 import type { WorkflowContext } from './types.js';
 
 export interface DevicePlan {
@@ -22,6 +27,30 @@ export interface DevicePlan {
 
 /** The operations that plan from the camera's own table, as a refusal names them. */
 export type PlannedOperation = 'dump' | 'sweep' | 'read the device info';
+
+/**
+ * The error a closed identity gate turns into, worded once.
+ *
+ * `planForDevice` throws it before a run's first arm, and a front end that
+ * asked the camera first (`identifyCamera`) throws the same one before the run
+ * starts, so the user reads one reason whichever of the two stopped them.
+ */
+export function identityRefusal(
+  gate: Extract<IdentityGate, { readonly permitsArming: false }>,
+  firmwareVersion: string | null,
+  operation: PlannedOperation,
+  profile: ProfileId,
+): SeekError {
+  return new SeekError(
+    gate.code,
+    `refusing to ${operation}: ${gate.reason}` +
+      (firmwareVersion === null
+        ? '. Nothing was armed. Unplug the camera, let it finish starting up, plug it back ' +
+          'in and try again.'
+        : ''),
+    { detail: { firmwareVersion, capability: operation, profile } },
+  );
+}
 
 /**
  * The running firmware's version, and the plan its own table gives.
@@ -45,22 +74,7 @@ export async function planForDevice(
   const firmware = await readRunningFirmware(ctx.device);
   const gate = identityGate(firmware);
   if (!gate.permitsArming) {
-    const version = firmware.version;
-    throw new SeekError(
-      gate.code,
-      `refusing to ${operation}: ${gate.reason}` +
-        (version === null
-          ? '. Nothing was armed. Unplug the camera, let it finish starting up, plug it back ' +
-            'in and try again.'
-          : ''),
-      {
-        detail: {
-          firmwareVersion: version,
-          capability: operation,
-          profile: ctx.profile.id,
-        },
-      },
-    );
+    throw identityRefusal(gate, firmware.version, operation, ctx.profile.id);
   }
   return { firmware, plan: ctx.profile.windowPlan(gate.version) };
 }

@@ -36,6 +36,7 @@ export {
 export { describeDevice, runDump } from './dump.js';
 export {
   evidenceFromChannelProbe,
+  identifyCamera,
   identityGate,
   predatesDumpProtocol,
   predatesDumpProtocolReason,
@@ -46,12 +47,18 @@ export {
   FIRST_DUMPABLE_MINOR,
   PROBE_OPEN_SUBCMD,
   PROBE_PROTECTED_SUBCMD,
+  type CameraIdentification,
   type IdentityGate,
   type ProbeOptions,
   type RunningFirmware,
   type SelectorChannelProbe,
 } from './capability.js';
-export { planForDevice, type DevicePlan, type PlannedOperation } from './window-plan.js';
+export {
+  identityRefusal,
+  planForDevice,
+  type DevicePlan,
+  type PlannedOperation,
+} from './window-plan.js';
 export { runSweep } from './sweep.js';
 export {
   decryptDump,

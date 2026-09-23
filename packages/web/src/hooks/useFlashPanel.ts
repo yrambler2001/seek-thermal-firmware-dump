@@ -30,11 +30,11 @@ import {
   writeFirmware,
   type DeviceState,
   type PreparedFlash,
-  type ProfileId,
   type WorkflowContext,
 } from '@seek-fw/core';
 import { downloadArchive, mib } from '../lib/download';
 import { logHint } from '../lib/hints';
+import { chooseActingProfile, refusalOf, type ProfileChoice, type Refusal } from '../lib/identify';
 import {
   asOptionsFailure,
   readOptions,
@@ -50,8 +50,11 @@ export const INFO_PANEL_ID = 'fwinfo';
 export const PREPARE_PANEL_ID = 'prepare';
 export const FLASH_PANEL_ID = 'flash';
 
-/** 'auto' means "whatever the last read detected", falling back to modern-4x. */
-export type ProfileChoice = ProfileId | 'auto';
+/**
+ * 'auto' asks the camera before the read (`chooseActingProfile`); a profile id
+ * is the expert override, which still goes through the read's own version gate.
+ */
+export type { ProfileChoice } from '../lib/identify';
 
 export interface PreparedImage {
   readonly prep: PreparedFlash;
@@ -71,6 +74,8 @@ export interface FlashPanelApi {
   readonly infoReporter: ReporterHandle;
   readonly flashReporter: ReporterHandle;
   readonly deviceState: DeviceState | null;
+  /** Why the last read was refused before it armed anything, or null. */
+  readonly refusal: Refusal | null;
   readonly prepared: PreparedImage | null;
   readonly readingInfo: boolean;
   readonly writing: boolean;
@@ -105,6 +110,7 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
   const flashReporter = useReporter('No image chosen.');
 
   const [deviceState, setDeviceState] = useState<DeviceState | null>(null);
+  const [refusal, setRefusal] = useState<Refusal | null>(null);
   const [prepared, setPrepared] = useState<PreparedImage | null>(null);
   const stateRef = useRef<DeviceState | null>(null);
   const preparedRef = useRef<PreparedImage | null>(null);
@@ -126,6 +132,7 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
       stateRef.current = null;
       preparedRef.current = null;
       setDeviceState(null);
+      setRefusal(null);
       setPrepared(null);
       if (had && reason !== null) {
         setInfoStatus(reason);
@@ -150,14 +157,6 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
     );
   }, [device.generation, device.device, dropAnalysis]);
 
-  const profileFor = useCallback(
-    (state: DeviceState | null): ProfileId => {
-      if (profileChoice !== 'auto') return profileChoice;
-      return state?.detection.best.profile.id ?? 'modern-4x';
-    },
-    [profileChoice],
-  );
-
   /* ---- read device info --------------------------------------------- */
 
   const readInfo = useCallback(
@@ -166,11 +165,11 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
         infoReporter.reset('Reading ...');
         flashReporter.setStatus('No image chosen.');
         dropAnalysis(null);
+        setRefusal(null);
         onOptionsFailure(null);
         let transport: ReturnType<DeviceHandle['makeTransport']> | null = null;
         try {
           const options = readOptions(form);
-          const profile = getProfile(profileFor(null));
           transport = device.makeTransport({
             recipient: options.recipient,
             onWarning: (message) => {
@@ -179,10 +178,23 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
           });
           const client = new SeekDevice(transport, { reporter: infoReporter.reporter, signal });
           await transport.open();
+          /* 'auto' ASKS THE CAMERA. It used to read under modern-4x without
+           * asking anything, which armed a 2016 camera's locked boot config on
+           * the plain channel and reported "no boot config". A hand-picked
+           * family skips the questions and nothing else: readDeviceInfo reads
+           * the version itself and refuses before its first arm. */
+          const chosen = await chooseActingProfile(
+            client,
+            profileChoice,
+            'read the device info',
+            (text, level) => {
+              infoReporter.reporter.log(text, level);
+            },
+          );
           const ctx: WorkflowContext = {
             device: client,
-            profile,
-            detection: null,
+            profile: chosen.profile,
+            detection: chosen.detection,
             reporter: infoReporter.reporter,
             signal,
           };
@@ -210,16 +222,31 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
             infoReporter.log('cancelled', 'warn');
             infoReporter.setStatus('Cancelled.');
           } else {
+            const refused = refusalOf(error);
+            if (refused !== null) setRefusal(refused);
             infoReporter.log(`ERROR: ${errorMessage(error)}`, 'error');
             logHint(infoReporter.log, error);
-            infoReporter.setStatus('Failed — see the log above.');
+            infoReporter.setStatus(
+              refused === null
+                ? 'Failed — see the log above.'
+                : 'Refused — nothing was armed. See the message below the log.',
+            );
           }
         } finally {
           if (transport !== null) await transport.close();
           infoReporter.flush();
         }
       }),
-    [device, dropAnalysis, flashReporter, form, infoReporter, onOptionsFailure, profileFor, runner],
+    [
+      device,
+      dropAnalysis,
+      flashReporter,
+      form,
+      infoReporter,
+      onOptionsFailure,
+      profileChoice,
+      runner,
+    ],
   );
 
   /* ---- pick an image ------------------------------------------------- */
@@ -286,7 +313,10 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
         let transport: ReturnType<DeviceHandle['makeTransport']> | null = null;
         try {
           const options = readOptions(form);
-          const profile = getProfile(profileFor(state));
+          /* The family the analysis was made under, unless one is named by
+           * hand now. `writeFirmware` itself acts under `state.profile`; this
+           * is the family the rescue dump reads with. */
+          const profile = profileChoice === 'auto' ? state.profile : getProfile(profileChoice);
           transport = device.makeTransport({
             recipient: options.recipient,
             onWarning: (message) => {
@@ -423,7 +453,7 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
           flashReporter.flush();
         }
       }),
-    [device, dropAnalysis, flashReporter, form, onOptionsFailure, profileFor, runner],
+    [device, dropAnalysis, flashReporter, form, onOptionsFailure, profileChoice, runner],
   );
 
   const cancelInfo = useCallback((): void => {
@@ -451,6 +481,7 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
       infoReporter,
       flashReporter,
       deviceState,
+      refusal,
       prepared,
       readingInfo: runner.active === INFO_PANEL_ID,
       writing: runner.active === FLASH_PANEL_ID,
@@ -465,6 +496,7 @@ export function useFlashPanel(params: FlashPanelParams): FlashPanelApi {
       infoReporter,
       flashReporter,
       deviceState,
+      refusal,
       prepared,
       runner.active,
       canWrite,

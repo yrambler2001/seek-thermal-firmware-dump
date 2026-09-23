@@ -38,7 +38,8 @@ import { CancelledError, errorMessage, type SeekErrorCode } from '../errors.js';
 import type { SeekDevice } from '../protocol/client.js';
 import { DEFAULT_READ_CHUNK, OP } from '../protocol/ops.js';
 import { OLD_FW_UNLOCK_TOKEN, authPayload } from '../profiles/legacy-auth.js';
-import type { DeviceEvidence } from '../profiles/types.js';
+import { detectProfile } from '../profiles/registry.js';
+import type { DetectionResult, DeviceEvidence } from '../profiles/types.js';
 
 /**
  * The bank the plain/authenticated question is asked about.
@@ -252,6 +253,12 @@ export interface SelectorChannelProbe {
    * both cases `0x52` may be `EnterBootloaderMode` (`identityGate`).
    */
   readonly skippedForSafety: boolean;
+  /**
+   * `identityGate`'s verdict on the version read, exactly as the probe acted
+   * on it. A caller that refuses on it refuses for the reason the probe
+   * stopped for, in the same words `planForDevice` would use.
+   */
+  readonly gate: IdentityGate;
   /** One line per step, for the reporter and the dump manifest. */
   readonly notes: readonly string[];
 }
@@ -303,6 +310,7 @@ export async function probeSelectorChannel(
       authAccepted: false,
       openWindowReadable: false,
       skippedForSafety: true,
+      gate,
       notes,
     };
   }
@@ -315,6 +323,7 @@ export async function probeSelectorChannel(
       authAccepted: false,
       openWindowReadable: false,
       skippedForSafety: true,
+      gate,
       notes: [...notes, 'the selector-channel probes were disabled by the caller'],
     };
   }
@@ -381,6 +390,7 @@ export async function probeSelectorChannel(
     authAccepted,
     openWindowReadable,
     skippedForSafety: false,
+    gate,
     notes,
   };
 }
@@ -407,4 +417,48 @@ export function evidenceFromChannelProbe(probe: SelectorChannelProbe): DeviceEvi
     plainSelectorRefused: !probe.plainAccepted,
     authSelectorWorks: probe.authAccepted,
   };
+}
+
+/** What asking an attached camera settled, for a caller that has not named a profile. */
+export interface CameraIdentification {
+  /** The four questions and their answers (`probeSelectorChannel`). */
+  readonly probe: SelectorChannelProbe;
+  /** The USB descriptors plus the probe's answers, as `detectProfile` scored them. */
+  readonly evidence: DeviceEvidence;
+  /** The ranking. `detection.best.profile` is the family a run acts under. */
+  readonly detection: DetectionResult;
+  /**
+   * Whether anything may be armed at all: `identityGate` on the version the
+   * probe read. When it says no, the run is refused whatever the ranking says
+   * — `planForDevice` would refuse it too, with the same reason.
+   */
+  readonly gate: IdentityGate;
+}
+
+/**
+ * DETECTION ON AN ATTACHED CAMERA: the descriptors it enumerated with, the
+ * four read-only answers of `probeSelectorChannel`, and `detectProfile` over
+ * both. This is the CLI's `chooseProfileByProbe` without the CLI, so the
+ * browser asks the camera the same questions and ranks the answers the same
+ * way instead of asking the user which family the camera is.
+ *
+ * It CHOOSES; it does not permit. The run that follows still goes through
+ * `planForDevice`, which reads the version again and applies `identityGate`
+ * before the first arm, so a caller that ignores `gate` here (or a user who
+ * picks a profile by hand and skips this altogether) gets the same refusal
+ * one step later. Nothing here sends more than the probe does.
+ */
+export async function identifyCamera(
+  device: SeekDevice,
+  options: ProbeOptions = {},
+): Promise<CameraIdentification> {
+  const probe = await probeSelectorChannel(device, options);
+  const description = device.transport.description;
+  const evidence: DeviceEvidence = {
+    ...(description.productName === null ? {} : { productName: description.productName }),
+    vendorId: description.vendorId,
+    productId: description.productId,
+    ...evidenceFromChannelProbe(probe),
+  };
+  return { probe, evidence, detection: detectProfile(evidence), gate: probe.gate };
 }

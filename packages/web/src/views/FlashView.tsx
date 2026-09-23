@@ -27,7 +27,8 @@ import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/field';
 import { Disclosure } from '@/components/ui/disclosure';
 import { Toolbar } from '@/components/ui/toolbar';
-import type { FlashPanelApi, ProfileChoice } from '@/hooks/useFlashPanel';
+import type { FlashPanelApi } from '@/hooks/useFlashPanel';
+import type { ProfileChoice } from '@/lib/identify';
 
 const IMAGE_ACCEPT = '.bin,.img,.rom,application/octet-stream';
 
@@ -87,6 +88,7 @@ export function FlashView({
 
         <ProfilePanel
           state={deviceState}
+          refusal={flash.refusal}
           choice={profileChoice}
           onChange={onProfileChoice}
           disabled={busy}
@@ -255,13 +257,15 @@ export function FlashView({
       <Section id="writes" title="What this view writes" icon={<Send />}>
         <Prose>
           <p>
-            The dump view&apos;s five read commands, plus these. Nothing else is in the source —
-            there is no <code>ResetDevice</code>, no raw-block write, and no path that touches the
-            bootloader at <code>0x14000000</code> or the recovery slot at <code>0x14070000</code>.
+            The dump view&apos;s six read commands, plus these. (<code>GetFirmwareInfo</code> is one
+            of the six: the dump reads only the running version with it, and this view also reads
+            the other records listed.) Nothing else is in the source — there is no{' '}
+            <code>ResetDevice</code>, no raw-block write, and no path that touches the bootloader at{' '}
+            <code>0x14000000</code> or the recovery slot at <code>0x14070000</code>.
           </p>
         </Prose>
 
-        <OpcodeTable caption="The five commands the flash view adds" rows={FLASH_OPCODES} />
+        <OpcodeTable caption="The commands the flash view adds" rows={FLASH_OPCODES} />
 
         <div className="space-y-2">
           <Disclosure summary="What the camera does when you press commit">

@@ -13,7 +13,13 @@
  * in a package that reaches for `process` and `node:fs`.
  */
 
-import { errorMessage, isSeekError, type LogLevel, type SeekErrorCode } from '@seek-fw/core';
+import {
+  errorMessage,
+  isSeekError,
+  type LogLevel,
+  type SeekError,
+  type SeekErrorCode,
+} from '@seek-fw/core';
 
 /** Only the three the advice actually differs for. */
 export type HostPlatform = 'linux' | 'windows' | 'other';
@@ -83,8 +89,9 @@ export function looksLikeAccessError(error: unknown): boolean {
 
 /**
  * Per-code advice, the CLI's table translated into what this page can offer:
- * there is no `--chunk` or `seek-fw profiles` here, there are form controls
- * and two dump buttons.
+ * there is no `--chunk` or `seek-fw profiles` here, there are form controls,
+ * a dump that asks the camera which family it is, and a hand-picked family
+ * for the camera that detection gets wrong.
  */
 const SEEK_HINTS: Partial<Record<SeekErrorCode, string>> = {
   'options/invalid': 'Open "Read options" and check the note under the fields for each range.',
@@ -93,7 +100,8 @@ const SEEK_HINTS: Partial<Record<SeekErrorCode, string>> = {
     'smaller chunk (64 is the value that works everywhere).',
   'usb/stalled':
     'The camera rejected the request. This usually means the firmware does not implement it — ' +
-    'try the legacy dump panel, or name the firmware family instead of leaving it on auto.',
+    'if detection picked the wrong family, name the family by hand ("Choose the firmware ' +
+    'family yourself" on the dump page, the profile menu on the flash page).',
   'usb/not-open':
     'Another program or a system driver is holding the camera. Close it, or set recipient to ' +
     '"device" in the read options, which does not need the interface claimed.',
@@ -117,9 +125,26 @@ const SEEK_HINTS: Partial<Record<SeekErrorCode, string>> = {
     'The commit was rejected. The camera checks the transfer checksum before it erases ' +
     'anything, so a rejected commit leaves the flash untouched.',
   'profile/unsupported':
-    'Name the firmware family explicitly instead of leaving the profile on auto, if you know ' +
-    'which one this camera is.',
+    'The firmware family chosen for this camera does not support that. Leave the family on ' +
+    'auto so the camera is asked, or pick one that does.',
 };
+
+/**
+ * The version gate's refusal of a build that predates the dump protocol, as
+ * opposed to a profile's own capability refusal: the same code, but no family
+ * the user could pick changes it, so the per-code advice above would send them
+ * round in a circle. Told apart by what `planForDevice` puts in the detail —
+ * the version it read — which `requireCapability` never does.
+ */
+export const FIRMWARE_TOO_OLD_HINT =
+  'No firmware family can read this build over USB: its firmware has no command that serves ' +
+  'flash, so nothing that could be misread was sent to it. A dump taken with an SPI programmer ' +
+  'or over SWD/J-Link can still be decrypted on this page, under "Decrypt a dump you already ' +
+  'have".';
+
+function isFirmwareTooOld(error: SeekError): boolean {
+  return error.code === 'profile/unsupported' && typeof error.detail?.firmwareVersion === 'string';
+}
 
 function liveUserAgent(): string {
   return typeof navigator === 'undefined' ? '' : navigator.userAgent;
@@ -130,7 +155,10 @@ export function hintFor(error: unknown, userAgent: string = liveUserAgent()): st
   /* The permission case first: it is the one whose remedy depends on the
    * machine rather than on which opcode failed. */
   if (looksLikeAccessError(error)) return permissionHint(userAgent);
-  if (isSeekError(error)) return SEEK_HINTS[error.code] ?? null;
+  if (isSeekError(error)) {
+    if (isFirmwareTooOld(error)) return FIRMWARE_TOO_OLD_HINT;
+    return SEEK_HINTS[error.code] ?? null;
+  }
   return null;
 }
 

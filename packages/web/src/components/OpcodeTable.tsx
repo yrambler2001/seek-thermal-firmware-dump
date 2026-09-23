@@ -71,8 +71,18 @@ export function OpcodeTable({ caption, rows }: OpcodeTableProps): ReactElement {
   );
 }
 
-/** The dump view's whole vocabulary, verbatim from the original. */
+/**
+ * The dump view's whole vocabulary: the original's five, verbatim, and the
+ * version read that has gone out before every dump since the toolkit started
+ * reading each build's own selector table (core `READ_ONLY_OPS`).
+ */
 export const READ_ONLY_OPCODES: readonly OpcodeRow[] = [
+  {
+    opcode: '0x4e',
+    name: 'GetFirmwareInfo',
+    dir: 'IN',
+    why: "the running firmware version, read first: it decides which build's selector table the dump uses, and a camera that does not report one is not read",
+  },
   { opcode: '0x35', name: 'GetErrorCode', dir: 'IN', why: 'check status after each step' },
   {
     opcode: '0x3c',
@@ -90,7 +100,11 @@ export const READ_ONLY_OPCODES: readonly OpcodeRow[] = [
   },
 ];
 
-/** The five the flash view adds on top, verbatim from the original. */
+/**
+ * What the flash view adds, verbatim from the original. `GetFirmwareInfo` is
+ * also in the dump's vocabulary now — the dump reads the running version with
+ * it — and is listed here as well for the records only this view reads.
+ */
 export const FLASH_OPCODES: readonly OpcodeRow[] = [
   {
     opcode: '0x4e',

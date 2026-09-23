@@ -17,6 +17,7 @@ import { detectProfile } from '../src/profiles/registry.js';
 import { OLD_FW_UNLOCK_TOKEN } from '../src/profiles/legacy-auth.js';
 import {
   evidenceFromChannelProbe,
+  identifyCamera,
   identityGate,
   predatesDumpProtocol,
   PROBE_OPEN_SUBCMD,
@@ -248,5 +249,54 @@ describe('evidenceFromChannelProbe', () => {
     expect(evidence.plainSelectorRefused).toBeUndefined();
     expect(evidence.plainSelectorWorks).toBeUndefined();
     expect(detectProfile(evidence).best.profile.id).toBe('compact-2014');
+  });
+});
+
+describe('identifyCamera: detection on an attached camera, for any front end', () => {
+  it('ranks the descriptors and the probe together, as the CLI always has', async () => {
+    const camera = cameraFor([1, 0, 3, 0], {
+      authBanks: [PROBE_PROTECTED_SUBCMD],
+      authToken: OLD_FW_UNLOCK_TOKEN,
+      description: { productName: 'PIR206 Thermal Camera', productId: 0x0010 },
+    });
+    await camera.open();
+    const identification = await identifyCamera(new SeekDevice(camera));
+
+    expect(identification.gate).toEqual({ permitsArming: true, version: '1.0.3.0' });
+    expect(identification.evidence).toMatchObject({
+      productName: 'PIR206 Thermal Camera',
+      vendorId: 0x289d,
+      productId: 0x0010,
+      firmwareVersion: '1.0.3.0',
+      plainSelectorRefused: true,
+      authSelectorWorks: true,
+    });
+    expect(identification.detection.best.profile.id).toBe('legacy-auth');
+    expect(identification.detection).toEqual(detectProfile(identification.evidence));
+  });
+
+  it('reports the gate the probe stopped at, and sends nothing past the version read', async () => {
+    const camera = fakeCamera({ initialMode: 0, fwInfo: new Map() });
+    await camera.open();
+    const identification = await identifyCamera(new SeekDevice(camera));
+
+    expect(identification.gate.permitsArming).toBe(false);
+    if (identification.gate.permitsArming) return;
+    expect(identification.gate.code).toBe('device/version-unknown');
+    expect(identification.probe.gate).toBe(identification.gate);
+    expect(identification.evidence.plainSelectorRefused).toBeUndefined();
+    expect(camera.calls.every((call) => call.op === OP.GET_FIRMWARE_INFO)).toBe(true);
+  });
+
+  it('says profile/unsupported for a build that predates the dump protocol', async () => {
+    const camera = cameraFor([0, 7, 0, 7]);
+    await camera.open();
+    const identification = await identifyCamera(new SeekDevice(camera));
+
+    expect(identification.gate.permitsArming).toBe(false);
+    if (identification.gate.permitsArming) return;
+    expect(identification.gate.code).toBe('profile/unsupported');
+    expect(identification.detection.best.profile.id).toBe('compact-2014');
+    expect(camera.calls.every((call) => call.op === OP.GET_FIRMWARE_INFO)).toBe(true);
   });
 });

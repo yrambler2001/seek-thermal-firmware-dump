@@ -7,10 +7,9 @@
 import {
   SeekDevice,
   detectProfile,
-  evidenceFromChannelProbe,
   getProfile,
   hex,
-  probeSelectorChannel,
+  identifyCamera,
   type Artifact,
   type DetectionResult,
   type DeviceEvidence,
@@ -74,7 +73,8 @@ export function chooseProfile(options: GlobalOptions, evidence: DeviceEvidence):
  * This sends four read-only transfers first — the version, a plain arm of a
  * protected bank, an authenticated arm of the same bank, and a read of a bank
  * open on every line — and hands the answers to the same scoring. See
- * `probeSelectorChannel` for why each one is safe and what it settles.
+ * `probeSelectorChannel` for why each one is safe and what it settles; the
+ * composition itself is core's `identifyCamera`, which the browser uses too.
  *
  * `--profile` still wins outright and skips the probe: a caller who has named
  * a family is not asking to be second-guessed, and on a camera the fewest
@@ -92,10 +92,8 @@ export async function chooseProfileByProbe(
   }
 
   ctx.reporter.log('asking the camera which protocol it speaks ...', 'detail');
-  const probe = await probeSelectorChannel(session.device);
+  const { probe, detection } = await identifyCamera(session.device);
   for (const note of probe.notes) ctx.reporter.log(`  ${note}`, 'detail');
-
-  const detection = detectProfile({ ...descriptors, ...evidenceFromChannelProbe(probe) });
   return { profile: detection.best.profile, detection, forced: false };
 }
 

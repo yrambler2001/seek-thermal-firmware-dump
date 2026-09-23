@@ -315,7 +315,9 @@ export {
   evidenceFromChannelProbe,
   evidenceFromDump,
   flashInvalidatesAnalysis,
+  identifyCamera,
   identityGate,
+  identityRefusal,
   isCancelled,
   planForDevice,
   predatesDumpProtocol,
@@ -337,6 +339,7 @@ export {
   writeFirmware,
 } from './workflows/index.js';
 export type {
+  CameraIdentification,
   ComparisonRow,
   DecryptOptions,
   SelectorChannelProbe,

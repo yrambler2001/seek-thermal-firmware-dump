@@ -1,21 +1,25 @@
 /**
- * The flash view's firmware-family panel: what the camera looks like, and the
- * manual override, because detection is a suggestion and the person holding
- * the camera may know better.
+ * The flash view's firmware-family panel: what the camera said it is, why a
+ * read was refused, and the manual override — detection is the default, and
+ * the person holding the camera may still know better. The override picks the
+ * family; it never skips the version check the read itself makes.
  */
 
 import type { ReactElement } from 'react';
 import { ScanSearch } from 'lucide-react';
 import { listProfiles, type DeviceState } from '@seek-fw/core';
+import { CameraIdentity } from './CameraIdentity';
 import { DetectionBox } from './DetectionBox';
 import { Panel, PanelTitle } from './Panel';
 import { Prose } from './Prose';
 import { Field, Select } from './ui/field';
-import type { ProfileChoice } from '@/hooks/useFlashPanel';
+import type { ProfileChoice, Refusal } from '@/lib/identify';
 
 export interface ProfilePanelProps {
   /** null until a read has happened; the selector still works. */
   readonly state: DeviceState | null;
+  /** Why the last read was refused, or null. */
+  readonly refusal?: Refusal | null;
   readonly choice: ProfileChoice;
   readonly onChange: (choice: ProfileChoice) => void;
   readonly disabled: boolean;
@@ -23,6 +27,7 @@ export interface ProfilePanelProps {
 
 export function ProfilePanel({
   state,
+  refusal = null,
   choice,
   onChange,
   disabled,
@@ -30,11 +35,14 @@ export function ProfilePanel({
   return (
     <Panel>
       <PanelTitle icon={<ScanSearch />}>Detected firmware profile</PanelTitle>
-      {state === null ? (
+      {refusal !== null ? (
+        <CameraIdentity acting={null} refusal={refusal} />
+      ) : state === null ? (
         <Prose>
           <p>
-            Nothing detected yet — press <strong>Read device info</strong>. The selector below
-            chooses which family the next read acts under.
+            Nothing detected yet — press <strong>Read device info</strong>. On <em>auto</em> the
+            camera is asked which firmware it runs first, and the read uses that family and that
+            build&apos;s own selector table.
           </p>
         </Prose>
       ) : (
@@ -54,7 +62,7 @@ export function ProfilePanel({
             onChange(event.target.value);
           }}
         >
-          <option value="auto">auto — use what detection picked</option>
+          <option value="auto">auto — ask the camera (recommended)</option>
           {listProfiles().map((profile) => (
             <option key={profile.id} value={profile.id}>
               {`${profile.name} (${profile.id})`}
@@ -68,6 +76,11 @@ export function ProfilePanel({
           Overriding changes the selector map, the whitening constant and the acceptance sum the
           next read uses. A profile that does not declare flashing keeps the write button disabled
           however the camera answers.
+        </p>
+        <p>
+          An override does not skip the safety check: the read still asks the camera for its
+          firmware version before anything is armed, and refuses a camera that does not report it,
+          or runs a build older than 0.8.0.0, whichever family is chosen.
         </p>
       </Prose>
     </Panel>
