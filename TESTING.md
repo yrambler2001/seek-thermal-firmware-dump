@@ -736,8 +736,8 @@ did in run B.
    `interface`. The same request as `0x01` succeeds on 4.8.1.9, 0.5.0.2 and 4.18.2.0-FF. Fixing
    it is right, but it changes every vendor request's recipient, so it needs a regeneration and
    a reviewed diff. It is not a speed fix; each stall costs 1–3 ms.
-5. **Not recommended now:** shortening the emulator's 20,000-step host-harness budget that
-   0.6.0.4 pays 127 times. That budget is 1.32 M cycles against a worst observed answer of 94,048,
+5. **Not recommended now** _(looked at again in §12.5, not done)_: shortening the emulator's
+   20,000-step host-harness budget that 0.6.0.4 pays 127 times. That budget is 1.32 M cycles against a worst observed answer of 94,048,
    so there is room. But the row is off the critical path once fix 1 is in, and shortening it
    changes when the emulator declares a request unanswered.
 
@@ -1375,8 +1375,8 @@ design. No standard request stalled.
   41-row method table and its modern `cmd_BeginFirmwareUpgrade` (`case 0xE` →
   0x140C0000), which the 0.3.0.1 image does not have; recorded in FW-V1
   `docs/ACTION_ITEMS.md`, not changed here.
-- The web dump view still calls the unlock token "build-specific" (§9.3 shows one token in
-  22 images); not changed here.
+- ~~The web dump view still calls the unlock token "build-specific" (§9.3 shows one token in
+  22 images); not changed here.~~ Fixed in §12.2.
 
 ---
 
@@ -1464,7 +1464,9 @@ says:
 
 On all 51 rows only `IN 0x4E` went out before identity. On 0.5.1.0 and 0.5.1.3 that read is
 the whole of what was sent, and the dump refused. 0.6.0.4 does not answer the probe's
-version read and does answer the dump's, which then refuses it as a pre-0.8 build.
+version read and does answer the dump's, which then refuses it as a pre-0.8 build. _(§12.3:
+since the version read takes two answered reads, the probe's own version read gets
+0.6.0.4's version, and compact-2014 refuses the dump.)_
 
 **The same two rows on the old code.** I ran the new instrument against a worktree of
 `ee9ca13`. The only additions were the two exports the instrument imports: the constant
@@ -1703,7 +1705,7 @@ machine as §10.5.
 - Without the optional inputs, `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run`
   gives **511 passed | 3 skipped**, exit 0. That was 473; the 38 new tests are those of
   §11.7.
-- **Found in passing, not caused here.** `npm run test:coverage` (CI's test step) already
+- **Found in passing, not caused here** _(fixed in §12.4)_. `npm run test:coverage` (CI's test step) already
   fails at `ee9ca13`. The `profiles/**` functions threshold is 95%, and coverage is 60 of 64
   (93.75%). The four uncovered functions are in `plan.ts` (two error-message callbacks),
   `compact-2014.ts` (`windowPlan`) and `registry.ts` (`hasCapability`). At `ee9ca13`, 2
@@ -1713,7 +1715,7 @@ machine as §10.5.
 
 ### 11.10 Still open
 
-- **The version read trusts the info selector to be 0.** The unarmed GetFirmwareInfo returns
+- ~~**The version read trusts the info selector to be 0.**~~ Closed in §12.3. The unarmed GetFirmwareInfo returns
   whichever block the selector names, and the selector is cleared only by a read. A camera
   left with the selector set returns the bootloader's version as if it were the
   application's. That can happen if another program, or an interrupted run of this one,
@@ -1728,3 +1730,313 @@ machine as §10.5.
 - **The commit bound assumes one status-register write per erase or program.** The SPIFI
   lock command before each operation was not traced to the wire. At 15 ms each, the total
   is 75 ms of the 8,117.
+
+---
+
+## 12. The web app asks the camera, the version read survives a stale selector, and CI's coverage (2026-09-23)
+
+Four changes, each with tests. The toolkit is at `447cd67` (the web app detects the camera,
+and the token text), `0545094` (the version read), `2951543` (the pins it changed) and
+`aae8ea0` (coverage). FW-V1 is at `653ee4f5` and nothing in it changed. **The fifth task, a
+cheaper answer for unanswered requests on the emulator, is not done** (§12.5). The final
+`npm run check` could not be run cleanly either: another program on the same machine was
+stopping emulator processes (§12.6).
+
+### 12.1 The web app asks the camera which family it is
+
+**What was wrong.** The browser made the user pick the camera type. The dump page's "Start
+dump" always meant the post-2018 map (`modern-4x`), and a separate "Dump legacy firmware"
+forced `legacy-auth`. The flash page had a profile menu whose "auto" read under `modern-4x`
+without asking the camera anything, which arms a 2016 camera's locked boot config on the
+plain channel. The CLI had asked the camera since the probe existed; the browser never did.
+
+**What changed.**
+
+- Core has `identifyCamera(device)`: the USB descriptors plus `probeSelectorChannel`, scored
+  by `detectProfile`. It is what the CLI's `chooseProfileByProbe` did, and the CLI now calls
+  it. It also returns `gate`, `identityGate`'s verdict on the version the probe read.
+- Core has `identityRefusal()`, the one wording of a closed identity gate. `planForDevice`
+  throws it, and so does the web app when the probe's gate is shut, so the user reads the
+  same reason whichever of the two stopped the run.
+- `packages/web/src/lib/identify.ts` `chooseActingProfile()`: on `auto` it asks the camera and
+  acts under `detection.best.profile`; when the gate is shut it throws the refusal before the
+  run starts.
+- The dump page: "Start dump" and "Dump all selectors" run on `auto`. Nothing is chosen.
+- The flash page: "Read device info" on `auto` asks the camera first.
+- A refusal is shown in an alert above the log (`CameraIdentity`): what the camera did not
+  say, the toolkit's own message, and the hint. `device/version-unknown` keeps its hint
+  (replug and retry). A build older than 0.8.0.0 now gets its own hint
+  (`FIRMWARE_TOO_OLD_HINT`): no family can read it over USB, and a dump taken another way
+  still decrypts. The old per-code hint told that user to pick another family, which cannot
+  help.
+- When the camera answered, the panel shows the version and the detection box (family,
+  confidence, reasons, and the ambiguity warning).
+
+**The hand-picked family is kept, as an expert override, and it cannot skip the gate.** The
+dump page has a section "Choose the firmware family yourself" (a menu, defaulting to
+`legacy-auth`, which is what the old legacy button forced), and the flash page keeps its
+menu. Picking a family skips the three channel questions of the probe and nothing else:
+`runDump`, `runSweep` and `readDeviceInfo` read the version through `planForDevice` and apply
+`identityGate` before their first arm, whatever profile they were given. There is no path
+from the page to a workflow that does not go through that.
+
+**The read-only vocabulary said five commands; it is six.** The dump has read the running
+version with `GetFirmwareInfo` since it began planning from each build's own table (§10.3),
+so the dump page's opcode table and its "exactly five vendor commands" were wrong. Both now
+list six, with `GetFirmwareInfo` first, and a paragraph says only the three
+`SAFE_BEFORE_IDENTITY` reads go out before the version is known. The README says the same.
+
+**Tests** (`packages/web`, against a scripted WebUSB camera in `test-fixtures.ts` that answers
+like one firmware line: its version, the legacy plain-channel lock, the token check; a refusal
+is a stall, as on the wire):
+
+| test (file)                                                                   | checks                                                                                                   |
+| ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| auto dump of 4.18.2.0 (`useDumpPanel.test.tsx`)                               | acts under `modern-4x`, not forced; the first request is GetFirmwareInfo; the probe's plain arm was sent |
+| auto dump of 1.0.3.0 with the lock                                            | acts under `legacy-auth` untold; token arms of 3, 5, 6, 7, 8 and 9 went out; the manifest names it       |
+| auto dump and sweep of a camera with no version                               | `device/version-unknown` shown with its hint; nothing downloaded; only `SAFE_BEFORE_IDENTITY` INs sent   |
+| auto dump of 0.3.0.1                                                          | `profile/unsupported`, `FIRMWARE_TOO_OLD_HINT`; the only requests are the version read                   |
+| hand-picked `modern-4x` on 4.18.2.0                                           | forced, no detection, no probe arm; the version is still read first                                      |
+| hand-picked `legacy-auth`, `modern-4x`, `compact-2016`, `generic`, no version | every one refused, nothing downloaded, only safe INs                                                     |
+| hand-picked families on 0.3.0.1 (dump page and flash page)                    | every one refused; the only requests are the version read                                                |
+| Read device info on auto, 1.0.3.0 (`useFlashPanel.test.tsx`)                  | reads under `legacy-auth` where it used to read `modern-4x`                                              |
+| Read device info, no version; a device change                                 | refusal shown, nothing armed; the refusal is forgotten when the camera changes                           |
+| `identifyCamera` (core `capability.test.ts`)                                  | evidence and ranking equal `detectProfile` over them; the gate and no request past the version read      |
+| render and a11y tests, hints (`render-smoke`, `App`, `hints.test.ts`)         | the override is a labelled control; the refusal alert and the detection panel render; the new hint       |
+
+### 12.2 The unlock-token text
+
+The dump page said: "The unlock token is **build-specific**; the one built in was recovered
+from a Compact PRO (PIR324) unit. On firmware with a different token the protected banks just
+stall". That is false. §9.3 measured it: the same 16 bytes occur once each in 22 of the 36
+corpus images (every 2014–2017 build, 0.3.0.1 to 1.3.0.8 on the Compact and 1.0.3.0 and
+1.0.3.2 on the Compact PRO) and in none of the 14 later ones, which have no token check.
+`firmware-facts.test.ts` asserts both counts. The page now says it is one 16-byte value, not
+one per build, with those numbers. `safety-copy.test.tsx` pins the new sentences and has a
+test that fails if "build-specific" (or "per-build token") appears on either page.
+
+Searched for the same mistake: the README never made it. `legacy/index.html` makes it, and is
+left alone on purpose: it is the original page, kept as the oracle for `verify:legacy`. The
+README's profile table still said `legacy-auth` starts at 0.7.0.7 and `compact-2014` covers
+"older than 0.7.0.7"; both now say 0.8.0.0 (§10.3).
+
+### 12.3 The version read, and a firmware-info selector left set
+
+**What the firmware does**, from FW-V1's reconstructed C (read, not edited):
+
+- The selector is one u16 in RAM (`g_fw_info_selector`, 0x1000B3EE on the completed images;
+  `fwinfo_index_r32k0301` on 0.3.0.1, `info_index` on 1.3.0.8). It is BSS, so it is 0 after a
+  reset. Nothing in the USB stack clears it, so it survives the host closing and reopening the
+  device.
+- Two setters write it: `cmd_SetFirmwareInfoFeatures` (wire 0x55; bound `<= 0x19` on the
+  completed images, `<= 0x17` on the 2016 build and 1.3.0.8, `<= 9` on 0.3.0.1) and
+  `cmd_SetFwOpCharFeatures` (wire 0x5B, `<= 5`), which shares the cell on the completed
+  images. (On 0.3.0.1 the getter reads its own cell, 0x1000EE1E, and that reconstruction's
+  `cmd_SetFwOpCharFeatures` is still the completed image's, §10.6, so it says nothing there.) An out-of-range value
+  is refused and leaves the cell as it was.
+- `cmd_GetFirmwareInfo` switches on it and, on every path that returns data, stores
+  `*out_len` and writes 0 back (e.g. `targets/compact_pro_ff/src/rpc_cmds.c:1638`, `:1900`,
+  `:1908`). Every reconstruction does, in all eleven application targets: 0.3.0.1, 1.3.0.8,
+  the 2016 Compact PRO, `compact_pro`, 4.9.2.0, Compact PRO FF, Compact XR, Mosaic 9 Hz and FF,
+  Nano 200 and 300. The unsupported-record path clears it too, except on 0.3.0.1, whose setter
+  cannot store a record its getter lacks. `cmd_GetFwOpChar` clears it as well.
+- It runs while the device handles the SETUP stage
+  (`targets/compact_pro_ff/src/usb_core.c:1087`), so a read the device took clears the
+  selector even if its reply were lost afterwards.
+- The getter's wrong-mode return (`(out_data & 0xFF000000) == 0x14000000 && mode == 1`) does
+  not clear it, but `out_data` there is the address of the reply-pointer cell, which is in RAM
+  (`&pCtrl->EP0Data.pData`), so that arm cannot fire over USB. A request the dispatcher
+  refuses before the getter runs (no handler, "sent during FW init", the mode gate) does not
+  clear it either.
+
+So the unarmed read returns selector 0, the build block, **only if nothing set the selector
+since the last read**. Another program, or an interrupted run of this one, that sent
+`SetFirmwareInfoFeatures` and never read afterwards leaves the next unarmed read returning
+some other record. The emulator showed it: 2.0.2.3, the bootloader's version, on 4.8.1.7
+(§11.8).
+
+**The rule now** (`readRunningFirmware`): the version comes from an answered GetFirmwareInfo
+that directly follows another answered one. The first answer is never the version; it only
+proves the selector is now 0. A failed read proves nothing (a stall may be the dispatcher, a
+timeout may be a SETUP never taken), so it does not count. At most
+`VERSION_READ_ATTEMPTS = 4` reads, and two failures in a row end it. Only GetFirmwareInfo is
+sent, as a control IN, so the read stays inside `SAFE_BEFORE_IDENTITY`. When the first
+answer differs from the second, the note says so ("the first read answered a different record
+(2.0.2.3), which an earlier command had left the firmware-info selector on").
+
+The cost: every version read is two transfers instead of one. A camera that never answers is
+refused after two reads instead of one.
+
+**Tests** (`identity-gate.test.ts`, "a camera an earlier command left with the firmware-info
+selector set"). The fake camera keeps the selector across close and open, as the firmware
+does. Run against the old `readRunningFirmware` (only `VERSION_READ_ATTEMPTS` added so the
+file loads), all five fail:
+
+| test                                                               | on the old code                                                  |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------- |
+| reads the application's version, not the record the selector names | `expected '2.0.2.3' to be '4.8.1.7'`                             |
+| hands the probe and the planner that version too                   | `expected '2.0.2.3' to be '4.8.1.7'`                             |
+| cannot open the gate on 0.3.0.1 with a stale record                | the probe sent **3 arms (0x52, EnterBootloaderMode on 0.3.0.1)** |
+| counts only an ANSWERED read as clearing the selector              | `expected null to be '4.8.1.7'` (one lost read, then no retry)   |
+| gives up after two failures in a row, and after the budget         | `expected '4.8.1.7' to be null` (one answer taken on trust)      |
+
+Existing tests that pinned exactly one GetFirmwareInfo now pin two: four in
+`capability.test.ts`, one in `workflows.test.ts`, two in `identity-gate.test.ts` and three in
+the web tests of §12.1. None of them was loosened: each still asserts the exact request list.
+
+**On the emulator.** Tier 1 has a new field, `staleSelector`: at the end of each row, after
+the command probe's `SetFirmwareInfoFeatures(1)` has been left unread, the toolkit's own
+version read runs and every answer is recorded with the version it settled on. Every row
+asserts, in both modes, that this version equals the one the plan was made from earlier in
+the same row with the selector at 0. The first-contact instrument (`IdentityRecorder`) now
+uses the same rule as `readRunningFirmware` for "identified".
+
+### 12.3.1 Pinned results that changed
+
+`node scripts/update-emulator-expectations.mjs`, both tiers: exit 0, 183 s, 450 passed
+(core), 51 + 15 emulator processes audited, 0 replies dropped. **Tier 2 is byte-identical.**
+In `expectations.rpc.json`:
+
+| rows    | field           | old                                                                                                     | new                                                                                                                                   | why                                                                                                                                                                                                                                 |
+| ------- | --------------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| file    | `note`          | described fields up to `gate`                                                                           | also describes `staleSelector`                                                                                                        | new field                                                                                                                                                                                                                           |
+| all 51  | `staleSelector` | absent                                                                                                  | answers and version                                                                                                                   | new measurement                                                                                                                                                                                                                     |
+| 49 rows | `staleSelector` | —                                                                                                       | first answer another record, second the plan's version: 2.0.2.3 (Compact donor), 1.2.0.0 (Compact PRO 1.0.3.x), 0.0.0.0, 220.32.3.0   | the selector was left at 1; the first read returned record 1 and cleared it                                                                                                                                                         |
+| 2 rows  | `staleSelector` | —                                                                                                       | `["stall", "stall"]`, version null                                                                                                    | 0.5.1.0 and 0.5.1.3 stall every request here, SetFirmwareInfoFeatures included                                                                                                                                                      |
+| 0.6.0.4 | `gate`          | `firmwareVersion: null`, profile `generic`, refusal `profile/unsupported: refusing to dump: … predates` | `firmwareVersion: "0.6.0.4"`, profile `compact-2014`, refusal `profile/unsupported: Early Compact (pre-0.8) does not support dump: …` | this build does not answer the first GetFirmwareInfo it gets. The probe's version read was that one read; now it reads on, gets two answers, and detection picks compact-2014, whose capability gate refuses before `planForDevice` |
+
+No other field of any row changed. `sentBeforeIdentity` is `["IN 0x4E"]` on all 51 rows, as
+before. Tier 1 delivers 20,756 replies (20,506 before): the extra GetFirmwareInfo reads and
+the new measurement. Tier 2 delivers 873,048 (873,018 before): +2 per row, one more read in
+each of the row's two version reads (the probe's and the dump's).
+
+The second `npm run check` of §12.6 then matched all 51 tier-1 rows against these pins, so
+they were reproduced once on a fresh set of emulators.
+
+### 12.4 CI's coverage
+
+CI's test step is `npm run test:coverage`; `npm run check` does not run coverage. It has
+failed since at least `ee9ca13` (§11.9): functions in `packages/core/src/profiles/**` were 60
+of 64 (93.75 %) against 95 %. The four untested functions were `registry.ts` `hasCapability`,
+`compact-2014.ts` `windowPlan`, and the two address-formatting callbacks in
+`buildWindowPlan`'s "holes and rows disagree" error (`plan.ts:82-83`). New tests in
+`profiles.test.ts`:
+
+- `hasCapability` gives the same answer as `requireCapability`, and as the declared
+  capability, for every built-in profile and all five operations, and both answers occur.
+- `compact-2014`'s `windowPlan` plans no window and declares the whole part a gap, equal to
+  its declared memory map, for any version it is handed. That is the path a hand-picked
+  `compact-2014` takes on a camera that passes the identity gate.
+- `buildWindowPlan` plans a table that tiles the part. It refuses an authenticated row with no
+  token ("subcmd 0x5 needs a token and none is set") and plans it with one. It refuses rows and
+  holes that disagree and names every block on both sides, both kinds at once and each alone.
+
+`vitest.config.ts` is unchanged: no threshold lowered, no file excluded.
+`SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npm run test:coverage` exits 0, with profiles
+functions at 64/64 (100 %).
+
+### 12.5 The slowest row, Compact 0.6.0.4: looked at, not done
+
+**Not done.** No emulator code changed, and the pins were not regenerated for it. What was
+found, from reading FW-V1 `emu/seekemu/` (nothing was run for it):
+
+- **Where the budget is.** The USB/IP server builds its host with `UsbHost(m)`
+  (`cli.py:404`), whose `wait_budget` defaults to 20,000 (`usb_host.py:158`). A control IN's
+  first data packet waits in `token_in(budget=None)`, which uses that budget
+  (`usb_host.py:277-292`).
+- **What a host step is.** `Machine._on_block` steps the host once every time 64 or more
+  emulated cycles have passed (`machine.py:376-387`). Cycles are counted per basic block, and
+  a WFI adds 4,096, so 20,000 steps is at least 1.28 M cycles; §9.7's "about 1.32 M" fits.
+- **What the host sees when it runs out.** `token_in` raises
+  `HostError('timeout on control IN bRequest=…')`. `Bridge._slice` completes the URB with
+  status `ST_ETIMEDOUT` (−110) and no data (`usbip.py:735-745`). The reply is delivered, not
+  dropped, so the client does not wait out its own deadline. The toolkit's transport rejects
+  it, and tier 1 records `no-answer`.
+- **The clock runs during those steps.** The clock is gated on host activity, so an
+  unanswered request advances the device's emulated time by the whole budget. That time is
+  part of the reproducible sequence the pins record.
+
+**The risk.** The 94,048-cycle "slowest answer" (§9.7) is the slowest among answers that came
+back **within** the current budget. Answers that come later were not in the sample. Some
+firmwares in this corpus do answer only after more than 20,000 steps: FW-V1
+`docs/ACTION_ITEMS.md` records that Compact 0.5.1.0 and 0.5.1.3 do not answer wire 54 with a
+20,000-step wait and do answer with 40,000. That is measured in the in-process harness from
+SET_CONFIGURATION, not per URB over USB/IP. Cutting the budget to 94,048 cycles could
+therefore turn a late answer into `no-answer`, which would change a result.
+
+A second risk follows from the gated clock. Because the budget decides how much device time
+passes after each unanswered request, shortening it would move the device's clock at every
+later request in the row. Anything time-dependent after that point could then change, for
+example the FSM's own transition to state 9 (§9.10). Detecting an idle firmware instead is not
+simple on this build: 0.6.0.4's main loop is `for (;;) { WFE; poll(); }`, which keeps running
+blocks, and "no new code reached" was shown too weak on the 2014 builds (55,910 steps of new
+blocks on 0.5.1.x, `docs/EMULATOR_CORPUS.md` §10.8).
+
+Old times, measured at `c491459` before any change: `npm run check` 191 s wall (vitest
+177.4 s), 647 passed, and the 0.6.0.4 row 104.2 s. The machine was not idle (load about 5).
+New times: none, because nothing changed.
+
+### 12.6 The measurements
+
+| run                                                             | commit                 | exit | passed / failed                | wall            | notes                                                                                                                                                                                                                      |
+| --------------------------------------------------------------- | ---------------------- | ---- | ------------------------------ | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run check`, baseline                                       | `c491459`              | 0    | 647 / 0                        | 191 s (177.4 s) | slowest rows 104.2 s (0.6.0.4) / 80.1 s; 0 dropped                                                                                                                                                                         |
+| regeneration, both tiers                                        | `447cd67` + §12.3 code | 0    | 450 / 0 (core)                 | 183 s           | 20,756 / 873,048 replies, 0 dropped; the pins of §12.3.1                                                                                                                                                                   |
+| `npm run check` 1                                               | the same               | 1    | 12 failed (6 tier 1, 6 tier 2) | 191 s           | not a result (below): emulators that exited without their delivery ledger; replies dropped as "the socket write failed" or "session closed before the device ran it"; 0.6.0.4's session gone mid-probe                     |
+| `npm run check` 2                                               | the same               | 1    | 665 / 6                        | 179 s           | all 51 tier-1 rows passed against the new pins, 0 dropped; 6 tier-2 rows failed: 5 as InfrastructureDefect, "the emulator exited without printing its delivery ledger", 1 on `connect ECONNREFUSED` to its emulator's port |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npm run test:coverage` | `c491459`              | 1    | 511 / 0, 3 skipped             | 10 s            | profiles functions 60/64 (93.75 %) < 95 %                                                                                                                                                                                  |
+
+**Why the two checks do not count.** While they ran, another program on this machine was
+running a script whose command line starts with `pkill -f "seek_emu.py --usbip"`. That pattern
+matches the emulators these suites start. It is the user's own session, and nothing of it was
+touched. Every failure in both runs is of the kind an emulator ended from outside produces,
+and the delivery audit reported each one as an infrastructure defect, as §9.8 designed it to.
+None is a firmware result, and nothing from those runs was recorded. The two failed runs are
+not evidence that anything here is broken, and they are not evidence that it works.
+
+The emulator-free checks at the final commit are in §12.7.
+
+### 12.7 Still owed, and still open
+
+**Checks at the final commit, without the emulator** (the code at `5947229`; the commit that
+adds this section changes only this file):
+
+| check                                                                   | result                                                                      |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `npm run format:check`, `npm run lint`, `npm run typecheck`             | exit 0, exit 0, exit 0 (2 s, 6 s, 5 s)                                      |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run`                | exit 0, 541 passed, 3 skipped (the two emulator tiers and the corpus), 10 s |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npm run test:coverage` (CI's)  | exit 0, 541 passed, 3 skipped; profiles functions 64/64 (100 %), 10 s       |
+| `npm run build`, then `git status --porcelain -- docs` (CI's last step) | clean, and two consecutive builds give the same files (but see below)       |
+
+That count was 511 at `c491459`. The 30 new tests: 16 web tests for §12.1 and §12.2
+(`useDumpPanel` 8, `useFlashPanel` 4, `render-smoke` 2, `hints` 1, `safety-copy` 1), 3 core
+`identifyCamera` tests, the 5 stale-selector tests of §12.3, and the 6 coverage tests of §12.4.
+
+**One slip, caught by the build check and fixed.** `0545094` changed `readRunningFirmware`,
+which the browser bundle includes, and was committed without rebuilding `docs/`, so CI's
+docs check would have failed from that commit until `5947229`, which is the rebuild.
+
+**Owed, each needing the emulator, once nothing else on the machine stops it:**
+
+1. `npm run check` twice in a row at the final commit, exit 0 both, with pass/fail counts and
+   wall times. This also re-checks the §12.3.1 pins in tier 2, which the killed runs could not.
+2. `pgrep -fl seek_emu.py` empty afterwards. Today it shows the other session's emulator,
+   which is not this work's to stop.
+3. All of task 5 (§12.5), if it is taken up. That means the old and new 0.6.0.4 row time and
+   `npm run check` time, regenerated pins identical, FW-V1 `emu/selftest.py` all passing with
+   a check for the new rule and its count updated, `shasum -a 256 -c emu/data/SHA256SUMS`,
+   `gmake -C codegen verify-noop`, and a dated FW-V1 campaign-log entry. None of it applies
+   while `emu/` is unchanged.
+
+**Open, reported and not patched:**
+
+- **`readDeviceInfo` can arm a slot the plan does not contain.** It looks each slot up in the
+  plan and, if the plan has no entry, falls back to the slot descriptor's own subcommand
+  (`device-info.ts`, the slots loop). Under `compact-2014`, whose plan is empty (§12.4), a
+  device read on a camera that passes the identity gate would therefore still arm the three
+  slot selectors. This is from reading the code, not a run. It is not a safety hole: the gate
+  has already said 0x52 is BeginFirmwareUpgrade on that build. But it contradicts the
+  profile's "nothing is readable".
+- The web tests use a scripted camera, not the emulator. The browser path has never been run
+  against an emulated firmware; the emulator suites drive the toolkit through the USB/IP
+  adapter and `WebUsbTransport`, which is the same transport the browser uses.
