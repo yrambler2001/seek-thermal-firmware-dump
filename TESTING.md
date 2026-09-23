@@ -365,7 +365,8 @@ controller** — USB/IP instead of libusb — and nothing else.
 **Until §9.9 that last sentence was not true in effect.** The adapter's `claimInterface`
 sent a `SET_INTERFACE` no real host sends (`bmRequestType 0x00`). Every firmware stalled it,
 and `WebUsbTransport`'s `'auto'` mode then fell back to device-recipient requests without a
-word. So every emulator row in both tiers measured `0x40`/`0xC0` vendor requests, while a
+word. _(Since §11 it cannot: `'auto'` falls back only when the platform refuses the claim,
+says so, and the dump manifest records it; any other claim failure is an error.)_ So every emulator row in both tiers measured `0x40`/`0xC0` vendor requests, while a
 real host sends `0x41`/`0xC1`. §9.9 fixes the adapter and re-measures. **No row of either
 tier changes**, because every Seek firmware's vendor handler ignores the recipient bits.
 Every row now asserts that it ran on the real-host path.
@@ -1049,6 +1050,8 @@ The toolkit was at `0f69282` and FW-V1 at `c94c61df`, on the same 10-core machin
 
 #### Findings in toolkit source, reported and not patched
 
+_(All six are fixed in §11, 2026-09-23.)_
+
 1. **`'auto'` falls back on any claim rejection, silently unless a caller passes
    `onWarning`** (`webusb.ts:170-189`). Its doc comment says the fallback is for "a driver
    holding the interface", but the `catch` does not look at the cause. A stall, a not-found
@@ -1272,7 +1275,10 @@ the gate in the prologue):
   part exactly. `planForDevice` reads the version (one `GetFirmwareInfo`, unarmed) before
   anything is armed, and `runDump`, `runSweep` and `readDeviceInfo` all use it. A version
   the profile has not decoded, or none at all, gets only the rows every decoded build agrees
-  on; 0x14000000 and 0x140C0000 are then gaps that say why. The manifest records the
+  on; 0x14000000 and 0x140C0000 are then gaps that say why. _(Corrected in §11: no version
+  at all is now refused, `device/version-unknown`; only a version the profile has not
+  decoded gets the agreed rows. `readDeviceInfo` did not in fact use it until §11 — it read
+  the version through `SetFirmwareInfoFeatures` and armed whatever the version said.)_ The manifest records the
   version and the table (`selectorTable`), and the legacy README lists the dump's own gaps.
 - **0.7.0.x is refused.** `compact-2014` covers everything before 0.8.0.0, `legacy-auth` and
   `compact-2016` score it 0, the probe sends nothing after the version read, and
@@ -1330,7 +1336,9 @@ windows, all unread. The dump would read nothing, and nothing unsafe is sent (0x
 `BeginFirmwareUpgrade` on those builds). The version gate treats an unknown version as not
 old, and the probe cannot tell "refused the plain arm" from "refused everything"; on a
 0.3.0.1 that did not answer `GetFirmwareInfo` the gate would therefore not engage. Whether a
-real 0.5.1.x camera behaves like this is not known.
+real 0.5.1.x camera behaves like this is not known. _(Fixed in §11.1: with no version the
+probe sends nothing more and the dump, the sweep and the device read refuse; both rows now
+pin that refusal.)_
 `scripts/selector-tables/early_version_read.ts` reproduces it (0.5.0.2 is the control).
 
 ### 10.5 The measurements
@@ -1357,9 +1365,9 @@ design. No standard request stalled.
 
 ### 10.6 Still open
 
-- **The version gate cannot see a build that does not answer `GetFirmwareInfo`** (§10.4,
-  0.5.1.x), and a plain arm refused along with every other request reads as the legacy
-  line's lock. Refusing unknown versions would stop every camera that is slow to answer.
+- ~~**The version gate cannot see a build that does not answer `GetFirmwareInfo`**~~ (§10.4,
+  0.5.1.x): closed in §11.1. An unknown version is refused; a camera that is slow to answer
+  is refused too, and reads once it answers.
 - **1.3.0.8 8 Hz could give its bootloader block** (no mode-2 test), but the version does not
   tell it from the 16 Hz build. The build string might.
 - **0.8.0.0's mode 1 on a real 2014 bootloader** is unmeasured; the plan does not use it.
@@ -1369,3 +1377,354 @@ design. No standard request stalled.
   `docs/ACTION_ITEMS.md`, not changed here.
 - The web dump view still calls the unlock token "build-specific" (§9.3 shows one token in
   22 images); not changed here.
+
+---
+
+## 11. Six fixes in the toolkit's own code (2026-09-23)
+
+§9.9 listed six defects in toolkit source and left them unpatched, and §10.4 and §10.6 left
+the unknown-version gate open. This section fixes all of them. The toolkit is at `2e8492e`
+(the fixes and their tests) and `b768227` (the regenerated pins). FW-V1 is at `de67189e`
+and nothing in it changed except its campaign log. Every fix has a test that fails on the
+old code and passes now (§11.7).
+
+### 11.1 Before the version is known, send only what every image reads the same way
+
+**What was wrong.** `predatesDumpProtocol(null)` is false, and it was the only gate. With
+no version the probe went on to arm subcommand 5 plainly and with the token, then
+subcommand 1 and a read. If every request stalled, as on the emulated 0.5.1.x, the plain
+arm read as the legacy lock refusing it, and `legacy-auth` won on that alone. The dump and
+the sweep then planned with the "version unknown" rows. `readDeviceInfo` never checked the
+version at all. It opened with `tryFwInfo(0)`, which sends `SetFirmwareInfoFeatures` (a
+setter), and then armed the boot config, the bootloader block and the slots whatever came
+back. That included a 0.3.0.1 under `--profile modern-4x`, where every arm is
+`EnterBootloaderMode`.
+
+**The list, built from `test/firmware/facts.json`.** A wire id is safe before identity
+when, on all 36 images, its method-table row has the same name, a getter, and nothing in
+the setter column. Ten ids qualify:
+
+| wire id | command            | wire id | command         |
+| ------- | ------------------ | ------- | --------------- |
+| 0x35    | GetErrorCode       | 0x41    | GetDataPage     |
+| 0x36    | GetChipID          | 0x44    | GetCurrentCmd   |
+| 0x39    | GetShutterPolarity | 0x47    | GetDefaultCmd   |
+| 0x3D    | GetOperationMode   | 0x4D    | GetRDAC         |
+| 0x3F    | GetIPMode          | 0x4E    | GetFirmwareInfo |
+
+The toolkit needs three of them before identity: GetErrorCode, GetOperationMode and
+GetFirmwareInfo. They are `SAFE_BEFORE_IDENTITY` in `ops.ts`, and they are sent as control
+IN only. Everything else it sends differs somewhere. 0x52 is `EnterBootloaderMode` on
+0.3.0.1. 0x4F is `UploadFirmwareRowSize` before 0.7 and a setter-only
+`GetFeaturedFirmwareData` on 0.7.0.x. 0x3C and 0x55 have the same name everywhere but are
+setters. `identity-gate.test.ts` derives the ten from the facts on every run, pins them, and
+holds `SAFE_BEFORE_IDENTITY` to them.
+
+**What changed.**
+
+- `identityGate(firmware)` in `capability.ts` makes the one decision. No version gives
+  `device/version-unknown`. A pre-0.8 version gives `profile/unsupported`, as before.
+  Anything else may be armed.
+- `probeSelectorChannel` sends nothing after an unanswered version read, so detection gets
+  no channel evidence from it.
+- `planForDevice` refuses an unknown version. `runDump`, `runSweep` and now
+  `readDeviceInfo` all go through it. The message says why, and what to do: replug, let
+  the camera start, try again.
+- `readDeviceInfo` reads the version first, with the unarmed GetFirmwareInfo. Selector 0 is
+  the build block, so these are the same bytes `tryFwInfo(0)` returned. It refuses as a
+  dump does, and only then sends `SetFirmwareInfoFeatures` for selectors 1, 20, 17 and 10.
+- `writeFirmware` refuses a `DeviceState` without a version.
+- The CLI and the web app have a hint for the new code.
+
+**Every other place that sends before the version is known**, checked:
+
+- The CLI's `devices` sends nothing, and `decrypt` is offline.
+- `info`, `flash`, `dump` and `sweep` go through the probe and the planner.
+- The web app's connection test sends GetOperationMode and GetErrorCode only, and both are
+  in the list.
+- The web app's dump, sweep and device-info panels go through `runDump`, `runSweep` and
+  `readDeviceInfo`.
+- The emulator suites' own probes arm everything on purpose. They are the instrument, not
+  the tool. The tool's own first contact is now measured separately (below).
+
+**The cost, stated.** A camera that does not answer GetFirmwareInfo cannot be dumped, swept
+or analysed until it does. §10.6 gave this as the reason not to do it.
+
+**On the emulator.** Every tier-1 row now carries `gate`: the toolkit's own first contact,
+as the CLI's `dump` runs it. That is `probeSelectorChannel`, then `detectProfile` over the
+evidence `chooseProfileByProbe` builds, then `runDump` with its signal already aborted. A
+dump that plans stops at the head of its window loop, before its first arm; a dump that
+refuses throws before that. `gate` records every distinct request sent before a
+GetFirmwareInfo came back with a version. Every row asserts two rules, whatever its pin
+says:
+
+1. Before identity, only control INs of `SAFE_BEFORE_IDENTITY` were sent.
+2. If no version came back during the whole first contact, the dump refused with
+   `device/version-unknown`.
+
+On all 51 rows only `IN 0x4E` went out before identity. On 0.5.1.0 and 0.5.1.3 that read is
+the whole of what was sent, and the dump refused. 0.6.0.4 does not answer the probe's
+version read and does answer the dump's, which then refuses it as a pre-0.8 build.
+
+**The same two rows on the old code.** I ran the new instrument against a worktree of
+`ee9ca13`. The only additions were the two exports the instrument imports: the constant
+list, and an `identityGate` that makes the old decision. Both rows fail rule 2. The old dump
+planned (`refusal: null`), with `profile: legacy-auth`, and before identity it sent
+`IN 0x4E` and `IN 0x3D`. It did **not** send 0x52 there. The probe's arm starts with
+`ensureMode0()`, and 0.5.1.x stalls GetOperationMode too, which fails the arm before
+BeginFirmwareUpgrade goes out. So on the emulator the old code fails on the refusal, not on
+the arm. The arm itself is shown by `identity-gate.test.ts`: a camera that answers
+GetOperationMode but not GetFirmwareInfo gets BeginFirmwareUpgrade from the old probe,
+dump, sweep and device read.
+
+### 11.2 The CLI honours the toolkit's own deadlines
+
+**What was wrong.** The CLI uses `usb` 3.1.0. Its WebUSB shim declares
+`const DEFAULT_TIMEOUT = 1000` and defines
+`controlTransferIn = async function (setup, length, timeout = DEFAULT_TIMEOUT)` and
+`controlTransferOut(setup, data, timeout = DEFAULT_TIMEOUT)`
+(`node_modules/usb/dist/index.js:8`, `:22`, `:32`). It passes the value as
+`nativeControlTransferIn(setup, timeout, length)`, and node-usb-rs v3.1.0 hands it to nusb
+as `Duration::from_millis(timeout)` (`src/webusb_device.rs`). On macOS nusb 0.2.7 puts it
+in IOKit's `completionTimeout` and `noDataTimeout`, and reports expiry as
+`TransferError::Cancelled`, "transfer was cancelled". The `deviceTimeout` option in the
+package's `.d.ts` is read nowhere. The transport never passed a third argument, so every
+CLI transfer got 1 s. The transport's 5 s race never fired, and a flash commit was cancelled
+by the host after 1 s.
+
+**What changed.**
+
+- `WebUsbDevice.controlTransferIn/Out` take the transport's deadline as a third argument,
+  and the transport passes it on every call.
+- The CLI no longer hands node-usb's device to the transport as it is. It wraps it in
+  `packages/cli/src/node-usb.ts` (`fromNodeUsb`), which passes the deadline on and reports
+  nusb's own expiry as `usb/timeout`, with the deadline in the message.
+- In the browser, `asWebUsbDevice` drops the argument. WebUSB has no per-transfer timeout,
+  so the transport's own timer is the only deadline there, as before.
+
+**The commit deadline, worked out.** What the firmware does inside `CompleteMemoryUpgrade`
+for the flash path's selector 0 is the same in all eight FW-V1 reconstructions of a
+writable build: `cmd_CompleteMemoryUpgrade` (`targets/compact_pro_ff/src/rpc_cmds.c`)
+calling `fw_validate_decrypt_program` and `update_write_boot_config`
+(`targets/compact_pro_ff/src/update.c`). In order:
+
+1. Sum the staged bytes and check the host's checksum.
+2. Decrypt with Key A and re-encrypt with the device key.
+3. Erase the slot's 64 KiB block, then read it back to check it is blank.
+4. Erase the next block too, but only if the length is over 0x10000.
+5. Program the image: at most 65,536 B, which is 256 pages.
+6. Read the image back and compare.
+7. Erase the boot-config block.
+8. Program the 284-byte boot record: 2 pages.
+9. Read the record back and compare.
+
+Step 4 cannot run on this path. BeginFirmwareUpgrade caps staging at `FLASH_BLOCK_BYTES`,
+and SetFeaturedFirmwareData refuses to stage past it. The bound counts step 4 anyway,
+together with 128 KiB of programming. The part is a W25Q32FV: JEDEC `EF 40 16` in the
+firmware's own SPIFI table, with 64 KiB blocks and 256-byte pages. Its datasheet (rev. J,
+2016-06-03, §9.6 AC Electrical Characteristics, MAX column) gives tBE2 (64 KB block erase)
+2,000 ms, tPP (page program) 3 ms and tW (write status register) 15 ms.
+
+| step                                                    | count | max each |        total |
+| ------------------------------------------------------- | ----: | -------: | -----------: |
+| 64 KB block erases                                      |     3 | 2,000 ms |     6,000 ms |
+| page programs (512 image + 2 record)                    |   514 |     3 ms |     1,542 ms |
+| status-register writes (one per erase/program, assumed) |     5 |    15 ms |        75 ms |
+| CPU: cipher passes, sum, read-backs (an allowance)      |       |          |       500 ms |
+| **worst case**                                          |       |          | **8,117 ms** |
+
+- The path that can actually run (2 erases, 258 pages, 4 status writes) comes to 5,334 ms
+  at the maximums, and about 0.52 s at the typical values (150 ms, 0.7 ms, 10 ms).
+- The deadline is **twice the 8,117 ms bound, rounded up to a whole 5 s: 20,000 ms.** That
+  is the value `USB_COMMIT_TIMEOUT_MS` already had, so no timeout changed. It was right, but
+  the CLI was not honouring it: the old 1 s cap was below the 5.3 s the real path can take.
+- The arithmetic lives in `ops.ts` as named constants, and `protocol.test.ts` pins
+  `COMMIT_WORST_CASE_MS = 8117` and `USB_COMMIT_TIMEOUT_MS >= 2 x` that.
+- **The browser path:** `protocol.test.ts` also shows, with fake timers, that a commit
+  taking the worst case completes, and that the transport's own timer fires at exactly
+  20,000 ms and not a millisecond earlier. That test passes on the old code too: the
+  browser path was already right.
+
+**Tests.** `node-usb.test.ts` runs the REAL shim functions `usb` installs,
+`UsbDevice.prototype.controlTransferIn/Out`, on top of a native layer that behaves as
+node-usb-rs does. A missing timeout therefore shows up as 1000 at the native layer.
+
+- One test pins the premise: no argument gives 1000.
+- One checks that every transfer of a sequence using all three deadlines (5 s, the 1.5 s
+  shrink retries, the 20 s commit) reaches the native layer with exactly the deadline the
+  transport was asked for.
+- One checks that no transfer of a whole dump uses 1 s.
+- One checks that nusb's own expiry is reported as `usb/timeout`.
+
+### 11.3 One recipient per session, and never a silent fallback
+
+**Which claim failure falls back, and why only that one.** WebUSB's `claimInterface`
+"perform[s] the necessary platform-specific steps to request exclusive control", and
+rejects with `NetworkError` if those steps fail. Its other rejections mean something else:
+`InvalidStateError` (the device is not opened or not configured), `NotFoundError` (no such
+interface), `SecurityError` (a protected class). Only `NetworkError` means "another program
+or a kernel driver holds the interface", and device recipient is correct for that one case
+for three reasons:
+
+1. The claim sends no packet (§9.9).
+2. A device-recipient vendor request needs no claimed interface. WebUSB's validity check
+   asks for a claim only for the interface and endpoint recipients, and node-usb-rs sends a
+   device-recipient request on the device handle (off Windows).
+3. Every Seek firmware's vendor handler checks only the type and `wIndex == 0`, never the
+   recipient bits (§9.9). So `0xC0` with wIndex 0 is the same request to the camera as
+   `0xC1` to interface 0.
+
+The CLI adapter maps nusb 0.2.7's two "held by someone else" claim errors onto the same
+name: "could not open interface for exclusive access" (macOS, `kIOReturnExclusiveAccess`)
+and "interface is busy" (Linux, `EBUSY`).
+
+**What changed.**
+
+- 'auto' falls back only on that failure (`isPlatformClaimRefusal`). Any other claim failure
+  is `usb/not-open`, and nothing is sent.
+- A fallback is reported through `onWarning` and through `TransportInfo.recipientFallback`.
+  `runDump`, `runSweep`, `readDeviceInfo` and `writeFirmware` log it as a warning even with
+  no `onWarning`, and the manifest records it.
+- The recipient is decided by the first `open()`. After that, a reopen that cannot re-claim
+  fails ("does not switch recipient part-way through a run"), and a session that fell back
+  stays on device recipient. So a dump's retry can no longer change recipient part-way.
+
+### 11.4 The manifest records the claim that was made
+
+`runDump` and `runSweep` take the manifest's transport record right after the version read,
+while the transport is still open. Before, the record was taken after the read loop had
+closed the transport, so `claimedInterface` was `false` on every manifest. The recipient
+cannot change after that point (§11.3), so one snapshot describes every window. Tier 2 now
+asserts `claimedInterface: true`, `recipient: interface` and `recipientFallback: null` on
+all 15 dumps.
+
+### 11.5 A stall is a refusal on the CLI too
+
+node-usb-rs turns every nusb error into a rejection, including `TransferError::Stall`
+("endpoint stalled"). A browser instead resolves `status: 'stall'`. `fromNodeUsb` turns the
+stall back into the WebUSB result, so a firmware refusal is `usb/stalled` on both hosts.
+Before, the CLI reported it as `usb/transfer-failed`, with "unplug and replug". Other native
+failures, such as "device disconnected", stay `usb/transfer-failed`.
+
+### 11.6 An unconfigured device on the CLI
+
+node-usb-rs's `configuration` getter throws `configuration error: device is not configured`
+(nusb's `ActiveConfigurationError` for value 0), where WebUSB returns `null`. `fromNodeUsb`
+returns `null` for exactly that error, and the transport then selects configuration 1, as
+in a browser. Any other getter error still throws, for example "no descriptor found for
+active configuration 2".
+
+### 11.7 The tests, and what each did on the old code
+
+Each new test was written first and run against the unchanged source (`ee9ca13`), then
+against the fix.
+
+| fix  | test (file)                                                                                                                                                       | on `ee9ca13`                                                                                                                                                                    |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | 11 tests in `identity-gate.test.ts`                                                                                                                               | 9 fail: the probe arms, the dump, sweep and device read do not refuse, `legacy-auth` wins, the constant is missing; 2 pass (the derived list itself, and the ids it leaves out) |
+| 1    | 6 tests in CLI `camera.test.ts`: `dump`, `dump --no-probe`, `dump --profile legacy-auth`, `sweep`, `info`, `info --profile modern-4x` on a camera with no version | all 6 fail: exit 0 instead of a refusal                                                                                                                                         |
+| 1    | `writeFirmware` refuses a state with no version (`workflows.test.ts`)                                                                                             | fails: no refusal (the old code went on and hit the dummy payload)                                                                                                              |
+| 1    | tier 1: rule 2 on 0.5.1.0 and 0.5.1.3 (worktree run, §11.1)                                                                                                       | both fail: `refusal: null`                                                                                                                                                      |
+| 2    | 4 timeout tests in `node-usb.test.ts`                                                                                                                             | 3 fail (1000 ms reached the native layer; cancel reported as `transfer-failed`); the premise test passes                                                                        |
+| 2    | commit arithmetic (`protocol.test.ts`)                                                                                                                            | fails: no `COMMIT_WORST_CASE_MS`                                                                                                                                                |
+| 2    | browser commit timer (`protocol.test.ts`)                                                                                                                         | passes: a check, not a fix                                                                                                                                                      |
+| 3, 4 | 8 tests in `transport-session.test.ts`                                                                                                                            | all 8 fail                                                                                                                                                                      |
+| 3    | CLI busy claim falls back / missing interface does not (`node-usb.test.ts`)                                                                                       | both fail                                                                                                                                                                       |
+| 5    | stall is `usb/stalled`, both directions (`node-usb.test.ts`)                                                                                                      | fails: `usb/transfer-failed`                                                                                                                                                    |
+| 5    | another native failure stays `usb/transfer-failed` (`node-usb.test.ts`)                                                                                           | passes: a guard against matching too much                                                                                                                                       |
+| 6    | unconfigured device selects configuration 1 (`node-usb.test.ts`)                                                                                                  | fails: `open()` throws                                                                                                                                                          |
+| 6    | another configuration error still throws (`node-usb.test.ts`)                                                                                                     | passes: a guard against matching too much                                                                                                                                       |
+
+Existing tests that changed, and why:
+
+- `capability.test.ts` "survives a camera that will not answer GetFirmwareInfo" required the
+  probe to arm with no version. It now requires the opposite.
+- `protocol.test.ts`'s fallback test used `Error('Access denied')` to trigger the fallback.
+  It now uses a `NetworkError`, and the plain error is one of the non-fallback cases in
+  `transport-session.test.ts`.
+- Fake cameras that never answered GetFirmwareInfo now report a version: `cameraFor` in
+  `workflows.test.ts`, `cameraWithFlash` in the CLI helpers, and the web dump panel's fake.
+  Their dumps used to plan for an unknown version, and that is refused now.
+- On the legacy fixture that version is 1.1.0.0, an undecoded build, so the plan is still
+  the agreed rows. Two assertions follow from that. The legacy dump test now expects
+  `firmwareVersion: '1.1.0.0'` instead of `null`. The device-info test checks that the
+  channel flag alone leaves detection ambiguous, because the version now corroborates the
+  profile.
+
+### 11.8 Pinned results that changed
+
+**Tier 2: none.** `expectations.roundtrip.json` is byte-identical.
+
+**Tier 1: every row gains `gate`, two rows change `plan`, and the file `note` describes the
+new field.** No other field of any row changed.
+
+| rows                                              | field  | old                                                                                    | new                                                                                                                          | why                                                                                                                            |
+| ------------------------------------------------- | ------ | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| all 51                                            | `gate` | absent                                                                                 | the toolkit's first contact; `sentBeforeIdentity: ["IN 0x4E"]` on every row                                                  | new measurement (§11.1)                                                                                                        |
+| 26 modern, 18 legacy (0.8.0.0 … 1.3.0.8, 1.0.3.x) | `gate` | —                                                                                      | `identified: true`, profile `modern-4x` / `legacy-auth`, `refusal: null`                                                     | the version came back; the dump planned                                                                                        |
+| 0.3.0.1, 0.5.0.2, 0.7.0.7, 0.7.0.8                | `gate` | —                                                                                      | profile `compact-2014`, `refusal: "profile/unsupported: Early Compact … does not support dump …"`                            | the version came back and predates the dump protocol                                                                           |
+| 0.6.0.4                                           | `gate` | —                                                                                      | probe saw no version, `identified: true`, profile `generic`, `refusal: "profile/unsupported: … firmware 0.6.0.4 predates …"` | it does not answer the first version read and answers the dump's                                                               |
+| 0.5.1.0, 0.5.1.3                                  | `gate` | —                                                                                      | `identified: false`, profile `generic`, `refusal: "device/version-unknown: …"`                                               | no version ever came back; refused (§11.1)                                                                                     |
+| 0.5.1.0, 0.5.1.3                                  | `plan` | `legacy-auth`, dumps, 30 windows all unread, table "legacy, version unknown …", 3 gaps | `generic`, no dump, 0 windows, table "none: no plan is made without the firmware version", no gaps                           | the CLI no longer arms without a version, so detection gets no "refused plain arm", and the planner refuses an unknown version |
+
+**One instrument mistake, caught and fixed before the pins were taken.** `gate` was first
+measured at the END of each row. That was not first contact, for two reasons:
+
+- The command probe's `SetFirmwareInfoFeatures(1)` leaves the info selector at 1, so the
+  unarmed GetFirmwareInfo returned the BOOTLOADER block: `2.0.2.3` on 4.8.1.7.
+- On the 4.8.1.7 and 4.16.1.7 images, and their `_trimmed` copies, a window read that late
+  in a row made the emulator fault (unmapped `0x35202088` at PC `0x100078F0`). The four rows
+  then read "not measurable". On a fresh emulator the same probe works, and no single
+  earlier step reproduces the fault.
+
+`gate` now runs first, as a real host's first contact does. With it first, the regeneration
+changed only the fields in the table above. The fault itself is not diagnosed (§11.10).
+
+### 11.9 The measurements
+
+The toolkit is at `b768227` plus this section, and FW-V1 is at `de67189e`, on the same
+machine as §10.5.
+
+| run                        | exit | passed / failed        | wall            | slowest row (tier 1 / tier 2) | replies delivered = received (t1 / t2) | dropped | emulators left |
+| -------------------------- | ---- | ---------------------- | --------------- | ----------------------------- | -------------------------------------- | ------- | -------------- |
+| regeneration, tier 1 alone | 0    | 426 / 0 (core, 1 skip) | 97.7 s          | 96.6 s / —                    | 20,506 / —                             | 0       | 0              |
+| `npm run check` 1          | 0    | 647 / 0                | 195 s (181.4 s) | 106.3 s / 83.5 s              | 20,506 / 873,018                       | 0       | 0              |
+| `npm run check` 2          | 0    | 647 / 0                | 193 s (178.8 s) | 104.9 s / 82.0 s              | 20,506 / 873,018                       | 0       | 0              |
+
+- The two `npm run check` runs are consecutive, on the committed code (`b768227`) with this
+  section still missing these two rows. Both passed 647 of 647 (609 in §10.5; the 38 new
+  tests are those of §11.7).
+- Tier 1 delivers 20,506 replies, up from §10.5's 20,001 (+505). It sends 20,276 vendor
+  requests as `0x41/0xC1` (up from 19,771) and 0 as `0x40/0xC0`, and 1,429 stalled. The
+  whole increase is the new first-contact measurement.
+- Tier 2 is unchanged: 873,018 replies, and 872,949 vendor requests as `0x41/0xC1`, 3 of
+  them stalled.
+- Neither tier sent a SET_CONFIGURATION or a SET_INTERFACE.
+- Without the optional inputs, `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run`
+  gives **511 passed | 3 skipped**, exit 0. That was 473; the 38 new tests are those of
+  §11.7.
+- **Found in passing, not caused here.** `npm run test:coverage` (CI's test step) already
+  fails at `ee9ca13`. The `profiles/**` functions threshold is 95%, and coverage is 60 of 64
+  (93.75%). The four uncovered functions are in `plan.ts` (two error-message callbacks),
+  `compact-2014.ts` (`windowPlan`) and `registry.ts` (`hasCapability`). At `ee9ca13`, 2
+  web dump-panel tests also fail under coverage (they pass without it). After this work
+  those two pass, and the four functions are unchanged. Nothing here touched them, and it is
+  not fixed here.
+
+### 11.10 Still open
+
+- **The version read trusts the info selector to be 0.** The unarmed GetFirmwareInfo returns
+  whichever block the selector names, and the selector is cleared only by a read. A camera
+  left with the selector set returns the bootloader's version as if it were the
+  application's. That can happen if another program, or an interrupted run of this one,
+  sent `SetFirmwareInfoFeatures` without the read after it. The emulator showed exactly
+  this (`2.0.2.3` on 4.8.1.7, §11.8). A second unarmed read would return selector 0, and it
+  stays inside `SAFE_BEFORE_IDENTITY`. Not changed here.
+- **The late-row emulator fault on 4.8.1.7 and 4.16.1.7** (§11.8) is not diagnosed. A
+  window read after the whole tier-1 row faults at `0x35202088`; a fresh emulator does
+  not. The pinned rows no longer reach it.
+- **A camera slow to answer GetFirmwareInfo is refused**, and reads once it answers (§11.1).
+  Whether a real 0.5.1.x camera behaves like the emulated one is still not known (§10.4).
+- **The commit bound assumes one status-register write per erase or program.** The SPIFI
+  lock command before each operation was not traced to the wire. At 15 ms each, the total
+  is 75 ms of the 8,117.
