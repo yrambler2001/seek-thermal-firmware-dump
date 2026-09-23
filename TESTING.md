@@ -1180,6 +1180,8 @@ machine as §9.8 and §9.9.
 
 #### Findings in toolkit source, reported and not patched
 
+_(All four are fixed in §10, 2026-09-23.)_
+
 1. **`legacy-auth` would write the wrong block on nine builds** (derived from the window
    measurement and `buildLegacyWindowMap()`; no dump was run on them). The map claims
    subcommand 0x0E is 0x140C0000. On 0.8.0.0 … 1.3.0.0 that arm serves 0x140B0000, so a
@@ -1203,3 +1205,163 @@ codegen root migration, and they import this repository's transport and harness.
 README says why lint, format and typecheck skip the three `.ts` files: they reach into the
 adapter's private session on purpose, load the toolkit by computed import, and are kept as
 they were run.
+
+---
+
+## 10. Windows and selectors: why "25 of 63" and "31 of 31" are both true (2026-09-23)
+
+A **window** is one 64 KiB block of the 4 MiB part that the firmware will serve over USB. A
+**selector** (subcommand) is the small number `BeginFirmwareUpgrade` (wire 0x52) takes to
+arm a window; `GetFeaturedFirmwareData` (0x4F) then reads it. Each build maps selectors to
+blocks in its own `BeginFirmwareUpgrade` switch, and that switch — not a profile — is the
+ground truth.
+
+### 10.1 The two numbers answer two different questions
+
+- **Tier 1's window probe** arms the _modern_ map's 63 selectors, on the _plain_ 2-byte
+  channel, against every firmware. On the 2016-2017 legacy builds 25 answer: subcommand 1
+  and the 24 linear windows 0x0A…0x21. 38 are refused: 2, 3, 5, 6, 8 and 9 on the plain
+  channel (the handler locks modes 2…9 unless the 18-byte token is sent), and 0x22…0x41
+  outright (`mode > 0x21`). The modern map has no subcommand 7 and never sends the token.
+- **A dump** arms the build's own table. On Compact PRO 1.0.3.0 that is 31 windows: 3, 5,
+  6, 7, 8 and 9 with the token, 1, and 0x0A…0x21 — every block from 0x14010000 to
+  0x141FFFFF, 31 × 64 KiB = 2,031,616 bytes. Tier 2 read all 31 with 0 differing bytes.
+  The firmware's switch has 34 modes; 0 is chosen at run time, 2 is refused outright, and 4
+  is a second door onto 0x14020000, which leaves 31 distinct blocks.
+
+So **31 is the true number of windows a dump can read on 1.0.3.0**, and 25 is a correct
+count of a different thing: one foreign list, on one channel, out of a denominator (63) of
+which 32 selectors do not exist on this firmware. The difference comes from the probe's
+selector list, its channel and its counting — not from the firmware. The FW-V1 source it
+was asked about says the same: `targets/compact_pro_9hz_2016/src/rpc_cmds.c:2590-2613` is
+the gate (mode 2 refused, `mode > 0x21` refused, modes 2…9 locked on the plain channel) and
+`:2615-2725` the switch; its address constants are declared at `:2442-2472`.
+
+### 10.2 But the legacy line has four tables, not one
+
+Each image's own switch is now decoded out of its bytes (`scripts/update-firmware-facts.mjs`,
+`windowTable` in `test/firmware/facts.json`: the TBB, each case's PC-relative literal, and
+the gate in the prologue):
+
+| build                         | mode 1                      | mode 2 (0x14000000)                  | mode 0x0E  | dump windows |
+| ----------------------------- | --------------------------- | ------------------------------------ | ---------- | ------------ |
+| Compact 0.8.0.0               | run time, from the boot cfg | loads through the word at 0x14000000 | 0x140B0000 | 30           |
+| Compact 0.9.0.2 … 1.3.0.0     | 0x14020000                  | armed with the token                 | 0x140B0000 | 31           |
+| Compact 1.3.0.8 (8 Hz, 16 Hz) | 0x14020000                  | 8 Hz: token; 16 Hz: refused          | 0x140C0000 | 31           |
+| Compact PRO 1.0.3.0, 1.0.3.2  | 0x14020000                  | refused outright                     | 0x140C0000 | 31           |
+
+- **Every 2014 image gives 0x0E the address of 0x0D.** Its switch carries 0x140B0000 twice,
+  so no selector arms 0x140C0000. The shared map said 0x0E was 0x140C0000, so a dump of a
+  2014 Compact would have filed 0x140B0000's bytes under 0x140C0000.
+- **0.8.0.0's mode 1 reads entry 4 or 5 of the bootloader's config block** (the table the
+  boot record's second word points at). On the emulator's 2020 donor bootloader that entry
+  is 0x14020000; on a real 2014 bootloader nobody has measured it. Mode 4 is a literal
+  0x14020000 on every build, so 0.8.0.0 reads that block through 4 and the token.
+- **The 2014 builds from 0.9.0.2 have no mode-2 test**, so the bootloader block is readable
+  with the token; the 2016-2017 builds refuse it outright. The two 1.3.0.8 images differ
+  here and both report `1.3.0.8`, so that block is not read on 1.3.0.8.
+- **0.7.0.7 and 0.7.0.8 register `GetFeaturedFirmwareData` as a setter only** (`rpcHandlers`
+  in `facts.json`), so a control-IN read has no handler. 0.8.0.0 is the first build with a
+  getter there.
+
+### 10.3 What changed in the toolkit
+
+- **Each build is dumped with its own table.** `FirmwareProfile.windowPlan(version)` returns
+  the build's rows, the windows to arm (one per block, at the address the row gives) and the
+  gaps with reasons; `buildWindowPlan` refuses a table whose gaps and rows do not tile the
+  part exactly. `planForDevice` reads the version (one `GetFirmwareInfo`, unarmed) before
+  anything is armed, and `runDump`, `runSweep` and `readDeviceInfo` all use it. A version
+  the profile has not decoded, or none at all, gets only the rows every decoded build agrees
+  on; 0x14000000 and 0x140C0000 are then gaps that say why. The manifest records the
+  version and the table (`selectorTable`), and the legacy README lists the dump's own gaps.
+- **0.7.0.x is refused.** `compact-2014` covers everything before 0.8.0.0, `legacy-auth` and
+  `compact-2016` score it 0, the probe sends nothing after the version read, and
+  `planForDevice` refuses a pre-0.8 build even under `--profile`: "firmware 0.7.0.7 predates
+  the dump protocol: its RPC method table has no read handler for GetFeaturedFirmwareData
+  (on 0.7.0.7 and 0.7.0.8 it is registered as a setter only …)".
+- **`facts.json` records both columns** for every command of every image (`rpcHandlers`, and
+  `getter`/`setter` on each toolkit opcode), and each image's window table.
+  `firmware-facts.test.ts` now checks that every opcode a dump sends is in the column
+  `OP_DIRECTION` sends it to on every build the toolkit would dump (29 images), that every
+  refused build lacks one, and that each legacy table equals its images' own switch.
+  `workflows.test.ts` checks the client against `OP_DIRECTION` over a whole dump, and dumps
+  fake cameras running the 1.3.0.0 and 1.0.3.0 tables.
+- **Tier 1 arms each firmware's own plan**, with the payload the dump sends, and compares the
+  bytes at the address the plan files them under (`plan` in `expectations.rpc.json`). A plan
+  window that serves another block's bytes fails every row, pinned or not.
+- **The derived gap reason names the command that failed.** Where arms came back clean and
+  every read failed, it says so and names `GetFeaturedFirmwareData`.
+
+Two negative checks, each reverted afterwards: giving 1.3.0.0 the old shared assumption
+(0x0E → 0x140C0000) fails 5 tests, among them the image-bytes comparison and both
+whole-dump tests; moving the probe's version gate back to 0.7 fails 5 others.
+
+### 10.4 Pinned results that changed
+
+**Tier 2: none.** All 15 rows are byte-identical. The dump now sends one `GetFirmwareInfo`
+first, which is why tier 2 delivers 873,018 replies instead of 873,003 (+15, one per row).
+
+**Tier 1: every one of the 51 rows gains the new `plan` field, and 4 gap reasons change.**
+No other field of any row changed.
+
+| row              | old gap reason                                                     | new gap reason                                                                                                                                    | why                                                                                                                                                                     |
+| ---------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0.7.0.7, 0.7.0.8 | `63 of 63 subcommands refused (BeginFirmwareUpgrade -> stall)`     | `25 of 63 subcommands armed with error code 0 and every read of them failed (GetFeaturedFirmwareData, wire 0x4F -> stall); 38 refused at the arm` | the arms of 1 and 0x0A…0x21 succeed; the read has no getter (§10.2). The old text counted an unreadable window as refused and quoted the command probe's plain arm of 5 |
+| 0.5.0.2          | the same as above                                                  | the same as 0.7.0.x                                                                                                                               | same measurement: arms succeed, reads stall (0x4F is `UploadFirmwareRowSize`, setter only, on this build)                                                               |
+| 0.6.0.4          | `63 of 63 subcommands refused (BeginFirmwareUpgrade -> no-answer)` | `25 of 63 … (GetFeaturedFirmwareData, wire 0x4F -> no-answer); 38 refused at the arm`                                                             | same, and this build never answers the read rather than stalling it, as it never answered it before                                                                     |
+
+0.3.0.1, 0.5.1.0 and 0.5.1.3 keep `63 of 63 … refused (BeginFirmwareUpgrade -> stall)`:
+no arm came back clean on them, so the old wording is the right one there.
+
+The new `plan` field, by group: 26 post-2018 rows plan 63 windows and confirm 63 (all
+reused from the window probe); the 3 × 1.0.3.0, 2 × 1.0.3.2 and 2 × 1.3.0.8 rows plan 31
+and confirm 31, arming 3, 5, 6, 7, 8 and 9 with the token; the eight 2014 rows 0.9.0.2 …
+1.3.0.0 plan 31 and confirm 31, including subcommand 2 at 0x14000000 with the token, with
+0x140C0000 a gap; 0.8.0.0 plans 30 and confirms 30, reading 0x14020000 through subcommand
+4; 0.3.0.1, 0.5.0.2, 0.6.0.4, 0.7.0.7 and 0.7.0.8 plan nothing (`compact-2014`). **No plan
+window is misplaced on any row.**
+
+**One row group is a finding, pinned as measured:** 0.5.1.0 and 0.5.1.3 stall every vendor
+request for a while after enumeration on the emulator — `GetFirmwareInfo` and
+`GetErrorCode` included, over USB/IP and in-process — so no version is known when the plan
+is made. The probe's plain arm of 5 is then refused, `legacy-auth` wins on that, and the
+plan is the version-unknown one: 30 windows, all unread. The dump would read nothing, and
+nothing unsafe is sent (0x52 is `BeginFirmwareUpgrade` on those builds). The version gate
+treats an unknown version as not old; on a 0.3.0.1 that did not answer `GetFirmwareInfo` it
+would therefore not engage. Whether a real 0.5.1.x camera behaves like this is not known.
+
+### 10.5 The measurements
+
+FW-V1 is at `6ade3441` and the toolkit at `a15e8de` plus this change, on the same machine
+as §9.10.
+
+| run                                      | exit | passed / failed | wall            | slowest row (tier 1 / tier 2) | replies delivered = received (t1 / t2) | dropped | emulators left |
+| ---------------------------------------- | ---- | --------------- | --------------- | ----------------------------- | -------------------------------------- | ------- | -------------- |
+| regeneration, both tiers, the pinned one | 0    | 420 / 0 (core)  | 184 s           | 105.9 s / 85.1 s              | 20,001 / 873,018                       | 0       | 0              |
+| `npm run check` 1                        | 0    | 609 / 0         | 198 s (183.4 s) | 104.6 s / 83.4 s              | 20,001 / 873,018                       | 0       | 0              |
+| `npm run check` 2                        | 0    | 609 / 0         | 199 s (184.6 s) | 106.8 s / 85.0 s              | 20,001 / 873,018                       | 0       | 0              |
+
+The two `npm run check` runs are consecutive, on the committed code with this section
+still missing these two rows. Without the optional inputs,
+`SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run` gives **473 passed | 3 skipped**,
+exit 0 (445 before; the 28 new tests are the per-build tables, the columns and the
+whole-dump runs above).
+
+The wire line reads 19,771 vendor requests as `0x41`/`0xC1` in tier 1 and 872,949 in tier
+2, and 0 as `0x40`/`0xC0` in either. Tier 2's 3 stalled vendor requests are the capability
+probe's plain arm of subcommand 5 on the three 1.0.3.0 dumps, which that firmware refuses by
+design. No standard request stalled.
+
+### 10.6 Still open
+
+- **The version gate cannot see a build that does not answer `GetFirmwareInfo`** (§10.4,
+  0.5.1.x). Refusing unknown versions would stop every camera that is slow to answer it.
+- **1.3.0.8 8 Hz could give its bootloader block** (no mode-2 test), but the version does not
+  tell it from the 16 Hz build. The build string might.
+- **0.8.0.0's mode 1 on a real 2014 bootloader** is unmeasured; the plan does not use it.
+- FW-V1 `targets/compact_32k_0_3_0_1/src/rpc_cmds.c` still carries the completed image's
+  41-row method table and its modern `cmd_BeginFirmwareUpgrade` (`case 0xE` →
+  0x140C0000), which the 0.3.0.1 image does not have; recorded in FW-V1
+  `docs/ACTION_ITEMS.md`, not changed here.
+- The web dump view still calls the unlock token "build-specific" (§9.3 shows one token in
+  22 images); not changed here.
