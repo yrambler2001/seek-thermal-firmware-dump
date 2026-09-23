@@ -108,16 +108,16 @@ export const READ_CHUNK = Number(process.env.SEEK_EMU_CHUNK ?? '64');
  * recorded as unmeasurable.
  *
  * THIS IS NOT A RETRY-UNTIL-GREEN, and the distinction is the whole point. It
- * fires only on `ProbeUnmeasurable` — the camera stopped being there, because
- * the emulator's own run ended or the session died and would not come back. A
- * device that STALLS, or answers a device error code, is measured once and
- * recorded as it answered; nothing here can turn a refusal into an `ok`.
+ * fires only on `ProbeUnmeasurable` — the camera stopped answering and three
+ * fresh imports did not bring it back, while its emulator kept running. A device
+ * that STALLS, or answers a device error code, is measured once and recorded as
+ * it answered; nothing here can turn a refusal into an `ok`.
  *
- * Three, because the failure it covers is a per-process event: the emulated
- * part faulted on an instruction this emulator does not model, or a session died
- * with nothing to say for itself. A fresh process is a fresh draw, and a row that
- * comes up unmeasurable three times running is telling you something real — which
- * is then written down in those words.
+ * AN EMULATOR WHOSE RUN ENDED IS NOT RE-DRAWN, AND IT IS NOT A GAP (2026-09-23,
+ * TESTING.md sec.15). It used to be: a Unicorn fault was recorded as the row's gap,
+ * and a death with no stop reason got a fresh process. Both are now an
+ * `InfrastructureDefect` the moment they happen (harness.ts, THE DEATH RULE). Tier 1
+ * only; tier 2's loop existed for dead emulators alone and is gone.
  *
  * IT CANNOT HIDE A LOST REPLY. "One transfer abandoned mid-flight under host
  * contention" used to be listed here as a cause; it was the emulator's USB/IP

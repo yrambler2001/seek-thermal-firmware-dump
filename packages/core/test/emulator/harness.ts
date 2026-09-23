@@ -23,6 +23,15 @@
  * compares that ledger with what the client side counted. Any dropped reply, any
  * mismatch, any ledger missing is an `InfrastructureDefect`: it fails the row,
  * gap or not, and is never written down as firmware behaviour.
+ *
+ * THE DEATH RULE (2026-09-23). An emulator whose run ends while a row is still
+ * using it — the process exits, or it prints its `stopped:` / `fault:` line
+ * without having been asked to stop — is a defect of the instrument too, and
+ * the harness notices AT ONCE: `Emulator` watches the child's output and exit,
+ * aborts every adapter attached to it (so nothing sits out a reopen timeout
+ * against a corpse), and `RowEmulators.guard()` fails the row with an
+ * `InfrastructureDefect` the moment it happens. It is never a gap: a camera
+ * does not "fault at PC 0x1000436C", an emulator does (TESTING.md sec.15).
  * ==================================================================== */
 
 import { type ChildProcess, spawn } from 'node:child_process';
@@ -192,9 +201,12 @@ export interface DeliveryAudit {
   readonly violations: readonly string[];
   readonly server: DeliverySummary | null;
   readonly client: DeliveryLedgerSnapshot;
-  /** True when the emulator exited on its own (a Unicorn fault) before the harness
-   *  stopped it — the one case in which an unanswered transfer is explained. */
+  /** True when the emulator's run ended on its own before the harness stopped it.
+   *  That is itself a violation (`death`); it only keeps the transfers it left
+   *  unanswered from being listed as separate ones. */
   readonly diedOnItsOwn: boolean;
+  /** How the emulator's run ended under the row, or null when the harness stopped it. */
+  readonly death: string | null;
   /** What went on the wire, and the emulator's own count of SET_INTERFACE stalls. */
   readonly wire: WireTally;
 }
@@ -313,9 +325,9 @@ export class InfrastructureDefect extends Error {
       a.violations.map((v) => `  emulator ${String(i + 1)} of ${String(audits.length)}: ${v}`),
     );
     super(
-      `INFRASTRUCTURE DEFECT on ${entryId} — the emulator/USB-IP transport lost or ` +
-        `mis-delivered replies, so nothing this row measured is a statement about the ` +
-        `firmware:\n${lines.join('\n')}`,
+      `INFRASTRUCTURE DEFECT on ${entryId} — the emulator/USB-IP transport failed (a ` +
+        `reply lost or mis-delivered, or the emulator's run ended under the row), so ` +
+        `nothing this row measured is a statement about the firmware:\n${lines.join('\n')}`,
       cause === undefined ? undefined : { cause },
     );
     this.name = 'InfrastructureDefect';
@@ -339,6 +351,13 @@ export interface StartOptions {
  *  backstop, not a wait: a healthy one exits in well under a second. */
 const STOP_GRACE_MS = 30_000;
 
+/** What `startOnce` wires to the child's output and exit before the `Emulator`
+ *  object exists; the constructor fills the two hooks in. */
+interface ChildWatch {
+  onLine: ((line: string) => void) | null;
+  onExit: ((code: number | null, signal: NodeJS.Signals | null) => void) | null;
+}
+
 export class Emulator {
   readonly entryId: string;
   readonly ready: ReadyLine;
@@ -350,6 +369,12 @@ export class Emulator {
   private stopped = false;
   private killed = false;
   private diedOnItsOwn = false;
+  /** The emulator printed `stopping (...)`: a stop somebody ASKED for is under way. */
+  private stopAnnounced = false;
+  private deathReason: string | null = null;
+  private readonly deathController = new AbortController();
+  private readonly deathNotice: Promise<string>;
+  private announceDeath: (reason: string) => void = () => undefined;
 
   private constructor(
     entryId: string,
@@ -357,12 +382,84 @@ export class Emulator {
     ready: ReadyLine,
     log: string[],
     closed: Promise<void>,
+    watch: ChildWatch,
   ) {
     this.entryId = entryId;
     this.child = child;
     this.ready = ready;
     this.logLines = log;
     this.closed = closed;
+    this.deathNotice = new Promise<string>((resolve) => {
+      this.announceDeath = resolve;
+    });
+    /* Anything that happened between the READY line and now counts too. */
+    for (const line of log) this.onOutputLine(line);
+    watch.onLine = (line) => {
+      this.onOutputLine(line);
+    };
+    watch.onExit = (code, signal) => {
+      this.onChildExit(code, signal);
+    };
+    if (child.exitCode !== null || child.signalCode !== null) {
+      this.onChildExit(child.exitCode, child.signalCode);
+    }
+  }
+
+  /**
+   * The emulator's own words about its run ending.
+   *
+   * `seek_emu.py --usbip` prints `stopping (SIGTERM) - ...` when it is ASKED to stop,
+   * and `stopped: <reason>` when `Machine.run()` returns, then the summary, then
+   * `fault: ...` if the part faulted (FW-V1 seekemu/cli.py, seekemu/report.py). So a
+   * `stopped:` line with no `stopping (` before it is a run that ended by itself - a
+   * Unicorn fault, a stall, anything - and a `fault:` line always is. Seen here, it
+   * is noticed while the process is still printing, before the socket has even
+   * finished closing.
+   */
+  private onOutputLine(line: string): void {
+    if (line.startsWith('stopping (')) {
+      this.stopAnnounced = true;
+    } else if (line.startsWith('fault: ')) {
+      this.markDead(`it reported "${line.trim()}"`, true);
+    } else if (line.startsWith('stopped: ') && !this.stopAnnounced) {
+      this.markDead(`it reported "${line.trim()}" without having been asked to stop`, true);
+    }
+  }
+
+  /** The process exited. Only a death if nobody here asked it to stop. */
+  private onChildExit(code: number | null, signal: NodeJS.Signals | null): void {
+    this.markDead(
+      `the process exited (code ${String(code)}, signal ${String(signal)})` +
+        (this.stopAnnounced ? ' after a stop this harness did not ask for' : ''),
+      false,
+    );
+  }
+
+  /** `selfDescribing`: the emulator said so itself, so it counts even if the harness
+   *  had begun stopping it in the same instant. */
+  private markDead(how: string, selfDescribing: boolean): void {
+    if (this.deathReason !== null) return;
+    if (this.stopped && !selfDescribing) return;
+    this.deathReason = `the emulator's run ended while the harness was still using it: ${how}`;
+    this.diedOnItsOwn = true;
+    this.deathController.abort(new Error(this.deathReason));
+    this.announceDeath(this.deathReason);
+  }
+
+  /** How the emulator's run ended under the harness, or null while it has not. */
+  get death(): string | null {
+    return this.deathReason;
+  }
+
+  /** Settles, with `death`, the moment the emulator's run ends on its own; never
+   *  settles for a stop the harness asked for. */
+  whenDead(): Promise<string> {
+    return this.deathNotice;
+  }
+
+  /** The Python process's pid - for a test that has to kill one from outside. */
+  get pid(): number | undefined {
+    return this.child.pid;
   }
 
   /** The emulator's own output. Attached to every failure, because the reason a
@@ -461,6 +558,14 @@ export class Emulator {
     const server = this.deliverySummary();
     const client = this.ledger.snapshot();
     const v: string[] = [];
+    if (this.deathReason !== null) {
+      const said = this.stopReason();
+      v.push(
+        this.deathReason +
+          (said === null || this.deathReason.includes(said) ? '' : ` [${said}]`) +
+          ' - an emulator that stops is a defect of the instrument, never a firmware result',
+      );
+    }
     if (server === null) {
       v.push(
         'the emulator exited without printing its ---USBIP-SUMMARY--- delivery ledger' +
@@ -531,6 +636,7 @@ export class Emulator {
       server,
       client,
       diedOnItsOwn: this.diedOnItsOwn,
+      death: this.deathReason,
       wire: tallyWire(client.requests, this.setInterfaceStallsLogged()),
     };
   }
@@ -594,6 +700,10 @@ export class Emulator {
     });
 
     const lines: string[] = [];
+    const watch: ChildWatch = { onLine: null, onExit: null };
+    child.once('exit', (code, signal) => {
+      watch.onExit?.(code, signal);
+    });
     const ready = await new Promise<ReadyLine>((resolve, reject) => {
       const deadline = setTimeout(() => {
         reject(
@@ -611,6 +721,7 @@ export class Emulator {
         pending = parts.pop() ?? '';
         for (const line of parts) {
           lines.push(line);
+          watch.onLine?.(line);
           if (line.startsWith('---USBIP-READY--- ')) {
             clearTimeout(deadline);
             try {
@@ -664,7 +775,7 @@ export class Emulator {
     for (;;) {
       try {
         await devlist('127.0.0.1', ready.port, 15_000);
-        return new Emulator(options.entryId, child, ready, lines, closed);
+        return new Emulator(options.entryId, child, ready, lines, closed, watch);
       } catch (error) {
         if (Date.now() >= deadline || child.exitCode !== null) {
           lastError = error;
@@ -687,6 +798,7 @@ export class Emulator {
     return UsbIpWebUsbDevice.attach('127.0.0.1', this.ready.port, this.ready.busid, {
       ...options,
       ledger: this.ledger,
+      gone: this.deathController.signal,
     });
   }
 
@@ -705,6 +817,11 @@ export class Emulator {
     live.delete(this.child);
     if (this.child.exitCode !== null || this.child.signalCode !== null) {
       this.diedOnItsOwn = true;
+      this.markDead(
+        `the process had exited (code ${String(this.child.exitCode)}, signal ` +
+          `${String(this.child.signalCode)}) before the harness stopped it`,
+        true,
+      );
       await Promise.race([this.closed, new Promise((resolve) => setTimeout(resolve, 15_000))]);
       return;
     }
@@ -756,6 +873,37 @@ export class RowEmulators {
     }
     this.audits = audits;
     return audits;
+  }
+
+  /**
+   * Run `work` against `emu`, and fail the row THE MOMENT the emulator's run ends.
+   *
+   * `work` is raced against `Emulator.whenDead()`. If the emulator dies first, every
+   * emulator of the row is stopped and audited and an `InfrastructureDefect` is
+   * thrown at once, carrying the death; `work` is left to unwind on its own, which
+   * it does in milliseconds because the death also aborted every adapter attached
+   * to that emulator. If `work` fails and the emulator turns out to be dead, that is
+   * the same defect (the socket can close a moment before the `stopped:` line is
+   * read). Nothing is retried and nothing is recorded.
+   */
+  async guard<T>(emu: Emulator, work: () => Promise<T>): Promise<T> {
+    const running = work();
+    const outcome = await Promise.race([
+      running.then(
+        (value) => ({ kind: 'done' as const, value }),
+        (error: unknown) => ({ kind: 'threw' as const, error }),
+      ),
+      emu.whenDead().then((reason) => ({ kind: 'died' as const, reason })),
+    ]);
+    if (outcome.kind === 'done') return outcome.value;
+    /* A failure while the emulator is (still) running is the work's own; if the
+     * emulator was in fact dying, the audit after the row says so. */
+    if (outcome.kind === 'threw' && emu.death === null) throw outcome.error;
+    const cause = outcome.kind === 'threw' ? outcome.error : new Error(outcome.reason);
+    await this.assertDelivery(cause);
+    /* Unreachable in practice: a dead emulator is always a violation. Kept so a
+     * change to the audit can never turn a death into a pass. */
+    throw new InfrastructureDefect(this.entryId, await this.finish(), cause);
   }
 
   /** Throws `InfrastructureDefect` if any audited emulator lost or mis-delivered a reply. */

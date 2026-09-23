@@ -794,6 +794,10 @@ The last rule is relaxed only when the emulator **died on its own** (a Unicorn f
 probe records as that row's gap): then an unanswered transfer is explained. Everything else still
 applies to those rows.
 
+_(Superseded in §15: an emulator that dies on its own is itself an infrastructure defect and
+fails the row at once; it is never recorded as a gap. The relaxation now only keeps the
+unanswered transfers from being listed as separate violations under the death.)_
+
 `RowEmulators` (harness.ts) tracks every emulator a row starts, and the audit runs **before**
 anything is recorded or compared, in both modes. `InfrastructureDefect` is not a
 `ProbeUnmeasurable`, so the re-measure-from-a-fresh-emulator path cannot hide it — a discarded
@@ -2238,7 +2242,13 @@ by measurement rather than reading:
 FW-V1's `emu/` moved and no self-test, `SHA256SUMS`, `verify-noop` or campaign-log-for-a-code-change
 was owed for it.
 
-## 14. Re-run against the wire-time emulator; 27 pins moved, every one explained (2026-09-23)
+## 14. Re-run against the wire-time emulator; 24 pins moved, every one explained (2026-09-23)
+
+> **Corrected in §15.** This section first pinned the three Nano 300 rows as a known gap whose
+> reason was the emulator faulting. That was wrong: an emulator that stops is a defect of the
+> instrument, never a firmware result, so it can never be a gap. Those three pins were reverted
+> (`9855f64`), a dead emulator now fails its row at once as an `InfrastructureDefect`, and the
+> timing that made the emulator hit the firmware's race every time was fixed in FW-V1 (§15).
 
 FW-V1 Phase 28 changed the emulator twice: handlers now nest by priority (`ba5662e7`), and a
 USB IN transfer completes no sooner than its data bits take at 480 Mb/s (`405f3d28`, USB 2.0
@@ -2254,12 +2264,12 @@ Tier 1: 26 rows failed; tier 2: 1 row failed. Regenerated with
 diff read field by field. Nothing else moved: identity, chip id, commands, windows, auth and
 plan are identical on every other row, and tier 2 is identical on the other 14 dumps.
 
-| rows                                                                                                                                                                                                      | field                       | pinned → now   |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- | -------------- |
-| Compact 4.8.1.7 and 4.16.1.7, image and trimmed (4)                                                                                                                                                       | `controlInBytes["512"]`     | 192 → 512      |
-| Compact 4.8.1.9 image and trimmed, Compact 4.8.2.1 dump, Compact PRO 4.9.1.15 (2), 4.9.2.0 (3), 4.18.2.0-FF (4), Compact XR 4.8.2.1 (2), Mosaic 10.9.1.31 (2), Mosaic 2.27.1.33-FF (2), Nano 200 (2) (20) | `controlInBytes["256"]`     | 128 → 256      |
-| the same 20                                                                                                                                                                                               | `controlInBytes["512"]`     | 128 → 512      |
-| Nano 300 44.27.3.10 dump and decrypted image (tier 1), dump (tier 2)                                                                                                                                      | the whole row → a known gap | measured → not |
+| rows                                                                                                                                                                                                      | field                   | pinned → now   |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- | -------------- |
+| Compact 4.8.1.7 and 4.16.1.7, image and trimmed (4)                                                                                                                                                       | `controlInBytes["512"]` | 192 → 512      |
+| Compact 4.8.1.9 image and trimmed, Compact 4.8.2.1 dump, Compact PRO 4.9.1.15 (2), 4.9.2.0 (3), 4.18.2.0-FF (4), Compact XR 4.8.2.1 (2), Mosaic 10.9.1.31 (2), Mosaic 2.27.1.33-FF (2), Nano 200 (2) (20) | `controlInBytes["256"]` | 128 → 256      |
+| the same 20                                                                                                                                                                                               | `controlInBytes["512"]` | 128 → 512      |
+| Nano 300 44.27.3.10 dump and decrypted image (tier 1), dump (tier 2)                                                                                                                                      | the emulator faulted    | see §14.3, §15 |
 
 ### 14.2 The 24 `controlInBytes` rows: the pins recorded an emulator race
 
@@ -2316,13 +2326,16 @@ is tens of cycles out of the poll's 12.5 ms period. The emulator hits it every t
 host steps, and so its SETUP deliveries, come on a grid that the firmware's wake-ups anchor, and
 the first vendor request of this sequence now falls on the poll's first instructions. Nothing in
 the emulator is unphysical there (a SETUP 77 cycles after a poll starts is possible on the wire),
-so nothing was changed in FW-V1 to dodge it, and the rows are pinned as the known gap they now
-are, with the fault in the reason. If FW-V1 changes the host timing again this row will move
-back, and the suite will say so ("was a known gap … and is now fully measured").
+but a host whose SETUPs are tied to the device's own wake-ups is not a real host, and the
+emulator stopping is not something a camera does. The rows are therefore **not** a gap: the
+pins stay at their measured values (reverted in `9855f64`), the harness fails a dead emulator
+as an `InfrastructureDefect`, and FW-V1 now delivers a SETUP on the host's microframe grid
+(§15).
 
 ### 14.4 The pins commit, and the second `npm run check`
 
-The regenerated pins are commit `795fca8`, on their own.
+The regenerated pins were commit `795fca8`, on their own; its three Nano 300 rows were
+reverted in `9855f64` (§15), its other 24 rows stand.
 
 | run                                   | exit | passed / failed | wall (vitest) | slowest row (tier 1 / tier 2) | delivered = received (t1 / t2) | dropped |
 | ------------------------------------- | ---- | --------------- | ------------- | ----------------------------- | ------------------------------ | ------- |
@@ -2331,9 +2344,72 @@ The regenerated pins are commit `795fca8`, on their own.
 
 The wire line on run 2: every vendor request `0x41/0xC1`, 0 `0x40/0xC0`; 0 SET_CONFIGURATION,
 0 SET_INTERFACE. Tier 2 delivered fewer replies than §13.2 (808,271 against 873,048) because
-the Nano 300 dump is now a 12 s gap instead of a full round trip.
+the Nano 300 dump ended at the emulator's fault 12 s in instead of a full round trip.
 
-**The cost, stated:** the two tier-1 Nano 300 rows now take ~615 s each — the probe meets a
-dead emulator and every reopen sits out its timeout — so `npm run check` went from ~210 s to
-~720 s. The pinned gap is exact, so this is a slow pass, not a flaky one. Making the probe give
-up sooner on a dead emulator is a toolkit-side change and was not made here.
+Run 2 passed only because the fault was pinned, which §15 undoes. The two tier-1 Nano 300 rows
+took ~615 s each — the probe met a dead emulator and every reopen sat out its 20 s — and
+`npm run check` went from ~210 s to ~720 s. §15 makes the harness stop at the first sign of a
+dead emulator; that is a test-harness change (the toolkit's source is untouched).
+
+## 15. A dead emulator is an infrastructure defect, never a gap; SETUPs on the host's microframes (2026-09-23)
+
+§14 pinned the three Nano 300 rows as a known gap whose reason was the emulator faulting. That
+broke this harness's own rule: an emulator crash is a defect of the instrument, not a firmware
+result. This section undoes it and fixes both halves of what caused it — the harness that took
+~615 s to notice a dead emulator, and the emulator timing that hit a firmware race every time.
+
+### 15.1 The three crash pins, reverted
+
+Commit `9855f64` reverses exactly the two Nano 300 hunks of `795fca8` in
+`expectations.rpc.json` and its one hunk in `expectations.roundtrip.json`. The rpc file now
+differs from `f177b2f` only in §14's 24 `controlInBytes` rows (kept: they are correct); the
+roundtrip file is identical to `f177b2f`. The crash-as-gap wording in §14 is corrected in place.
+
+### 15.2 The harness notices a dead emulator at once
+
+The rule (harness.ts, THE DEATH RULE): an emulator whose run ends while a row is still using it
+fails that row **immediately** as an `InfrastructureDefect`. "Ends" is any of:
+
+| signal                                                       | how it is seen                                                                             |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| it printed `fault: …`                                        | the output line, while the process may still be running                                    |
+| it printed `stopped: …` with no `stopping (…)` before it     | the output line: `seek_emu.py --usbip` prints `stopping (SIGTERM)` only when asked to stop |
+| the process exited and this harness had not asked it to stop | the child's `exit` event (a SIGKILL, or another process's `pkill`)                         |
+
+What happens then:
+
+- `Emulator` aborts a `gone` signal that every adapter attached to it holds
+  (`UsbIpWebUsbOptions.gone`): the live USB/IP session is closed, and every later transfer and
+  every reopen throws at once with the reason. Before, `open()` retried a dead port for its full
+  `REOPEN_TIMEOUT_MS` (20 s), and the tier-1 probe reopens after every command that came back
+  empty — that was the ~615 s per Nano 300 row.
+- `RowEmulators.guard(emu, work)` races the row's work against `Emulator.whenDead()`. On a
+  death it stops and audits every emulator of the row and throws the `InfrastructureDefect`
+  there and then; the abandoned work unwinds in milliseconds because its adapter was aborted.
+  Both suites run their measurement under it (tier 1: `probeTier1`; tier 2: attach, profile
+  probe and `runDump`).
+- `auditDelivery()` lists the death as a violation ("… an emulator that stops is a defect of the
+  instrument, never a firmware result"), with the emulator's own `stopped:` / `fault:` line. So a
+  death the race did not see (the socket can close a moment before the line is read) still fails
+  the row when it is audited, before anything is recorded or compared — in both modes, so the
+  regenerator cannot turn it into a gap either.
+- `measureRow` rethrows `InfrastructureDefect` (as it already did `HarnessFidelityError`) instead
+  of turning it into a gap. Tier 1's `ProbeUnmeasurable` re-draw now covers only a camera that
+  stopped answering while its emulator kept running; tier 2's attempts loop, which existed only
+  for dead emulators, is gone (one attempt). No timeout was lengthened, no retry added, no check
+  loosened; the §9.8 relaxation for a dead emulator now only keeps its unanswered transfers from
+  being listed as separate violations under the death.
+
+**The test** (`packages/core/test/emulator-failfast.test.ts`, 4 tests, ~7 s):
+
+| case                                                                                             | measured                                                                                 |
+| ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| a stand-in emulator prints `stopped:` / `fault:` exactly as `seek_emu.py` does, then stays alive | `InfrastructureDefect` with the fault line, noticed while the process was still alive    |
+| the same stand-in, stopped by the harness (prints `stopping (SIGTERM)` first)                    | no death, audit clean                                                                    |
+| the stand-in stopped in order by a SIGTERM from outside                                          | `InfrastructureDefect` "… after a stop this harness did not ask for"                     |
+| a **real** emulator (Compact PRO 4.18.2.0-FF dump) SIGKILLed after 20 replies of a tier-1 probe  | `InfrastructureDefect` 3 ms after the kill; the abandoned probe settled well inside 10 s |
+
+The bound in each is half of one `REOPEN_TIMEOUT_MS` (10 s), so a row that noticed the death only
+by sitting out a reopen cannot pass. Negative check, with the race in `guard()` disabled: 3 of 4
+fail (two 60 s test timeouts; the real row came back as a `ProbeUnmeasurable`, the old path to a
+gap, instead of an `InfrastructureDefect`).

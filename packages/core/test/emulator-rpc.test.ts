@@ -79,7 +79,7 @@
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { SAFE_BEFORE_IDENTITY, type Opcode } from '../src/protocol/ops.js';
-import { liveEmulatorCount, RowEmulators } from './emulator/harness.js';
+import { InfrastructureDefect, liveEmulatorCount, RowEmulators } from './emulator/harness.js';
 import {
   probeTier1,
   ProbeUnmeasurable,
@@ -351,9 +351,11 @@ function gapReason(error: unknown): string {
  *
  * Both modes call this, so the gap an assertion compares against the pin is derived
  * by the same code that wrote the pin. It never throws for a measurement that could
- * not be made: that becomes the row's gap, with its reason, as it always has. What
- * it does not decide is whether the instrument was sound — `RowEmulators` audits
- * that afterwards, and an infrastructure defect never reaches the record.
+ * not be made: that becomes the row's gap, with its reason, as it always has. It DOES
+ * throw an `InfrastructureDefect` the moment the emulator's run ends under it - a dead
+ * emulator is not a measurement that could not be made, it is a broken instrument
+ * (TESTING.md sec.15). Everything else about the instrument `RowEmulators` audits
+ * afterwards, and an infrastructure defect never reaches the record.
  */
 async function measureRow(
   entry: (typeof ENTRIES)[number],
@@ -383,10 +385,15 @@ async function measureRow(
         readyTimeoutMs: BOOT_TIMEOUT_MS,
       });
       try {
-        got = await probeTier1(emu, {
-          groundTruthPath: truth,
-          urbTimeoutMs: URB_TIMEOUT_MS,
-        });
+        /* GUARDED: if the emulator's run ends under the probe, the row fails at
+         * once as an `InfrastructureDefect` (harness.ts, THE DEATH RULE) instead of
+         * the probe sitting out a reopen timeout per command against a corpse. */
+        got = await row.guard(emu, () =>
+          probeTier1(emu, {
+            groundTruthPath: truth,
+            urbTimeoutMs: URB_TIMEOUT_MS,
+          }),
+        );
         break;
       } catch (error) {
         if (!(error instanceof ProbeUnmeasurable)) throw error;
@@ -395,10 +402,11 @@ async function measureRow(
             (error.emulatorStopReason === null ? '' : ` [${error.emulatorStopReason}]`),
         );
         await emu.stop();
-        /* A FAULT IS NOT RE-DRAWN. `worthRetrying` is false when the emulator
-         * stopped on an instruction it cannot execute, which it will reach again at
-         * the same point on a fresh process. Only a session that died with nothing
-         * to say for itself gets another go. */
+        /* A DEAD EMULATOR IS NEITHER RE-DRAWN NOR A GAP. If its run ended - a
+         * Unicorn fault, a kill from outside - the audit throws the
+         * `InfrastructureDefect` here. What is left to re-draw is a camera that
+         * stopped answering while its emulator kept running. */
+        if (emu.death !== null) await row.assertDelivery(error);
         if (!error.worthRetrying) break;
       }
     }
@@ -420,8 +428,11 @@ async function measureRow(
       gap: now.windowsConfirmed.length === 0 ? { reason: noWindowReason(got, now) } : null,
     };
   } catch (error) {
-    /* The harness off the real-host path is not a measurement at all: never a gap. */
-    if (error instanceof HarnessFidelityError) throw error;
+    /* The harness off the real-host path is not a measurement at all: never a gap.
+     * Nor is a defect of the instrument - a lost reply or a dead emulator. */
+    if (error instanceof HarnessFidelityError || error instanceof InfrastructureDefect) {
+      throw error;
+    }
     /* A measurement that could not be made, recorded as the gap it is. */
     return {
       kind: entry.kind,

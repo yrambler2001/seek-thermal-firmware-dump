@@ -37,7 +37,7 @@ import { WebUsbTransport } from '../src/protocol/webusb.js';
 import { detectProfile, getProfile } from '../src/profiles/registry.js';
 import { evidenceFromChannelProbe, probeSelectorChannel } from '../src/workflows/capability.js';
 import { runDump } from '../src/workflows/dump.js';
-import { type Emulator, liveEmulatorCount, RowEmulators } from './emulator/harness.js';
+import { InfrastructureDefect, liveEmulatorCount, RowEmulators } from './emulator/harness.js';
 import { assertRealHostPath, HarnessFidelityError } from './emulator/webusb-over-usbip.js';
 import {
   announceSkip,
@@ -54,7 +54,6 @@ import {
   REGENERATING,
   ROUNDTRIP_EXPECTATIONS,
   scratchFile,
-  PROBE_ATTEMPTS,
   TIER2_TIMEOUT_MS,
   URB_TIMEOUT_MS,
   writeExpectations,
@@ -200,26 +199,23 @@ async function measureRow(
   row: RowEmulators,
 ): Promise<RoundTripExpectation & { gap: KnownGap | null }> {
   try {
-    /* SAME RULE AS TIER 1: a dump taken off an emulator that stopped executing
-     * partway through is not a round-trip result, it is a partial transfer to a
-     * corpse, and writing its diff ranges down would pin this machine's load.
-     * `Emulator.alive` is the check, and the whole row is taken again from a fresh
-     * process — every one of which `RowEmulators` audits. */
-    let result: Awaited<ReturnType<typeof runDump>> | null = null;
-    let truth: Uint8Array | null = null;
-    let served: Emulator | null = null;
+    /* SAME RULE AS TIER 1, AND SINCE 2026-09-23 A STRICTER ONE: a dump taken off an
+     * emulator whose run ended partway through is not a round-trip result, and it is
+     * not a gap either - it is a broken instrument. `row.guard` fails the row with an
+     * `InfrastructureDefect` the moment the emulator dies (harness.ts, THE DEATH
+     * RULE), and the check after the dump catches a death the race did not see.
+     * There is nothing left to re-draw from a fresh process: the attempts loop that
+     * stood here existed only for dead emulators (TESTING.md sec.15). */
+    const truthPath = scratchFile(`t2_${entry.id}_a1.bin`);
+    const emu = await row.start(EMU_DIR!, {
+      entryId: entry.id,
+      fillSeed: FILL_SEED,
+      fillScope: FILL_SCOPE,
+      flashOut: truthPath,
+      readyTimeoutMs: BOOT_TIMEOUT_MS,
+    });
     let profile = getProfile('generic');
-    const dead: string[] = [];
-    for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
-      const truthPath = scratchFile(`t2_${entry.id}_a${String(attempt)}.bin`);
-      const emu = await row.start(EMU_DIR!, {
-        entryId: entry.id,
-        fillSeed: FILL_SEED,
-        fillScope: FILL_SCOPE,
-        flashOut: truthPath,
-        readyTimeoutMs: BOOT_TIMEOUT_MS,
-      });
-
+    const { result, device, transport } = await row.guard(emu, async () => {
       const device = await emu.attach({ urbTimeoutMs: URB_TIMEOUT_MS });
       const transport = new WebUsbTransport(device, {
         recipient: 'auto',
@@ -243,38 +239,22 @@ async function measureRow(
       const channel = await probeSelectorChannel(seek);
       profile = detectProfile(evidenceFromChannelProbe(channel)).best.profile;
 
-      const attemptResult = await runDump(
+      const result = await runDump(
         { device: seek, profile, detection: null, reporter: silentReporter },
         { chunk: READ_CHUNK, retries: 1, decrypt: true },
       );
-      await device.close().catch(() => undefined);
-      /* ...and it stayed there through every reopen `runDump`'s retries made. The
-       * transport is closed by now, so only the recipient and the claims are checked. */
-      assertRealHostPath(device, transport.info, `${entry.id}: end of the dump`, false);
+      return { result, device, transport };
+    });
+    await device.close().catch(() => undefined);
+    /* ...and it stayed there through every reopen `runDump`'s retries made. The
+     * transport is closed by now, so only the recipient and the claims are checked. */
+    assertRealHostPath(device, transport.info, `${entry.id}: end of the dump`, false);
 
-      if (!emu.alive) {
-        const reason = await emu.settledStopReason();
-        dead.push(
-          `attempt ${String(attempt)}: the emulator exited during the dump` +
-            (reason === null ? '' : ` [${reason}]`),
-        );
-        await emu.stop();
-        /* Same rule as tier 1: a Unicorn fault is deterministic, so a fresh
-         * process reproduces it rather than measuring anything new. */
-        if (reason !== null) break;
-        continue;
-      }
-      result = attemptResult;
-      truth = new Uint8Array(readFileSync(truthPath));
-      served = emu;
-      break;
+    if (emu.death !== null || !emu.alive) {
+      await emu.stop();
+      await row.assertDelivery(new Error(`${entry.id}: the emulator's run ended during the dump`));
     }
-    if (result === null || truth === null) {
-      throw new Error(
-        `not measurable in ${String(dead.length)} attempt(s) from fresh emulators:\n  ` +
-          dead.join('\n  '),
-      );
-    }
+    const truth = new Uint8Array(readFileSync(truthPath));
     expect(truth.length, 'the emulator wrote a 4 MiB ground-truth image').toBe(FLASH_SIZE);
 
     /* WHAT THE MANIFEST SAYS ABOUT ITS TRANSPORT is what the run used: interface
@@ -328,7 +308,7 @@ async function measureRow(
       diffBytesComparable,
       diffRangesComparable: describeRanges(comparable),
       bytesUnreachable,
-      bytesStillErased: served?.ready.fill?.bytes_still_erased ?? null,
+      bytesStillErased: emu.ready.fill?.bytes_still_erased ?? null,
       decryptedSha256,
       profile: profile.id,
     };
@@ -351,8 +331,11 @@ async function measureRow(
             },
     };
   } catch (error) {
-    /* The harness off the real-host path is not a measurement at all: never a gap. */
-    if (error instanceof HarnessFidelityError) throw error;
+    /* The harness off the real-host path is not a measurement at all: never a gap.
+     * Nor is a defect of the instrument - a lost reply or a dead emulator. */
+    if (error instanceof HarnessFidelityError || error instanceof InfrastructureDefect) {
+      throw error;
+    }
     /* A measurement that could not be made, recorded as the gap it is. */
     return {
       kind: entry.kind,

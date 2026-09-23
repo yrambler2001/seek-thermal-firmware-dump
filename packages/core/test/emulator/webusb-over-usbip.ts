@@ -63,7 +63,7 @@ import type {
   WebUsbInTransferResult,
   WebUsbOutTransferResult,
 } from '../../src/protocol/webusb.js';
-import { DeliveryLedger, UsbIpSession, UsbIpStall } from './usbip-client.js';
+import { DeliveryLedger, UsbIpError, UsbIpSession, UsbIpStall } from './usbip-client.js';
 
 /* USB 2.0 sec.9.3.1, Table 9-2: bmRequestType is D7 direction, D6..5 type, D4..0
  * recipient. Table 9-3 lists every standard request with the ONE recipient it is
@@ -162,6 +162,29 @@ export interface UsbIpWebUsbOptions {
    * harness can compare the client's count against the emulator's delivery ledger.
    */
   readonly ledger?: DeliveryLedger;
+  /**
+   * Aborted when the device behind this adapter is gone for good: `Emulator` aborts
+   * it the moment the emulator's run ends (the process exited, or it printed its
+   * `stopped:` / `fault:` line without having been asked to stop).
+   *
+   * WHY THE ADAPTER HAS TO KNOW. Nothing on the socket says "for good". A closed
+   * session looks like the single import slot being busy, so `open()` retries for
+   * `REOPEN_TIMEOUT_MS`, and the probe reopens after every command that came back
+   * with nothing — against a dead emulator that was 20 s per reopen, ~615 s per
+   * Nano 300 row on 2026-09-23 (TESTING.md sec.14, sec.15). Once this is aborted,
+   * the live session is closed (its pending transfers end at once), and every later
+   * transfer and every reopen throws immediately with the reason.
+   */
+  readonly gone?: AbortSignal;
+}
+
+/** Throws at once when `gone` has been aborted, carrying its reason. */
+function throwIfGone(gone: AbortSignal | undefined, what: string): void {
+  if (gone?.aborted !== true) return;
+  const reason: unknown = gone.reason;
+  throw new UsbIpError(
+    `${what}: the device is gone for good (${reason instanceof Error ? reason.message : String(reason)})`,
+  );
 }
 
 export class UsbIpWebUsbDevice implements WebUsbDevice {
@@ -177,6 +200,7 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
   private readonly timeoutMs: number;
   private readonly where: { host: string; port: number; busid: string };
   private readonly ledger: DeliveryLedger;
+  private readonly gone: AbortSignal | undefined;
   /** bNumInterfaces of the active configuration, from the import record. USB 2.0
    *  sec.9.6.5: bInterfaceNumber is the zero-based index into that array, so the
    *  interfaces that exist are exactly 0 .. interfaceCount-1. */
@@ -200,11 +224,23 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     timeoutMs: number,
     where: { host: string; port: number; busid: string },
     ledger: DeliveryLedger,
+    gone: AbortSignal | undefined,
   ) {
     this.session = session;
     this.timeoutMs = timeoutMs;
     this.where = where;
     this.ledger = ledger;
+    this.gone = gone;
+    gone?.addEventListener(
+      'abort',
+      () => {
+        if (!this.opened) return;
+        this.opened = false;
+        this.claimed.clear();
+        this.session.close();
+      },
+      { once: true },
+    );
     this.vendorId = session.device.idVendor;
     this.productId = session.device.idProduct;
     this.interfaceCount = session.device.bNumInterfaces;
@@ -228,13 +264,19 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     options: UsbIpWebUsbOptions = {},
   ): Promise<UsbIpWebUsbDevice> {
     const ledger = options.ledger ?? new DeliveryLedger();
+    throwIfGone(options.gone, 'attach');
     const session = await UsbIpSession.attach(host, port, busid, undefined, ledger);
     const device = new UsbIpWebUsbDevice(
       session,
       options.urbTimeoutMs ?? DEFAULT_URB_TIMEOUT_MS,
       { host, port, busid },
       ledger,
+      options.gone,
     );
+    if (options.gone?.aborted === true) {
+      session.close();
+      throwIfGone(options.gone, 'attach');
+    }
     device.opened = true;
     await device.readIdentity();
     return device;
@@ -400,6 +442,8 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     const deadline = Date.now() + REOPEN_TIMEOUT_MS;
     let last: unknown;
     for (;;) {
+      /* ...but never against a device known to be gone: see `UsbIpWebUsbOptions.gone`. */
+      throwIfGone(this.gone, 'open');
       try {
         this.session = await UsbIpSession.attach(
           this.where.host,
@@ -408,6 +452,10 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
           undefined,
           this.ledger,
         );
+        if (this.gone?.aborted === true) {
+          this.session.close();
+          throwIfGone(this.gone, 'open');
+        }
         this.reopens++;
         this.opened = true;
         return;
@@ -517,6 +565,7 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     setup: WebUsbControlSetup,
     length: number,
   ): Promise<WebUsbInTransferResult> {
+    throwIfGone(this.gone, 'controlTransferIn');
     this.assertTransferAllowed(setup, 'controlTransferIn');
     try {
       const data = await this.session.controlTransfer(
@@ -541,6 +590,7 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     setup: WebUsbControlSetup,
     data: ArrayBufferView,
   ): Promise<WebUsbOutTransferResult> {
+    throwIfGone(this.gone, 'controlTransferOut');
     this.assertTransferAllowed(setup, 'controlTransferOut');
     const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     try {

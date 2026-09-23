@@ -635,11 +635,11 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
   /**
    * Throws `ProbeUnmeasurable` when the emulator has stopped executing.
    *
-   * THIS IS THE ONLY THING THAT DISCARDS A WHOLE ROW, and it is the only one
-   * that should: once the Python process is gone there is no camera left to
-   * ask, so everything measured after that point is a property of this
-   * machine. Eleven corpus rows end here, every one of them on the same
-   * unmodelled bit-band write, and their gap reasons name the faulting address.
+   * Once the Python process is gone there is no camera left to ask, so
+   * everything measured after that point is a property of this machine. Since
+   * 2026-09-23 the suites run the probe under `RowEmulators.guard()`, which
+   * fails the row as an `InfrastructureDefect` the moment the emulator dies, so
+   * this is a second line: a dead emulator is never a gap (TESTING.md sec.15).
    */
   const assertEmulatorAlive = async (what: string): Promise<void> => {
     /* A camera that has answered NOTHING from the start is silent, and silent
