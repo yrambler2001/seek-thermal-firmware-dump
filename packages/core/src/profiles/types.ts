@@ -65,7 +65,13 @@ export interface MemoryLayout {
   /** Offset of the per-device key slot within the bootloader block (0x218). */
   readonly deviceKeySlotOffset: number;
   readonly deviceKeySlotLength: number;
-  /** Blocks this profile's protocol cannot reach at all, recorded as dump gaps. */
+  /**
+   * Blocks this profile's protocol reaches on NONE of the builds it covers.
+   *
+   * Not the dump's gap list. A dump records the gaps of the one firmware it is
+   * talking to, which is `windowPlan(version).unreachable` and can be longer:
+   * the 2014 Compacts, for one, cannot arm 0x140C0000 at all.
+   */
   readonly unreachable: readonly UnreachableRange[];
 }
 
@@ -83,6 +89,53 @@ export interface WindowEntry {
   readonly auth?: boolean;
   /** Exact BeginFirmwareUpgrade payload. Defaults to the 2-byte little-endian subcmd. */
   readonly payload?: Uint8Array;
+}
+
+/**
+ * One row of a firmware's own BeginFirmwareUpgrade switch: what one subcommand
+ * arms, as THAT build's handler decides it.
+ *
+ * WHY ROWS AND NOT A MAP. A dump needs one selector per block; the firmware has
+ * one row per subcommand, and the two differ in exactly the places that cost
+ * bytes. Two rows can name the same block (subcommand 4 is a second door onto
+ * 0x14020000), a row can compute its address at run time rather than carry it
+ * (case 0 on every build, case 1 on 0.8.0.0), and on the 2014 Compacts two rows
+ * name the same block by mistake, which leaves a third block with no row at
+ * all. The dump plan is derived from these rows, so none of that can be
+ * papered over by a table that assumes a linear run.
+ */
+export interface SelectorRow {
+  readonly subcmd: number;
+  /**
+   * The block the handler arms, when the image carries it as a constant. Null
+   * when the handler computes it at run time (from the boot record, or from the
+   * bootloader's config block), and null when the builds one version string can
+   * name disagree about it. A dump never arms a row whose address is null.
+   */
+  readonly address: number | null;
+  /** The payload the handler accepts: plain 2-byte, the 18-byte token, or none. */
+  readonly channel: 'plain' | 'auth' | 'refused';
+  readonly note: string;
+}
+
+/**
+ * What a dump of ONE firmware reads, resolved from that firmware's own table.
+ *
+ * `windows` holds one selector per reachable block, each at the address the
+ * table gives it; `unreachable` holds every other block with the reason. The
+ * two tile the whole part exactly, which the builder checks, so a block is
+ * either read from the address its selector really arms or declared a gap —
+ * never filled from somewhere else.
+ */
+export interface WindowPlan {
+  /** The version the plan was resolved for, as the camera reported it, or null. */
+  readonly firmwareVersion: string | null;
+  /** Which table this is and what it was read from, for the log and the manifest. */
+  readonly table: string;
+  /** The firmware's whole table, one row per subcommand its handler switches on. */
+  readonly selectors: readonly SelectorRow[];
+  readonly windows: readonly WindowEntry[];
+  readonly unreachable: readonly UnreachableRange[];
 }
 
 export interface SlotDescriptor {
@@ -195,8 +248,22 @@ export interface FirmwareProfile {
   readonly capabilities: ProfileCapabilities;
   readonly slots: readonly SlotDescriptor[];
   readonly boot: BootPolicy;
-  /** The full selector map for a whole-flash dump. */
+  /**
+   * The selector map when the firmware version is NOT known: `windowPlan(null)`'s
+   * windows. A dump, a sweep and a device read all resolve the version first and
+   * use `windowPlan` instead; this remains for listings and for callers with no
+   * camera to ask.
+   */
   windowMap(): readonly WindowEntry[];
+  /**
+   * The selector table and dump plan for one firmware build.
+   *
+   * `firmwareVersion` is what the running camera reports through
+   * GetFirmwareInfo, or null when it could not be read. A profile whose builds
+   * disagree about a subcommand answers a null or unrecognised version with only
+   * the rows every build it knows agrees on, and declares the rest unreachable.
+   */
+  windowPlan(firmwareVersion: string | null): WindowPlan;
   /** Inclusive subcommand range a selector sweep should probe. */
   readonly sweepRange: readonly [number, number];
   detect(evidence: DeviceEvidence): DetectionVerdict;

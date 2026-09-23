@@ -451,6 +451,18 @@ export interface DumpManifest {
   readonly cancelled: boolean;
   /** NEW: which firmware profile this run detected/acted under. */
   readonly profile: ManifestProfileInfo;
+  /**
+   * NEW, 2026-09-23: which selector table the windows were armed from, and the
+   * version it was resolved for. Absent on manifests written before per-build
+   * tables existed.
+   */
+  readonly selectorTable?: SelectorTableInfo;
+}
+
+/** The firmware build a dump planned for, and the table that plan came from. */
+export interface SelectorTableInfo {
+  readonly firmwareVersion: string | null;
+  readonly table: string;
 }
 
 export interface BuildDumpManifestInput {
@@ -475,6 +487,7 @@ export interface BuildDumpManifestInput {
   readonly expectedReadableWindows: number;
   readonly cancelled: boolean;
   readonly profile: ManifestProfileInfo;
+  readonly selectorTable?: SelectorTableInfo;
   /** Always `false` in the original; kept overridable rather than hard-coded dead weight. */
   readonly usbComplete?: boolean;
   /** Always `true` in the original (a dump always fills unreachable blocks). */
@@ -507,6 +520,7 @@ export function buildDumpManifest(input: BuildDumpManifestInput): DumpManifest {
     expectedReadableWindows: input.expectedReadableWindows,
     cancelled: input.cancelled,
     profile: input.profile,
+    ...(input.selectorTable === undefined ? {} : { selectorTable: input.selectorTable }),
   };
 }
 

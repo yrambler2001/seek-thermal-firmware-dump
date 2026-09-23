@@ -18,6 +18,7 @@ export type {
   GapRecordInput,
   SelectorRecord,
   SelectorRecordInput,
+  SelectorTableInfo,
   EmbeddedKeyTable,
   EmbeddedKeyTableInput,
   ImageSummary,

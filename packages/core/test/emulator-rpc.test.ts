@@ -79,7 +79,12 @@
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { liveEmulatorCount, RowEmulators } from './emulator/harness.js';
-import { probeTier1, ProbeUnmeasurable, type Tier1Result } from './emulator/probe.js';
+import {
+  probeTier1,
+  ProbeUnmeasurable,
+  type Tier1Result,
+  type WindowProbe,
+} from './emulator/probe.js';
 import { HarnessFidelityError } from './emulator/webusb-over-usbip.js';
 import {
   announceSkip,
@@ -130,6 +135,101 @@ export interface RpcExpectation {
   /** The firmware refused the selector or could not serve it. */
   readonly windowsRefused: readonly number[];
   readonly auth: Tier1Result['auth'];
+  /**
+   * The DUMP'S OWN plan for this firmware, armed window by window as `runDump`
+   * arms it (TESTING.md sec.10). `misplaced` is also asserted empty on every
+   * row regardless of the pin: a plan window whose bytes are not the bytes at
+   * the address it is filed under is the one failure a dump must never have.
+   */
+  readonly plan: PlanExpectation;
+}
+
+export interface PlanExpectation {
+  readonly firmwareVersion: string | null;
+  readonly profile: string;
+  readonly dumps: boolean;
+  readonly table: string;
+  readonly windows: number;
+  /** Subcommands whose bytes matched the image at the plan's address. */
+  readonly confirmed: readonly number[];
+  /** Subcommands that served bytes from somewhere else, and where those live. */
+  readonly misplaced: Readonly<Record<string, readonly string[]>>;
+  /** Subcommands the firmware refused, or armed and served nothing for. */
+  readonly unread: readonly number[];
+  /** Of the confirmed ones, those armed here rather than reused from the window probe. */
+  readonly armedHere: readonly number[];
+  readonly gaps: readonly string[];
+}
+
+function whereElse(w: WindowProbe): readonly string[] {
+  return w.mappedTruncated
+    ? [...w.mappedAddresses, '...(list capped; these bytes carry little position)']
+    : w.mappedAddresses;
+}
+
+function summarizePlan(result: Tier1Result): PlanExpectation {
+  const confirmed: number[] = [];
+  const misplaced: Record<string, readonly string[]> = {};
+  const unread: number[] = [];
+  const armedHere: number[] = [];
+  for (const w of result.plan.windows) {
+    if (!w.probe.armed || w.probe.locatorHex === null) unread.push(w.subcmd);
+    else if (w.probe.matchesClaimed) {
+      confirmed.push(w.subcmd);
+      if (!w.reused) armedHere.push(w.subcmd);
+    } else misplaced[`0x${w.subcmd.toString(16)}`] = whereElse(w.probe);
+  }
+  return {
+    firmwareVersion: result.plan.firmwareVersion,
+    profile: result.plan.profile,
+    dumps: result.plan.dumps,
+    table: result.plan.table,
+    windows: result.plan.windows.length,
+    confirmed,
+    misplaced,
+    unread,
+    armedHere,
+    gaps: result.plan.gaps,
+  };
+}
+
+/**
+ * Why the modern selector map reached no window on this firmware — in the words
+ * of what was measured, naming the command that actually failed.
+ *
+ * CORRECTED 2026-09-23. This always read "... refused (BeginFirmwareUpgrade ->
+ * <the command probe's outcome>)". On 0.7.0.7 and 0.7.0.8 that is true and not
+ * the reason: the command probe's BeginFirmwareUpgrade is a plain arm of the
+ * protected subcommand 5, which every legacy build refuses by design, while the
+ * arms of 1 and 0x0A..0x21 came back with error code 0 and it was every READ of
+ * them that failed — `GetFeaturedFirmwareData`, whose handler those builds
+ * register in the setter column. So when windows armed cleanly and served
+ * nothing, the reason now says that, and names the read's own outcome.
+ */
+function noWindowReason(result: Tier1Result, summary: RpcExpectation): string {
+  const armed = result.windows.filter((w) => w.armed);
+  if (armed.length === 0) {
+    return (
+      `the selector map reaches no window: ${String(summary.windowsRefused.length)} ` +
+      `of 63 subcommands refused (BeginFirmwareUpgrade -> ` +
+      `${summary.commands.BeginFirmwareUpgrade ?? '?'})`
+    );
+  }
+  const outcomes = [...new Set(armed.map((w) => classifyRead(w.error)))].sort().join('/');
+  return (
+    `the selector map reaches no window: ${String(armed.length)} of 63 subcommands armed with ` +
+    `error code 0 and every read of them failed (GetFeaturedFirmwareData, wire 0x4F -> ` +
+    `${outcomes}); ` +
+    `${String(result.windows.length - armed.length)} refused at the arm`
+  );
+}
+
+/** A failed read's error text, as the device outcome it records. */
+function classifyRead(error: string | null): string {
+  if (error === null) return 'short';
+  if (/stall/i.test(error)) return 'stall';
+  if (/returned 0x/i.test(error)) return 'device-error';
+  return 'no-answer';
 }
 
 function summarize(result: Tier1Result, entry: (typeof ENTRIES)[number]): RpcExpectation {
@@ -161,6 +261,7 @@ function summarize(result: Tier1Result, entry: (typeof ENTRIES)[number]): RpcExp
     windowsMisplacedTo: misplacedTo,
     windowsRefused: refused,
     auth: result.auth,
+    plan: summarizePlan(result),
   };
 }
 
@@ -250,15 +351,7 @@ async function measureRow(
      * subcommands, so the dump path cannot read them at all. */
     return {
       ...now,
-      gap:
-        now.windowsConfirmed.length === 0
-          ? {
-              reason:
-                `the selector map reaches no window: ${String(now.windowsRefused.length)} ` +
-                `of 63 subcommands refused (BeginFirmwareUpgrade -> ` +
-                `${now.commands.BeginFirmwareUpgrade ?? '?'})`,
-            }
-          : null,
+      gap: now.windowsConfirmed.length === 0 ? { reason: noWindowReason(got, now) } : null,
     };
   } catch (error) {
     /* The harness off the real-host path is not a measurement at all: never a gap. */
@@ -288,6 +381,18 @@ async function measureRow(
         authAccepted: false,
         wrongTokenAccepted: false,
         subcmd: 5,
+      },
+      plan: {
+        firmwareVersion: null,
+        profile: '',
+        dumps: false,
+        table: '',
+        windows: 0,
+        confirmed: [],
+        misplaced: {},
+        unread: [],
+        armedHere: [],
+        gaps: [],
       },
       gap: { reason: gapReason(error).slice(0, 300) },
     };
@@ -366,6 +471,9 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
             : now.gap.reason;
 
         if (REGENERATING) {
+          /* A plan that files bytes under the wrong address is a bug, not a
+           * measurement to pin. */
+          expect(now.plan.misplaced, 'plan windows serving bytes from another address').toEqual({});
           measured[entry.id] = now;
           status = now.gap === null ? 'supported' : 'known-gap';
           return;
@@ -412,6 +520,12 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
 
         /* ---- the authenticated channel, as an observation ---- */
         expect(now.auth, 'auth-token accept/refuse on a protected bank').toEqual(want.auth);
+
+        /* ---- THE DUMP'S OWN PLAN, armed as the dump arms it ----
+         * Never pinned into acceptance: a window filed under an address whose
+         * bytes it did not serve fails every row, whatever the pin says. */
+        expect(now.plan.misplaced, 'plan windows serving bytes from another address').toEqual({});
+        expect(now.plan, "the dump's own plan, measured").toEqual(want.plan);
         status = now.gap === null ? 'supported' : 'known-gap';
       } catch (error) {
         status = 'failed';

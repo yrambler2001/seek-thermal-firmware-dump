@@ -26,8 +26,10 @@ import {
 import { makeSweepReadme } from '../archive/readme.js';
 import { u16Payload } from '../protocol/client.js';
 import { OP, WINDOW_SIZE } from '../protocol/ops.js';
+import { placeableAddresses } from '../profiles/plan.js';
 import { requireCapability } from '../profiles/registry.js';
 import { decryptDump } from './decrypt.js';
+import { planForDevice } from './window-plan.js';
 import {
   deviceInfoOf,
   isCancelled,
@@ -82,10 +84,18 @@ export async function runSweep(
   const { device, profile, reporter } = ctx;
   const { flashBase, flashSize, windowSize } = profile.memory;
 
-  const entries = profile.windowMap();
+  /* WHERE A SELECTOR'S BYTES GO IS THIS BUILD'S ANSWER, NOT THE PROFILE'S.
+   * The sweep places each block at the address the running firmware's own
+   * table gives its subcommand, and leaves a subcommand whose address that
+   * table does not carry as a constant unplaced. With one map per profile, a
+   * 2014 Compact's subcommand 0x0E — which serves 0x140B0000 — was placed at
+   * 0x140C0000. The same version gate as the dump runs first: on 0.3.0.1 every
+   * arm of a sweep would be `EnterBootloaderMode`. */
+  const { plan } = await planForDevice(ctx, 'sweep');
+  const entries = plan.windows;
   const legacy = usesAuthChannel(entries);
   const unlockToken = unlockTokenOf(entries);
-  const addressBySubcmd = new Map(entries.map((entry) => [entry.subcmd, entry.address]));
+  const addressBySubcmd = placeableAddresses(plan);
   const [first, last] = profile.sweepRange;
   const span = last - first + 1;
 

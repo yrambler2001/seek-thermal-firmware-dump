@@ -50,8 +50,10 @@ import type {
   SlotDescriptor,
   SlotKey,
   WindowEntry,
+  WindowPlan,
 } from './types.js';
 import { SUPPORTED } from './types.js';
+import { buildWindowPlan } from './plan.js';
 import { primaryVersion, versionSource } from './version.js';
 
 /* ---- memory layout ------------------------------------------------------ */
@@ -185,6 +187,37 @@ export const MODERN_MEMORY: MemoryLayout = {
     },
   ],
 };
+
+/**
+ * The plan for a post-2018 build, whatever its version.
+ *
+ * ONE TABLE FOR THE WHOLE FAMILY, AND THAT IS MEASURED, NOT ASSUMED. The
+ * version is recorded and does not change the table: every post-2018 corpus
+ * image's own window switch decodes to the same rows for modes 1..6 and
+ * 0x0A..0x21 (`windowTable` in `test/firmware/facts.json`), and all 26 of those
+ * firmwares confirm all 63 windows on the emulator at these addresses. The two
+ * aliases the comment above `buildModernWindowMap` names are left out of the
+ * rows as they are left out of the map.
+ */
+export function modernWindowPlan(
+  firmwareVersion: string | null,
+  table = 'modern-4x: the post-2018 BeginFirmwareUpgrade table (one table, every build)',
+): WindowPlan {
+  return buildWindowPlan({
+    table,
+    firmwareVersion,
+    selectors: buildModernWindowMap().map((entry) => ({
+      subcmd: entry.subcmd,
+      address: entry.address,
+      channel: 'plain' as const,
+      note: entry.note,
+    })),
+    holes: MODERN_MEMORY.unreachable,
+    flashBase: FLASH_BASE,
+    flashSize: FLASH_SIZE,
+    windowSize: WINDOW_SIZE,
+  });
+}
 
 export const MODERN_SLOTS: readonly SlotDescriptor[] = [
   { key: 'a', name: 'Slot A', subcmd: SUBCMD_SLOT_A, address: SLOT_A_BASE },
@@ -379,6 +412,7 @@ export const modern4x: FirmwareProfile = {
   slots: MODERN_SLOTS,
   boot: MODERN_BOOT,
   windowMap: buildModernWindowMap,
+  windowPlan: (firmwareVersion) => modernWindowPlan(firmwareVersion),
   sweepRange: MODERN_SWEEP_RANGE,
   detect: detectModern,
 };

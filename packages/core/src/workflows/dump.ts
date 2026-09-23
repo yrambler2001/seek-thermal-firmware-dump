@@ -4,10 +4,13 @@
  * This ONE function replaces the original page's `runDump` and `runOldDump`.
  * Those two differed only in three things — which selectors to arm, whether a
  * bank needs the authenticated payload, and which blocks are unreachable — and
- * all three now come off the profile (`windowMap()` and `memory.unreachable`).
- * Keeping two near-identical 130-line copies in sync was how the legacy
- * algorithm ended up with a subtly different gap list from the modern one; the
- * unification is the point.
+ * all three now come off the running firmware's own table
+ * (`profile.windowPlan(version)`, resolved by `planForDevice`). Keeping two
+ * near-identical 130-line copies in sync was how the legacy algorithm ended up
+ * with a subtly different gap list from the modern one; the unification is the
+ * point. One table per PROFILE was the same mistake one level down, and it cost
+ * a block: the 2014 Compacts arm 0x140B0000 on subcommand 0x0E, so a shared
+ * map wrote those bytes at 0x140C0000.
  *
  * Read-only by construction: the only opcodes reachable from here are the ones
  * in `READ_ONLY_OPS` (BeginFirmwareUpgrade is used purely as a volatile window
@@ -36,6 +39,7 @@ import { WINDOW_SIZE } from '../protocol/ops.js';
 import { requireCapability } from '../profiles/registry.js';
 import type { WindowEntry } from '../profiles/types.js';
 import { decryptDump } from './decrypt.js';
+import { planForDevice } from './window-plan.js';
 import {
   deviceInfoOf,
   isCancelled,
@@ -263,10 +267,13 @@ export async function runDump(
     );
   }
 
-  const entries = profile.windowMap();
+  const startedAt = new Date().toISOString();
+  /* The build first, then its own table. One read-only transfer, and a refusal
+   * for a build with no read handler before anything is armed. */
+  const { firmware, plan } = await planForDevice(ctx, 'dump');
+  const entries = plan.windows;
   const legacy = usesAuthChannel(entries);
   const unlockToken = unlockTokenOf(entries);
-  const startedAt = new Date().toISOString();
 
   const combined = new Uint8Array(flashSize).fill(args.gapFill);
   const artifacts: Artifact[] = [];
@@ -275,10 +282,13 @@ export async function runDump(
     `flash_4m_usb${legacy ? '_legacy' : ''}_partial_gap_` +
     `${args.gapFill.toString(16).padStart(2, '0')}.bin`;
 
-  /* Every block the profile says its protocol cannot reach becomes a gap. This
-   * is the one list; the modern map contributes 0x14060000, the legacy map its
-   * hard-blocked boot base and the whole upper 2 MiB. */
-  const gaps: GapRecord[] = profile.memory.unreachable.map((range) =>
+  /* Every block this firmware's table does not reach becomes a gap, with the
+   * table's own reason. This is the one list: the modern table contributes
+   * 0x14060000; the legacy ones the upper 2 MiB, plus the bootloader block where
+   * the build refuses it and 0x140C0000 where the build has no selector for it.
+   * The plan builder checks that windows and gaps tile the part exactly, so no
+   * block can be both read and declared a gap, or neither. */
+  const gaps: GapRecord[] = plan.unreachable.map((range) =>
     buildGapRecord({
       address: range.address,
       flashBase,
@@ -289,6 +299,8 @@ export async function runDump(
   );
 
   reporter.log(describeDevice(ctx), 'detail');
+  reporter.log(firmware.note, 'detail');
+  reporter.log(`selector table: ${plan.table}`, 'detail');
   reporter.log(
     `selector map: ${String(entries.length)} windows, ` +
       `${String((entries.length * WINDOW_SIZE) / 1024)} KiB expected` +
@@ -374,6 +386,7 @@ export async function runDump(
     expectedReadableWindows: entries.length,
     cancelled,
     profile: profileInfoOf(profile, ctx.detection),
+    selectorTable: { firmwareVersion: plan.firmwareVersion, table: plan.table },
   };
 
   let manifest: DumpManifest | LegacyDumpManifest;

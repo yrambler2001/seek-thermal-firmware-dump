@@ -22,11 +22,13 @@ import {
   type ImageHeader,
 } from '../src/image/header.js';
 import { SeekDevice } from '../src/protocol/client.js';
-import { WINDOW_SIZE } from '../src/protocol/ops.js';
+import { OP, OP_DIRECTION, READ_ONLY_OPS, WINDOW_SIZE, type Opcode } from '../src/protocol/ops.js';
 import { compact2016 } from '../src/profiles/compact-2016.js';
 import {
   buildLegacyWindowMap,
   legacyAuth,
+  legacySelectorRows,
+  legacyWindowPlan,
   OLD_FW_UNLOCK_TOKEN,
 } from '../src/profiles/legacy-auth.js';
 import { FLASH_BASE, FLASH_SIZE, GAP_ADDRESS, modern4x } from '../src/profiles/modern-4x.js';
@@ -65,6 +67,37 @@ function cameraFor(
     ...(options.flash ? { flash: options.flash } : {}),
     ...(options.stallAt ? { stallAt: options.stallAt } : {}),
     ...(authBanks.length > 0 ? { authBanks, authToken: OLD_FW_UNLOCK_TOKEN } : {}),
+  });
+}
+
+/** `GetFirmwareInfo` selector 0: four version bytes, then the build string. */
+function buildBlock(version: string): Uint8Array {
+  const out = new Uint8Array(36);
+  out.set(
+    version.split('.').map((n) => Number.parseInt(n, 10)),
+    0,
+  );
+  out.set(new TextEncoder().encode('Oct 21 2014'), 4);
+  return out;
+}
+
+/**
+ * A fake camera running one legacy build's OWN window table, as decoded from
+ * its image: every row with a constant address serves that block, a row the
+ * build computes at run time serves nothing, and it reports `version` through
+ * GetFirmwareInfo. On a 2014 build that means subcommands 0x0D AND 0x0E both
+ * serve 0x140B0000, and nothing serves 0x140C0000 — exactly the firmware the
+ * shared map used to mis-file.
+ */
+function legacyBuildCamera(version: string, flash?: Uint8Array): FakeCamera {
+  const rows = legacySelectorRows(version) ?? [];
+  const live = rows.filter((r) => r.address !== null && r.channel !== 'refused');
+  return fakeCamera({
+    windows: live.map((r) => ({ subcmd: r.subcmd, offset: (r.address ?? 0) - FLASH_BASE })),
+    authBanks: live.filter((r) => r.channel === 'auth').map((r) => r.subcmd),
+    authToken: OLD_FW_UNLOCK_TOKEN,
+    fwInfo: new Map([[0, buildBlock(version)]]),
+    ...(flash ? { flash } : {}),
   });
 }
 
@@ -415,7 +448,9 @@ describe('runDump', () => {
   it('covers the legacy authenticated map with the same function, and says so', async () => {
     /* The unification under test: one runDump, two algorithms. Nothing branches
      * on the profile id — the authenticated payloads in the map itself are what
-     * select the legacy manifest, its unlock-token bookkeeping and its README. */
+     * select the legacy manifest, its unlock-token bookkeeping and its README.
+     * This camera does not answer GetFirmwareInfo, so the plan is the one for an
+     * unknown version: only the rows every decoded build agrees on. */
     const camera = cameraFor(legacyAuth);
     const ctx = await contextFor(legacyAuth, camera);
     const entries = buildLegacyWindowMap();
@@ -433,14 +468,123 @@ describe('runDump', () => {
     expect(manifest.combinedFile).toContain('legacy');
     expect(manifest.safety.join(' ')).toContain('channel-0x12 unlock token');
 
-    /* the blocks the legacy protocol cannot reach at all, from the profile */
-    expect(manifest.gaps).toHaveLength(legacyAuth.memory.unreachable.length);
+    /* the blocks THIS plan does not reach — for an unknown version, the ones
+     * the builds disagree about as well as the ones none of them reaches */
+    expect(manifest.gaps.map((g) => g.address)).toEqual(
+      legacyWindowPlan(null).unreachable.map((u) => hex(u.address, 8)),
+    );
     expect(manifest.gaps.map((g) => g.address)).toContain(hex(FLASH_BASE, 8));
+    expect(manifest.selectorTable?.firmwareVersion).toBeNull();
+    expect(manifest.selectorTable?.table).toMatch(/version unknown/);
 
     const readme = result.artifacts.find((a) => a.name === 'README.md');
     expect(new TextDecoder().decode(readme?.data ?? new Uint8Array())).toContain(
       'legacy (locked-firmware) algorithm',
     );
+  }, 60_000);
+
+  it('dumps a 2014 Compact with its own table and never files 0x140B0000 under 0x140C0000', async () => {
+    /* THE BUG, reproduced and closed. On 0.8.0.0 .. 1.3.0.0 the firmware's own
+     * table gives subcommand 0x0E the address 0x140B0000, the same as 0x0D. The
+     * shared map claimed 0x0E was 0x140C0000, so a dump stored 0x140B0000's
+     * bytes at 0x140C0000 and never read 0x140C0000 at all. The camera here runs
+     * that table: had the dump armed 0x0E "for 0x140C0000", the bytes at
+     * 0x140C0000 in the image would equal the flash at 0x140B0000. */
+    const flash = patternFlash(FLASH_SIZE, 0x2014);
+    const camera = legacyBuildCamera('1.3.0.0', flash);
+    const ctx = await contextFor(legacyAuth, camera);
+
+    const result = await runDump(ctx, { chunk: 4096, decrypt: false });
+
+    const at = (address: number): Uint8Array =>
+      result.combined.subarray(address - FLASH_BASE, address - FLASH_BASE + WINDOW_SIZE);
+    const flashAt = (address: number): Uint8Array =>
+      flash.subarray(address - FLASH_BASE, address - FLASH_BASE + WINDOW_SIZE);
+
+    expect(equalBytes(at(0x140b0000), flashAt(0x140b0000))).toBe(true);
+    expect(equalBytes(at(0x140c0000), flashAt(0x140b0000))).toBe(false);
+    expect(at(0x140c0000).every((b) => b === 0xff)).toBe(true);
+    expect(result.manifest.windows.some((w) => w.address === hex(0x140c0000, 8))).toBe(false);
+    const gap = result.manifest.gaps.find((g) => g.address === hex(0x140c0000, 8));
+    expect(gap?.reason).toMatch(/gives subcommand 0x0E the address 0x140B0000/);
+
+    /* ...and the build's own table is used for the rest: 31 windows, the
+     * bootloader block read through subcommand 2 and the token. */
+    expect(result.windowsExpected).toBe(31);
+    expect(result.windowsRead).toBe(31);
+    expect(equalBytes(at(FLASH_BASE), flashAt(FLASH_BASE))).toBe(true);
+    expect(result.manifest.selectorTable).toEqual({
+      firmwareVersion: '1.3.0.0',
+      table: "legacy 1.3.0.0: this build's own BeginFirmwareUpgrade table",
+    });
+    /* every block read came from the address it is filed under */
+    for (const w of result.manifest.windows) {
+      const address = Number(w.address);
+      expect(equalBytes(at(address), flashAt(address)), w.address).toBe(true);
+    }
+  }, 60_000);
+
+  it('dumps the 2016 Compact PRO 1.0.3.0 with its own table: 31 blocks, 0x14010000 up', async () => {
+    const flash = patternFlash(FLASH_SIZE, 0x2016);
+    const camera = legacyBuildCamera('1.0.3.0', flash);
+    const ctx = await contextFor(compact2016, camera);
+
+    const result = await runDump(ctx, { chunk: 4096, decrypt: false });
+
+    expect(result.windowsRead).toBe(31);
+    expect(result.manifest.windows.map((w) => w.address)).toEqual(
+      legacyWindowPlan('1.0.3.0').windows.map((w) => hex(w.address, 8)),
+    );
+    expect(result.manifest.gaps.map((g) => g.address)).toEqual([
+      hex(FLASH_BASE, 8),
+      hex(0x14200000, 8),
+    ]);
+    const c = 0x140c0000 - FLASH_BASE;
+    expect(
+      equalBytes(result.combined.subarray(c, c + WINDOW_SIZE), flash.subarray(c, c + WINDOW_SIZE)),
+    ).toBe(true);
+  }, 60_000);
+
+  it('refuses a 0.7.0.x camera before arming anything, even under a forced profile', async () => {
+    /* 0.7.0.7 and 0.7.0.8 have GetFeaturedFirmwareData at 0x4F with the handler
+     * in the SETTER column: every read would stall. The refusal is the
+     * firmware's, so it holds whichever profile the caller forced. */
+    for (const version of ['0.7.0.7', '0.7.0.8']) {
+      const camera = fakeCamera({ fwInfo: new Map([[0, buildBlock(version)]]) });
+      const ctx = await contextFor(legacyAuth, camera);
+      const error = await runDump(ctx, { chunk: 4096, decrypt: false }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(error, version).toBeInstanceOf(SeekError);
+      expect((error as SeekError).code).toBe('profile/unsupported');
+      expect((error as SeekError).message).toContain(`firmware ${version} predates the dump`);
+      expect((error as SeekError).message).toContain('setter only');
+      expect(
+        camera.calls.map((c) => c.op),
+        version,
+      ).toEqual([OP.GET_FIRMWARE_INFO]);
+    }
+  }, 60_000);
+
+  it('sends every request of a dump in the direction OP_DIRECTION records', async () => {
+    /* `firmware-facts.test.ts` checks each image's handler COLUMNS against
+     * OP_DIRECTION; this checks the client against OP_DIRECTION. Together they
+     * say: every request a dump sends reaches a handler the firmware has. */
+    for (const [profile, camera] of [
+      [modern4x, cameraFor(modern4x)],
+      [legacyAuth, legacyBuildCamera('1.3.0.0')],
+    ] as const) {
+      const ctx = await contextFor(profile, camera);
+      await runDump(ctx, { chunk: 4096, decrypt: false });
+      expect(camera.calls.length).toBeGreaterThan(0);
+      for (const call of camera.calls) {
+        expect(READ_ONLY_OPS.has(call.op as Opcode), `${profile.id} op ${hex(call.op)}`).toBe(true);
+        expect(call.direction, `${profile.id} op ${hex(call.op)}`).toBe(
+          OP_DIRECTION[call.op as Opcode],
+        );
+      }
+    }
   }, 60_000);
 
   it('rejects out-of-range options before touching the camera', async () => {
@@ -496,6 +640,36 @@ describe('runSweep', () => {
     expect(
       equalBytes(result.combined.subarray(base, base + 32), camera.flash.subarray(base, base + 32)),
     ).toBe(true);
+  }, 60_000);
+
+  it('places a 2014 Compact subcommand where its own table says, not where 4.x would', async () => {
+    /* The sweep had the dump's bug too: it placed each selector's block at the
+     * address the PROFILE's map claimed. On a 2014 build subcommand 0x0E serves
+     * 0x140B0000, and the old map put those bytes at 0x140C0000. */
+    const flash = patternFlash(FLASH_SIZE, 0x5eed);
+    const camera = legacyBuildCamera('1.3.0.0', flash);
+    const profile: FirmwareProfile = { ...legacyAuth, sweepRange: [0x0d, 0x0f] };
+    const ctx = await contextFor(profile, camera);
+
+    const result = await runSweep(ctx, { chunk: 4096, decrypt: false });
+
+    expect(result.manifest.selectors.map((r) => r.mappedAddress)).toEqual([
+      hex(0x140b0000, 8),
+      hex(0x140b0000, 8),
+      hex(0x140d0000, 8),
+    ]);
+    const c = 0x140c0000 - FLASH_BASE;
+    expect(result.combined.subarray(c, c + WINDOW_SIZE).every((b) => b === 0xff)).toBe(true);
+    expect(namesOf(result.artifacts)).toContain('blocks/subcmd_0e_140b0000.bin');
+  }, 60_000);
+
+  it('refuses to sweep a build whose 0x52 may be EnterBootloaderMode', async () => {
+    const camera = fakeCamera({ fwInfo: new Map([[0, buildBlock('0.3.0.1')]]) });
+    const ctx = await contextFor(modern4x, camera);
+    await expect(runSweep(ctx, { chunk: 4096, decrypt: false })).rejects.toThrow(
+      /refusing to sweep: firmware 0\.3\.0\.1 predates the dump protocol/,
+    );
+    expect(camera.calls.some((c) => c.op === OP.BEGIN_FIRMWARE_UPGRADE)).toBe(false);
   }, 60_000);
 });
 

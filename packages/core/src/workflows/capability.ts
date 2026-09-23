@@ -63,31 +63,38 @@ const PROBE_READ_BYTES = DEFAULT_READ_CHUNK;
 /**
  * The oldest build that has a dump protocol at all.
  *
- * NOT A GUESS, AND IT IS A SAFETY GATE RATHER THAN A CAPABILITY ONE. Each
+ * NOT A GUESS, AND IT IS A SAFETY GATE AS WELL AS A CAPABILITY ONE. Each
  * decrypted image carries its own RPC method table — an array whose entries name
- * the command at wire id index + 53 — and it was recovered from all 36 images of
- * the corpus into `test/firmware/facts.json`. Five of them do not have
- * `GetFeaturedFirmwareData` anywhere in that table, so wire id 0x4F is something
- * else, and on the oldest of the five wire id 0x52 is something else too:
+ * the command at wire id index + 53, with a getter column (control IN) and a
+ * setter column (control OUT) — and it was recovered from all 36 images of the
+ * corpus into `test/firmware/facts.json`. Seven of them have no GETTER for wire
+ * id 0x4F, which is the one read a dump sends, and on the oldest wire id 0x52
+ * is something else too:
  *
- *   0.3.0.1   0x4F = UploadFirmwareRowSize   0x52 = EnterBootloaderMode
- *   0.5.0.2   0x4F = UploadFirmwareRowSize   0x52 = BeginFirmwareUpgrade
- *   0.5.1.0   0x4F = UploadFirmwareRowSize   0x52 = BeginFirmwareUpgrade
- *   0.5.1.3   0x4F = UploadFirmwareRowSize   0x52 = BeginFirmwareUpgrade
- *   0.6.0.4   0x4F = UploadFirmwareRowSize   0x52 = BeginFirmwareUpgrade
+ *   0.3.0.1   0x4F = UploadFirmwareRowSize (setter)   0x52 = EnterBootloaderMode
+ *   0.5.0.2   0x4F = UploadFirmwareRowSize (setter)   0x52 = BeginFirmwareUpgrade
+ *   0.5.1.0   0x4F = UploadFirmwareRowSize (setter)   0x52 = BeginFirmwareUpgrade
+ *   0.5.1.3   0x4F = UploadFirmwareRowSize (setter)   0x52 = BeginFirmwareUpgrade
+ *   0.6.0.4   0x4F = UploadFirmwareRowSize (setter)   0x52 = BeginFirmwareUpgrade
+ *   0.7.0.7   0x4F = GetFeaturedFirmwareData, SETTER  0x52 = BeginFirmwareUpgrade
+ *   0.7.0.8   0x4F = GetFeaturedFirmwareData, SETTER  0x52 = BeginFirmwareUpgrade
  *
- * `EnterBootloaderMode` is the one that matters: a dump, a sweep and this probe
- * all send 0x52, and on a 0.3.0.1 camera that is a request to leave the
- * application. So a build older than 0.7 is not probed — the version read at
+ * `EnterBootloaderMode` is the one that matters for safety: a dump, a sweep and
+ * this probe all send 0x52, and on a 0.3.0.1 camera that is a request to leave
+ * the application. The two 0.7.0.x builds are the one that mattered for
+ * correctness: their table has the right NAME at 0x4F, so a names-only check
+ * passed them, and every read is then stalled because the handler is in the
+ * write column. So a build older than 0.8 is not probed — the version read at
  * step 1 is enough to know, and nothing is sent afterwards.
  *
- * 0.7.0.7 is the first corpus build with the full set; every build from there
- * to 4.16.1.7 has all ten of the toolkit's opcodes at the ids it uses.
+ * 0.8.0.0 is the first corpus build with a getter at 0x4F; every build from
+ * there to 4.16.1.7 has every opcode the dump sends at the id it uses, in the
+ * column it is sent to. (Corrected 2026-09-23: this was 0.7.)
  */
 export const FIRST_DUMPABLE_MAJOR = 0;
-export const FIRST_DUMPABLE_MINOR = 7;
+export const FIRST_DUMPABLE_MINOR = 8;
 
-/** Is this version old enough that `0x52` may not be BeginFirmwareUpgrade? */
+/** Is this version old enough that it has no read handler, or `0x52` may not be BeginFirmwareUpgrade? */
 export function predatesDumpProtocol(version: string | null): boolean {
   if (version === null) return false;
   const match = /^\s*(\d+)\.(\d+)/.exec(version);
@@ -98,6 +105,68 @@ export function predatesDumpProtocol(version: string | null): boolean {
   const min = Number.parseInt(minor, 10);
   if (maj !== FIRST_DUMPABLE_MAJOR) return maj < FIRST_DUMPABLE_MAJOR;
   return min < FIRST_DUMPABLE_MINOR;
+}
+
+/** Why a build `predatesDumpProtocol` says no, in one sentence for a user. */
+export function predatesDumpProtocolReason(version: string): string {
+  return (
+    `firmware ${version} predates the dump protocol: its RPC method table has no read handler ` +
+    'for GetFeaturedFirmwareData (on 0.7.0.7 and 0.7.0.8 it is registered as a setter only, ' +
+    'and before that wire id 0x4F is UploadFirmwareRowSize), so no window can be read; on ' +
+    '0.3.0.1 wire id 0x52 is EnterBootloaderMode rather than BeginFirmwareUpgrade'
+  );
+}
+
+export interface RunningFirmware {
+  /** `major.minor.patch.build` as the running firmware reports it, or null. */
+  readonly version: string | null;
+  /** The build date string that follows the version, when there was one. */
+  readonly buildString: string | null;
+  /** One line saying what was read, or why nothing was. */
+  readonly note: string;
+}
+
+/**
+ * The running build's version, from a command every build has.
+ *
+ * `GetFirmwareInfo` unarmed, NOT `readFwInfo(0, ...)`. The latter sends
+ * `SetFirmwareInfoFeatures` first, which lives in `FLASH_OPS`; this stays inside
+ * `READ_ONLY_OPS`. Selector 0 is the default after a reset and the handler
+ * clears the selector after every read, and selector 0 is the build block, so
+ * the unarmed read returns it — measured on 0.3.0.1, 1.3.0.8, 4.18.2.0, 10.9.1.31
+ * and 42.32.3.10, which returned 00 03 00 01, 01 03 00 08, 04 12 02 00,
+ * 0A 09 01 1F and 2A 20 03 0A respectively, each followed by that build's own
+ * date string. `GetFirmwareInfo` has a getter at 0x4E in all 36 corpus images.
+ *
+ * Never throws for a refusal or a timeout — a camera that does not say is a
+ * camera whose version is unknown, and the caller decides what that means —
+ * but a cancellation propagates.
+ */
+export async function readRunningFirmware(device: SeekDevice): Promise<RunningFirmware> {
+  try {
+    const raw = await device.rpcIn(OP.GET_FIRMWARE_INFO, 36);
+    if (raw.length < 4) {
+      return {
+        version: null,
+        buildString: null,
+        note: `GetFirmwareInfo answered ${String(raw.length)} byte(s), too few for a version`,
+      };
+    }
+    const version = [raw[0], raw[1], raw[2], raw[3]].join('.');
+    const buildString = raw.length > 4 ? asciiz(raw.subarray(4)) : null;
+    return {
+      version,
+      buildString,
+      note: `the camera reports firmware ${version}${buildString === null ? '' : ` (${buildString})`}`,
+    };
+  } catch (error) {
+    if (error instanceof CancelledError) throw error;
+    return {
+      version: null,
+      buildString: null,
+      note: `GetFirmwareInfo did not answer (${errorMessage(error)})`,
+    };
+  }
 }
 
 export interface SelectorChannelProbe {
@@ -151,39 +220,14 @@ export async function probeSelectorChannel(
 ): Promise<SelectorChannelProbe> {
   const notes: string[] = [];
 
-  /* ---- 1. the version, from a command every build has -----------------
-   *
-   * `GetFirmwareInfo` unarmed, NOT `readFwInfo(0, ...)`. The latter sends
-   * `SetFirmwareInfoFeatures` first, which lives in `FLASH_OPS`; this probe
-   * stays inside `READ_ONLY_OPS`. Selector 0 is the default after a reset and
-   * selector 0 is the build block, so the unarmed read returns it — measured on
-   * 0.3.0.1, 1.3.0.8, 4.18.2.0, 10.9.1.31 and 42.32.3.10, which returned
-   * 00 03 00 01, 01 03 00 08, 04 12 02 00, 0A 09 01 1F and 2A 20 03 0A
-   * respectively, each followed by that build's own date string. */
-  let firmwareVersion: string | null = null;
-  let buildString: string | null = null;
-  try {
-    const raw = await device.rpcIn(OP.GET_FIRMWARE_INFO, 36);
-    if (raw.length >= 4) {
-      firmwareVersion = [raw[0], raw[1], raw[2], raw[3]].join('.');
-      buildString = raw.length > 4 ? asciiz(raw.subarray(4)) : null;
-    }
-    notes.push(
-      firmwareVersion === null
-        ? `GetFirmwareInfo answered ${String(raw.length)} byte(s), too few for a version`
-        : `the camera reports firmware ${firmwareVersion}${buildString === null ? '' : ` (${buildString})`}`,
-    );
-  } catch (error) {
-    if (error instanceof CancelledError) throw error;
-    notes.push(`GetFirmwareInfo did not answer (${errorMessage(error)})`);
-  }
+  /* ---- 1. the version, from a command every build has ----------------- */
+  const running = await readRunningFirmware(device);
+  const firmwareVersion = running.version;
+  const buildString = running.buildString;
+  notes.push(running.note);
 
   if (predatesDumpProtocol(firmwareVersion)) {
-    notes.push(
-      `firmware ${String(firmwareVersion)} predates the dump protocol: its RPC table has no ` +
-        'GetFeaturedFirmwareData, and on 0.3.0.1 wire id 0x52 is EnterBootloaderMode rather ' +
-        'than BeginFirmwareUpgrade. Nothing further was sent.',
-    );
+    notes.push(`${predatesDumpProtocolReason(String(firmwareVersion))}. Nothing further was sent.`);
     return {
       firmwareVersion,
       buildString,

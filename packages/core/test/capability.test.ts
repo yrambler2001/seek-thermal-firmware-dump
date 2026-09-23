@@ -118,6 +118,25 @@ describe('probeSelectorChannel', () => {
     expect(camera.calls.some((c) => c.op === OP.BEGIN_FIRMWARE_UPGRADE)).toBe(false);
   });
 
+  it('stops after the version read on 0.7.0.x, whose read has no getter', async () => {
+    /* 0.7.0.7's 0x52 IS BeginFirmwareUpgrade, so arming would be harmless — and
+     * useless: its GetFeaturedFirmwareData is registered as a setter only, so
+     * no window it arms can be read. The version is enough to know, so the
+     * probe sends nothing more, and the evidence it hands on names the builds'
+     * own profile, which refuses to dump. */
+    const camera = cameraFor([0, 7, 0, 7]);
+    await camera.open();
+    const probe = await probeSelectorChannel(new SeekDevice(camera));
+
+    expect(probe.firmwareVersion).toBe('0.7.0.7');
+    expect(probe.skippedForSafety).toBe(true);
+    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO]);
+    expect(probe.notes.join(' ')).toContain('setter only');
+    const detection = detectProfile(evidenceFromChannelProbe(probe));
+    expect(detection.best.profile.id).toBe('compact-2014');
+    expect(detection.best.profile.capabilities.dump.supported).toBe(false);
+  });
+
   it('sends nothing but the version read when the caller disables the arms', async () => {
     const camera = cameraFor([4, 18, 2, 0]);
     await camera.open();
@@ -147,11 +166,25 @@ describe('probeSelectorChannel', () => {
 });
 
 describe('predatesDumpProtocol', () => {
-  it('is the 0.7 boundary the corpus measured, and nothing else', () => {
-    for (const v of ['0.3.0.1', '0.5.0.2', '0.5.1.0', '0.5.1.3', '0.6.0.4', '0.6.99.99']) {
+  it('is the 0.8 boundary the corpus measured, and nothing else', () => {
+    /* 0.8.0.0 is the first build with a GETTER for GetFeaturedFirmwareData at
+     * 0x4F. 0.7.0.7 and 0.7.0.8 have the name there and the handler in the
+     * setter column, which is why this boundary was 0.7 until 2026-09-23: the
+     * facts it was drawn from recorded names only. */
+    for (const v of [
+      '0.3.0.1',
+      '0.5.0.2',
+      '0.5.1.0',
+      '0.5.1.3',
+      '0.6.0.4',
+      '0.6.99.99',
+      '0.7.0.7',
+      '0.7.0.8',
+      '0.7.99.99',
+    ]) {
       expect(predatesDumpProtocol(v), v).toBe(true);
     }
-    for (const v of ['0.7.0.7', '0.9.1.0', '1.0.0.0', '1.3.0.8', '4.18.2.0', '42.32.3.10']) {
+    for (const v of ['0.8.0.0', '0.9.1.0', '1.0.0.0', '1.3.0.8', '4.18.2.0', '42.32.3.10']) {
       expect(predatesDumpProtocol(v), v).toBe(false);
     }
   });

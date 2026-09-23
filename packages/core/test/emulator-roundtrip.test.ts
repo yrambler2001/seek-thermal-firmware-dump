@@ -14,12 +14,16 @@
  * a byte of it. The emulator knows exactly what the part contains; the toolkit
  * has to go and get it over a real transport.
  *
- * WHAT IS ALLOWED TO DIFFER, AND ONLY THAT. `profile.memory.unreachable` names
- * the blocks the protocol cannot reach — on `modern-4x` that is the single
+ * WHAT IS ALLOWED TO DIFFER, AND ONLY THAT. The dump's own manifest names the
+ * blocks this firmware's table cannot reach — on `modern-4x` that is the single
  * 64 KiB block at 0x14060000, for which no BeginFirmwareUpgrade selector exists.
  * The toolkit gap-fills those with 0xFF and says so in the manifest. Every byte
  * OUTSIDE them must match exactly, and the assertion is written that way round:
- * a new unreachable region cannot be waved through by widening a tolerance.
+ * a new unreachable region cannot be waved through by widening a tolerance,
+ * because the count of unreachable bytes is pinned and the gap list must be
+ * exactly the plan the profile gives for the version the camera reported.
+ * (Until 2026-09-23 this read `profile.memory.unreachable`, one list per
+ * profile; the gaps are per build now, since the 2014 Compacts have one more.)
  * ==================================================================== */
 
 import { createHash } from 'node:crypto';
@@ -273,9 +277,17 @@ async function measureRow(
     }
     expect(truth.length, 'the emulator wrote a 4 MiB ground-truth image').toBe(FLASH_SIZE);
 
-    const holes: Range[] = profile.memory.unreachable.map((u) => ({
-      start: u.address - FLASH_BASE,
-      end: u.address - FLASH_BASE + u.length,
+    /* The dump's OWN gap list — and it must be the plan the profile gives for
+     * the version the dump says it planned for, block for block. */
+    const table = result.manifest.selectorTable;
+    expect(table, 'the manifest records the selector table it armed from').toBeDefined();
+    const planned = profile.windowPlan(table?.firmwareVersion ?? null);
+    expect(result.manifest.gaps.map((g) => [Number(g.address), g.length])).toEqual(
+      planned.unreachable.map((u) => [u.address, u.length]),
+    );
+    const holes: Range[] = result.manifest.gaps.map((g) => ({
+      start: Number(g.address) - FLASH_BASE,
+      end: Number(g.address) - FLASH_BASE + g.length,
     }));
     const bytesUnreachable = holes.reduce((sum, h) => sum + (h.end - h.start), 0);
     const all = diffRanges(truth, result.combined);

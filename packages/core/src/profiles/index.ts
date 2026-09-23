@@ -47,10 +47,12 @@ export {
   WINDOW_SIZE,
   buildModernWindowMap,
   modern4x,
+  modernWindowPlan,
 } from './modern-4x.js';
 
 export {
   LEGACY_BOOT,
+  LEGACY_KNOWN_VERSIONS,
   LEGACY_MEMORY,
   LEGACY_SLOTS,
   LEGACY_SWEEP_RANGE,
@@ -58,7 +60,10 @@ export {
   authPayload,
   buildLegacyWindowMap,
   legacyAuth,
+  legacySelectorRows,
+  legacyWindowPlan,
 } from './legacy-auth.js';
+export { agreedRows, buildWindowPlan, placeableAddresses } from './plan.js';
 export { compact2016 } from './compact-2016.js';
 export { compact2014, FIRST_READABLE_VERSION } from './compact-2014.js';
 export { parseVersion, primaryVersion, versionsIn, versionSource } from './version.js';

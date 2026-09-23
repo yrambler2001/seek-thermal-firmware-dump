@@ -33,6 +33,31 @@ export const OP = {
 export type OpName = keyof typeof OP;
 export type Opcode = (typeof OP)[OpName];
 
+/**
+ * Which handler column of the firmware's RPC method table each opcode reaches.
+ *
+ * The camera's dispatcher routes a control IN to the record's GETTER and a
+ * control OUT to its SETTER, and stalls a request whose column is empty. So an
+ * opcode being at the right wire id with the right NAME is not enough: 0.7.0.7
+ * and 0.7.0.8 have `GetFeaturedFirmwareData` at 0x4F with its handler in the
+ * setter column, and every read this toolkit sends there stalls (TESTING.md
+ * sec.9.10). `firmware-facts.test.ts` holds this table to both columns of every
+ * corpus image, and `workflows.test.ts` holds the client to it: every request a
+ * dump sends goes out in the direction written here.
+ */
+export const OP_DIRECTION: Readonly<Record<Opcode, 'in' | 'out'>> = {
+  [OP.GET_ERROR_CODE]: 'in',
+  [OP.SET_OPERATION_MODE]: 'out',
+  [OP.GET_OPERATION_MODE]: 'in',
+  [OP.GET_FEATURED_FIRMWARE_DATA]: 'in',
+  [OP.BEGIN_FIRMWARE_UPGRADE]: 'out',
+  [OP.GET_FIRMWARE_INFO]: 'in',
+  [OP.SET_FEATURED_FIRMWARE_DATA]: 'out',
+  [OP.COMPLETE_MEMORY_UPGRADE]: 'out',
+  [OP.SET_FIRMWARE_INFO_FEATURES]: 'out',
+  [OP.SET_RAM_DATA_FEATURES]: 'out',
+};
+
 /** Every opcode a dump is allowed to touch. The write path asserts against this
  *  set so a stray call cannot leak into a read-only run. */
 export const READ_ONLY_OPS: ReadonlySet<Opcode> = new Set<Opcode>([

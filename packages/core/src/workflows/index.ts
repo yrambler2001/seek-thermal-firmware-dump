@@ -37,14 +37,18 @@ export { describeDevice, runDump } from './dump.js';
 export {
   evidenceFromChannelProbe,
   predatesDumpProtocol,
+  predatesDumpProtocolReason,
   probeSelectorChannel,
+  readRunningFirmware,
   FIRST_DUMPABLE_MAJOR,
   FIRST_DUMPABLE_MINOR,
   PROBE_OPEN_SUBCMD,
   PROBE_PROTECTED_SUBCMD,
   type ProbeOptions,
+  type RunningFirmware,
   type SelectorChannelProbe,
 } from './capability.js';
+export { planForDevice, type DevicePlan } from './window-plan.js';
 export { runSweep } from './sweep.js';
 export {
   decryptDump,

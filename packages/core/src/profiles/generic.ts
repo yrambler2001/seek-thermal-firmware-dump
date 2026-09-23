@@ -27,6 +27,7 @@ import {
   MODERN_MEMORY,
   MODERN_SLOTS,
   MODERN_SWEEP_RANGE,
+  modernWindowPlan,
 } from './modern-4x.js';
 
 /**
@@ -78,6 +79,8 @@ export const generic: FirmwareProfile = {
   slots: MODERN_SLOTS,
   boot: MODERN_BOOT,
   windowMap: buildModernWindowMap,
+  windowPlan: (firmwareVersion) =>
+    modernWindowPlan(firmwareVersion, 'generic: the post-2018 table, borrowed without evidence'),
   sweepRange: MODERN_SWEEP_RANGE,
   detect: detectGeneric,
 };

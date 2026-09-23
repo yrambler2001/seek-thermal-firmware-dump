@@ -75,6 +75,7 @@ import {
   LEGACY_MEMORY,
   LEGACY_SLOTS,
   LEGACY_SWEEP_RANGE,
+  legacyWindowPlan,
 } from './legacy-auth.js';
 import { primaryVersion, versionSource } from './version.js';
 
@@ -117,6 +118,17 @@ const LEGACY_MAJORS: readonly number[] = [0, 1];
 function detectCompact2016(evidence: DeviceEvidence): DetectionVerdict {
   const reasons: string[] = [];
   const sums = evidence.observedAcceptanceSums ?? [];
+
+  /* A build with no read handler is compact-2014's, whatever it sums to: the
+   * 2014 images sum to zero as well, and this profile dumps. */
+  const early = primaryVersion(evidence);
+  if (early !== null && early.major === 0 && early.minor < 8) {
+    reasons.push(
+      `firmware ${early.text} is older than 0.8.0.0 and has no read handler for ` +
+        'GetFeaturedFirmwareData — that is compact-2014, not this profile',
+    );
+    return { score: 0, reasons };
+  }
 
   if (sums.some((sum) => sum >>> 0 === MODERN_ACCEPT_SUM)) {
     reasons.push(
@@ -191,6 +203,7 @@ export const compact2016: FirmwareProfile = {
   slots: LEGACY_SLOTS,
   boot: LEGACY_BOOT,
   windowMap: buildLegacyWindowMap,
+  windowPlan: legacyWindowPlan,
   sweepRange: LEGACY_SWEEP_RANGE,
   detect: detectCompact2016,
 };

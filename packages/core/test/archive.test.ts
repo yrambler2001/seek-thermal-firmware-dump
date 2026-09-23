@@ -709,27 +709,37 @@ describe('README generation', () => {
     expect(readme.toLowerCase()).toContain('command-line');
   });
 
-  it('makeLegacyReadme derives coverage counts from the manifest itself', () => {
+  it('makeLegacyReadme derives coverage and the gap list from the manifest itself', () => {
+    /* The gap list is THIS firmware's. It used to be two fixed lines naming
+     * 0x14000000 and the upper 2 MiB, which was wrong twice over on the 2014
+     * builds: they arm 0x14000000 with the token, and have no selector for
+     * 0x140C0000. So the README must say what the manifest says, not recite. */
     const manifest = buildLegacyDumpManifest({
       ...sampleDumpInput(),
       windows: [],
       gaps: [
         buildGapRecord({
-          address: 0x14000000,
+          address: 0x140c0000,
           flashBase: 0x14000000,
           length: 0x10000,
           fill: 0xff,
-          reason: 'Live XIP/boot base — hard-blocked by the legacy firmware on every channel.',
+          reason: 'No subcommand arms 0x140C0000 on this build.',
         }),
       ],
       usbReadableWindows: 58,
       expectedReadableWindows: 61,
       unlockToken: Uint8Array.from([0x12, 0x34]),
       authChannelBanks: [0x14010000],
+      selectorTable: { firmwareVersion: '1.3.0.0', table: "legacy 1.3.0.0: this build's own" },
     });
     const readme = makeLegacyReadme(manifest);
     expect(readme).toContain('58 of 61 reachable 64 KiB windows were read.');
-    expect(readme).toContain('1 of 64 windows are unreachable');
+    expect(readme).toContain('1 gap(s) on this firmware');
+    expect(readme).toContain('0x140c0000 + 65536 B: No subcommand arms 0x140C0000 on this build.');
+    expect(readme).toContain(
+      "Firmware 1.3.0.0; windows armed from legacy 1.3.0.0: this build's own",
+    );
+    expect(readme).not.toContain('hard-blocked');
     expect(readme).toContain('Modern 4.x');
   });
 

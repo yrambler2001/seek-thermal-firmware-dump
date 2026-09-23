@@ -132,10 +132,19 @@ export function makeLegacyReadme(manifest: LegacyDumpManifest): string {
     '',
     '## Coverage',
     '',
+    ...(manifest.selectorTable === undefined
+      ? []
+      : [
+          `Firmware ${manifest.selectorTable.firmwareVersion ?? 'version unknown'}; windows armed ` +
+            `from ${manifest.selectorTable.table}.`,
+          '',
+        ]),
     `${String(okCount)} of ${String(reachable)} reachable 64 KiB windows were read.`,
-    `${String(gapCount)} of 64 windows are unreachable on this firmware and were gap-filled with ${fill}:`,
-    '  - 0x14000000              live XIP/boot base, hard-blocked by the firmware',
-    '  - 0x14200000..0x143fffff  upper 2 MiB, no read-window selector exists',
+    /* The gaps are THIS firmware's, read off the manifest. They used to be two
+     * fixed lines, and on the 2014 builds both were wrong: those arm the
+     * bootloader block with the token, and have no selector for 0x140C0000. */
+    `${String(gapCount)} gap(s) on this firmware, gap-filled with ${fill}:`,
+    ...manifest.gaps.map((gap) => `  - ${gap.address} + ${String(gap.length)} B: ${gap.reason}`),
     'See manifest.json for exact per-window and per-gap detail.',
     '',
     'The protected app-image banks 0x14010000..0x14070000 ARE included here (read via',
@@ -156,11 +165,12 @@ export function makeLegacyReadme(manifest: LegacyDumpManifest): string {
     'from its known-zero Cortex-M reserved vectors), so no stored key is needed.',
     '',
     'Note for legacy dumps: on these units the xorshift key lives in the boot bank at',
-    '0x14000000, which the old firmware hard-blocks on every channel (even with the',
-    'unlock token). That bank cannot be read here — but it does not have to be. Because',
-    'the key is solved from the encrypted image itself, the app-image slots decrypt from',
-    'this dump alone as long as the slot was actually captured. Only blocks the old',
-    'protocol cannot reach at all are left as gaps and listed in manifest.json.',
+    '0x14000000. The 2016-2017 builds refuse that bank on every channel, and the 2014',
+    'builds from 0.9.0.2 on arm it with the unlock token; the gap list above says which',
+    'this firmware did. Either way it does not have to be read: because the key is',
+    'solved from the encrypted image itself, the app-image slots decrypt from this dump',
+    'alone as long as the slot was actually captured. Only blocks this firmware cannot',
+    'reach at all are left as gaps and listed in manifest.json.',
     '',
   ].join('\n');
 }

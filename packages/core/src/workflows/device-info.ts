@@ -238,7 +238,6 @@ export async function readDeviceInfo(
   const args: DumpOptions = resolveDumpOptions(options);
   const { device, profile, reporter } = ctx;
   const chunk = args.chunk;
-  const entries = profile.windowMap();
   const readAt = new Date().toISOString();
 
   /* Which channel each bank actually armed on, which falls out of doing the
@@ -246,8 +245,9 @@ export async function readDeviceInfo(
    * rather than returning — so nothing built from this list can say a channel
    * was refused, only that one worked. The banks that reach it are the ones the
    * legacy firmware locks behind the authenticated channel (boot config, the
-   * image slots) plus the bootloader block at flashBase, which that firmware
-   * blocks on every channel. */
+   * image slots) plus the bootloader block at flashBase, which the 2016-2017
+   * builds refuse on every channel and the 2014 builds from 0.9.0.2 arm with
+   * the token. */
   const armedBanks: WindowEntry[] = [];
   const noteArmed = (entry: WindowEntry): void => {
     armedBanks.push(entry);
@@ -258,6 +258,9 @@ export async function readDeviceInfo(
   const version =
     build && build.length >= 4 ? [build[0], build[1], build[2], build[3]].join('.') : null;
   const buildString = build && build.length >= 4 ? asciiz(build.subarray(4)) : null;
+  /* Every arm below goes through THIS build's own table, resolved from the
+   * version just read, as a dump's does (`planForDevice`). */
+  const entries = profile.windowPlan(version).windows;
 
   const boot = await device.tryFwInfo(1, 36, 'bootloader info');
   const bootloaderVersion =

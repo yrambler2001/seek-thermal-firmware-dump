@@ -18,7 +18,9 @@ import { OP } from '../../src/protocol/ops.js';
 import { WebUsbTransport } from '../../src/protocol/webusb.js';
 import { authPayload } from '../../src/profiles/legacy-auth.js';
 import { buildModernWindowMap, FLASH_BASE } from '../../src/profiles/modern-4x.js';
-import type { WindowEntry } from '../../src/profiles/types.js';
+import { detectProfile } from '../../src/profiles/registry.js';
+import type { DeviceEvidence, WindowEntry } from '../../src/profiles/types.js';
+import { predatesDumpProtocol, readRunningFirmware } from '../../src/workflows/capability.js';
 import type { Emulator } from './harness.js';
 import { assertRealHostPath } from './webusb-over-usbip.js';
 
@@ -195,6 +197,40 @@ export interface WindowProbe {
   readonly error: string | null;
 }
 
+/**
+ * One window of the DUMP'S OWN plan, armed exactly as `runDump` arms it.
+ *
+ * WHY THIS EXISTS BESIDE THE WINDOW PROBE. The window probe above arms the
+ * MODERN map on the plain channel against every firmware, which is a fine
+ * question about that map and the wrong one about a dump: on the legacy line it
+ * never sends the token, never asks subcommand 7, and measures 63 selectors of
+ * which 32 do not exist there. That is where "25 of 63" came from while a dump
+ * of the same firmware read 31 of 31. This arms what the dump would arm, with
+ * the payload the dump would send, for the table the dump would resolve from
+ * the version the camera reports — and compares the bytes at the address the
+ * plan files them under.
+ */
+export interface PlanWindowProbe {
+  readonly subcmd: number;
+  readonly address: string;
+  readonly auth: boolean;
+  /** True when the window probe already armed this exact selector and payload. */
+  readonly reused: boolean;
+  readonly probe: WindowProbe;
+}
+
+export interface PlanProbe {
+  /** What GetFirmwareInfo said, which is what the dump plans from. */
+  readonly firmwareVersion: string | null;
+  /** The profile the CLI's own evidence would pick, and whether it dumps. */
+  readonly profile: string;
+  readonly dumps: boolean;
+  readonly table: string;
+  readonly windows: readonly PlanWindowProbe[];
+  /** The plan's gap list, by address. */
+  readonly gaps: readonly string[];
+}
+
 export interface AuthProbe {
   /** A plain 2-byte BeginFirmwareUpgrade armed the protected bank. */
   readonly plainAccepted: boolean;
@@ -212,6 +248,8 @@ export interface Tier1Result {
   readonly commands: Readonly<Record<string, CommandOutcome>>;
   readonly windows: readonly WindowProbe[];
   readonly auth: AuthProbe;
+  /** The dump's own plan for this firmware, measured window by window. */
+  readonly plan: PlanProbe;
   /** Bytes actually returned for a control IN of each probed size. */
   readonly controlInBytes: Readonly<Record<string, number | null>>;
   /** sha256 of the 4 MiB image the emulator says it is serving. */
@@ -497,9 +535,9 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
      * was a timeout — which the caller re-takes, for the reason in `measure`.
      */
     const probeWindow = async (
-      subcmd: number,
-      address: number,
+      entry: WindowEntry,
     ): Promise<{ probe: WindowProbe; lost: boolean }> => {
+      const { subcmd, address } = entry;
       let lost = false;
       let armed = false;
       let errorCode: number | null = null;
@@ -509,7 +547,7 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
       let locatorHex: string | null = null;
       let error: string | null = null;
       try {
-        await seek.armWindow({ subcmd, address, note: 'probe' });
+        await seek.armWindow(entry);
         armed = true;
         errorCode = 0;
         const read = await seek.readArmed(64, LOCATOR_BYTES);
@@ -577,7 +615,7 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
        * a refused arm answers with a stall or a device error code, which is
        * the firmware speaking and needs no second opinion. `lost` is
        * therefore recorded rather than acted on. */
-      windows.push((await probeWindow(subcmd, address)).probe);
+      windows.push((await probeWindow({ subcmd, address, note: 'probe' })).probe);
     }
 
     /* ---- how many bytes a control IN of each size really returns ---- */
@@ -630,6 +668,57 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
       plainAccepted: await armAuth(),
       authAccepted: await armAuth(authPayload(AUTH_SUBCMD)),
       wrongTokenAccepted: await armAuth(wrong),
+    };
+
+    /* ---- the dump's own plan, armed as the dump arms it ----
+     *
+     * The profile is chosen from exactly the evidence the CLI's probe hands to
+     * `detectProfile`: the version GetFirmwareInfo reports, and — unless that
+     * version predates the dump protocol, in which case the CLI sends nothing
+     * more — the plain/authenticated observations just made on subcommand 5.
+     * The plan is then that profile's table for that version, and every window
+     * of it is armed with the payload the dump would send. A window the modern
+     * probe already armed with the same selector and payload is not armed
+     * again; its measurement is reused and marked so. */
+    await recover();
+    const running = await readRunningFirmware(seek);
+    const evidence: DeviceEvidence = {
+      ...(running.version === null ? {} : { firmwareVersion: running.version }),
+      ...(predatesDumpProtocol(running.version)
+        ? {}
+        : {
+            plainSelectorWorks: auth.plainAccepted,
+            plainSelectorRefused: !auth.plainAccepted,
+            authSelectorWorks: auth.authAccepted,
+          }),
+    };
+    const planProfile = detectProfile(evidence).best.profile;
+    const dumps = planProfile.capabilities.dump.supported && !predatesDumpProtocol(running.version);
+    const dumpPlan = planProfile.windowPlan(running.version);
+    const planWindows: PlanWindowProbe[] = [];
+    for (const entry of dumps ? dumpPlan.windows : []) {
+      const already =
+        entry.payload === undefined
+          ? windows.find(
+              (w) => w.subcmd === entry.subcmd && w.claimedAddress === HEX(entry.address, 8),
+            )
+          : undefined;
+      if (already === undefined) await recover();
+      planWindows.push({
+        subcmd: entry.subcmd,
+        address: HEX(entry.address, 8),
+        auth: entry.payload !== undefined,
+        reused: already !== undefined,
+        probe: already ?? (await probeWindow(entry)).probe,
+      });
+    }
+    const plan: PlanProbe = {
+      firmwareVersion: running.version,
+      profile: planProfile.id,
+      dumps,
+      table: dumpPlan.table,
+      windows: planWindows,
+      gaps: dumpPlan.unreachable.map((u) => HEX(u.address, 8)),
     };
 
     /* ---- which commands answer ---- */
@@ -686,6 +775,7 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
       commands,
       windows,
       auth,
+      plan,
       controlInBytes,
       servedSha256: emu.ready.flash_sha256,
       fillSeed: emu.ready.fill?.seed ?? null,

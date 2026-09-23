@@ -5,10 +5,9 @@
  *
  * This profile used to describe a protocol that had been inferred. It is now
  * derived: FW-V1's byte-exact reconstruction of this generation's
- * `cmd_BeginFirmwareUpgrade` (`codegen/fn/cmd_BeginFirmwareUpgrade.c`, variant
- * `gcc49_shape` for the 2016 Compact PRO 1.0.3.0 and `c32k_1308` for the
- * Compact 1.3.0.8 — two independently decoded builds, identical window table)
- * opens with exactly this:
+ * `cmd_BeginFirmwareUpgrade` (`targets/compact_pro_9hz_2016/src/rpc_cmds.c:2573`
+ * for the 2016 Compact PRO 1.0.3.0, `targets/compact_32k_1_3_0_8/src/rpc_cmds.c:2273`
+ * for the Compact 1.3.0.8 16 Hz build) opens with exactly this:
  *
  *     mode = arg0 & 0xFF;
  *     if (mode == 2)    return 0x20000;   // "Invalid memory region"
@@ -18,10 +17,8 @@
  *         if (memcmp(arg + 2, KEY, 16) != 0) return 0x80000;  // "Invalid backdoor key"
  *     } else if ((unsigned)(mode - 2) <= 7) return 0x80000;  // "Invalid backdoor key"
  *
- * Every claim this file makes falls out of those five lines:
+ * and then switches on the mode to pick the block. What follows from it:
  *
- *   - `0x14000000` is blocked on EVERY channel, because `mode == 2` returns
- *     before the length and token tests are reached at all.
  *   - the protected set is modes 2..9 — boot config, the config/factory alias,
  *     and the five image banks — because that is what `(mode - 2) <= 7` spans
  *     on the plain channel.
@@ -30,26 +27,54 @@
  *   - the 18-byte form is not a longer plain arm: the token is genuinely
  *     compared, and a wrong one is refused with a distinct status.
  *
+ * ---- NOT ONE TABLE: THE BUILDS DIFFER, AND EACH ONE'S OWN IS USED ----
+ *
+ * CORRECTED 2026-09-23. This file used to carry one selector map for the whole
+ * line, and it was wrong on nine builds. Each image's own window switch is now
+ * decoded straight out of its bytes (`scripts/update-firmware-facts.mjs`, the
+ * `windowTable` of every image in `test/firmware/facts.json`), and the line has
+ * FOUR tables, not one:
+ *
+ *   build                         mode 1        mode 2                  mode 0x0E
+ *   Compact 0.8.0.0               run time *    *(u32 *)0x14000000 **   0x140B0000
+ *   Compact 0.9.0.2 .. 1.3.0.0    0x14020000    0x14000000, token       0x140B0000
+ *   Compact 1.3.0.8               0x14020000    differs by build ***    0x140C0000
+ *   Compact PRO 1.0.3.0, 1.0.3.2  0x14020000    refused outright        0x140C0000
+ *
+ *     *   `boot_record[1][4 + (boot_record[2] == 0)]`: an entry of the table the
+ *         BOOTLOADER's boot record points at (the boot-config block), so the
+ *         block depends on the bootloader, not on this image.
+ *     **  a load THROUGH the word at 0x14000000, which arms whatever address that
+ *         word holds — not a flash window.
+ *     *** the 16 Hz image refuses mode 2 outright; the 8 Hz ("insecure") image
+ *         has no mode-2 test at all and arms 0x14000000 with the token.
+ *         GetFirmwareInfo reports 1.3.0.8 for both, so that block is not read.
+ *
+ * The one that costs a block silently is mode 0x0E: every 2014 image carries
+ * the literal run 0x140A0000, 0x140B0000, 0x140B0000, 0x140D0000 in that switch,
+ * so subcommand 0x0E arms 0x140B0000 again and NO subcommand arms 0x140C0000.
+ * The shared map claimed 0x0E was 0x140C0000, so a dump of a 2014 Compact would
+ * have written 0x140B0000's bytes at 0x140C0000. It now records 0x140C0000 as a
+ * gap, with that reason, and reads 0x140B0000 once.
+ *
  * ---- And measured on the wire ---------------------------------------
  *
- * The emulator sweep arms all 63 selectors of the modern map against each
- * firmware. Nine corpus builds — Compact PRO 1.0.3.0 (three parts), 1.0.3.0 FF,
- * 1.0.3.2, 1.0.3.2 FF, and Compact 1.3.0.8 and 1.3.0.8 FF — confirm exactly 25
- * and refuse exactly 38: subcommand 1 plus the 24 linear windows 0x0A..0x21 are
- * served, and the six protected banks plus the 32 selectors above 0x141FFFFF
- * are refused. That is the source arm above, counted. The same nine refuse a
- * plain arm of subcommand 5, accept the 18-byte one, and refuse an 18-byte
- * payload with one byte of the token flipped.
+ * The emulator sweep arms all 63 selectors of the MODERN map, on the plain
+ * channel, against each firmware. The 2016-2017 builds answer 25 and refuse 38:
+ * subcommand 1 plus the 24 linear windows 0x0A..0x21 are served; 2, 3, 5, 6, 8
+ * and 9 are refused on that channel, and the 32 selectors above 0x21 are refused
+ * outright. That is the gate above, counted — and it is a count of THAT list on
+ * THAT channel, not of what this profile reads. With the token, and with
+ * subcommand 7 (which the modern map does not contain), the same firmware
+ * serves 31 distinct blocks, 0x14010000..0x141FFFFF, and that is what a dump
+ * reads (tier 2: 31/31 windows, 0 differing bytes, on the three 1.0.3.0 dumps).
+ * Tier 1 now also arms every window of each build's OWN plan, the way the dump
+ * does, and checks the bytes against the emulator's image (`plan` in
+ * `test/emulator/expectations.rpc.json`).
  *
- * The map here therefore sends the token on the protected banks and omits the
- * blocks the protocol cannot reach; the dump records those as gaps (see
- * `memory.unreachable`). The subcommand -> address assignment is this
- * generation's own and differs from the modern one: 0x14050000 / 0x14060000 /
- * 0x14070000 are subcommands 7 / 8 / 9 here, where the modern map uses 8 and 9
- * for 0x14050000 and 0x14070000 and exposes nothing at 0x14060000 at all. The
- * token selects a read window only — nothing is written to the device.
+ * The token selects a read window only — nothing is written to the device.
  */
-import { viewOf } from '../bytes.js';
+import { hexUp, viewOf } from '../bytes.js';
 import { SeekError } from '../errors.js';
 import type {
   BootPolicy,
@@ -60,10 +85,14 @@ import type {
   FirmwareProfile,
   MemoryLayout,
   ProfileCapabilities,
+  SelectorRow,
   SlotDescriptor,
+  UnreachableRange,
   WindowEntry,
+  WindowPlan,
 } from './types.js';
 import { SUPPORTED, unsupported } from './types.js';
+import { agreedRows, buildWindowPlan } from './plan.js';
 import { primaryVersion, versionSource } from './version.js';
 import { FLASH_BASE, FLASH_SIZE, HDR_HI, HDR_LO, WINDOW_SIZE } from './modern-4x.js';
 
@@ -115,60 +144,309 @@ export function authPayload(subcmd: number, token: Uint8Array = OLD_FW_UNLOCK_TO
   return bytes;
 }
 
-/** Highest address the legacy selector map reaches, inclusive of its window. */
+/** The first block no legacy subcommand reaches: `mode > 0x21` is refused outright. */
 const LEGACY_TOP = 0x14200000;
 
-interface LegacyBank {
-  readonly subcmd: number;
-  readonly address: number;
-  readonly auth: boolean;
-  readonly note: string;
-}
-
-/* The old firmware's own subcommand -> address assignment. Note 7/8/9 for
- * 0x14050000/0x14060000/0x14070000 — the modern map uses 8 and 9 for
- * 0x14050000 and 0x14070000 and exposes nothing at 0x14060000 at all. */
-const LEGACY_BANKS: readonly LegacyBank[] = [
-  { subcmd: 0x3, address: 0x14010000, auth: true, note: 'boot config block (auth)' },
-  { subcmd: 0x1, address: 0x14020000, auth: false, note: 'config/factory area' },
-  /* Subcommand 4 is a second door onto 0x14020000 — `case 4` in the same switch
-   * — but a LOCKED one, because 4 falls inside the protected 2..9 span while 1
-   * does not. It is not in the map: the block is already tiled by subcommand 1
-   * on the cheaper channel, and a dump covers each address once. */
-  { subcmd: 0x5, address: 0x14030000, auth: true, note: 'protected bank (auth)' },
-  { subcmd: 0x6, address: 0x14040000, auth: true, note: 'protected bank (auth)' },
-  { subcmd: 0x7, address: 0x14050000, auth: true, note: 'app image slot (auth)' },
-  { subcmd: 0x8, address: 0x14060000, auth: true, note: 'app image slot (auth)' },
-  { subcmd: 0x9, address: 0x14070000, auth: true, note: 'app image slot (auth)' },
-];
+const UPPER_HOLE: UnreachableRange = {
+  address: LEGACY_TOP,
+  length: FLASH_BASE + FLASH_SIZE - LEGACY_TOP,
+  reason:
+    'Upper 2 MiB — the legacy handler refuses every subcommand above 0x21 (0x141F0000 is the ' +
+    'last window it can arm), so nothing above 0x141FFFFF is reachable.',
+};
 
 /**
- * The legacy selector map. Auth banks carry the 18-byte payload; the plain banks
- * omit `payload` entirely rather than setting it to `undefined`, so the entry
- * itself says which channel it needs.
+ * How one build's switch differs from its siblings'. Everything else in the
+ * table is the same on every build from 0.5.0.2 to 1.3.0.8 (decoded from each
+ * image; `test/firmware-facts.test.ts` holds these tables to those bytes).
  */
-export function buildLegacyWindowMap(): readonly WindowEntry[] {
-  const entries: WindowEntry[] = LEGACY_BANKS.map((bank) =>
-    bank.auth
-      ? {
-          subcmd: bank.subcmd,
-          address: bank.address,
-          auth: true,
-          note: bank.note,
-          payload: authPayload(bank.subcmd),
-        }
-      : { subcmd: bank.subcmd, address: bank.address, auth: false, note: bank.note },
+interface LegacyTraits {
+  /** Mode 1: the constant 0x14020000, or an entry of the bootloader's config block. */
+  readonly modeOne: 'literal' | 'boot-config';
+  /**
+   * Mode 2: refused before the channel test; armed on the token channel; armed
+   * through a load of the word AT 0x14000000 (not a flash window); or different
+   * between two builds that report the same version.
+   */
+  readonly modeTwo: 'refused' | 'auth' | 'indirect' | 'differs';
+  /** The block subcommand 0x0E arms. */
+  readonly modeFourteen: number;
+}
+
+const LINEAR_BASE = 0x14080000;
+
+/** The build's own window table, one row per mode its switch handles (0..0x21). */
+function legacyRows(traits: LegacyTraits): readonly SelectorRow[] {
+  const rows: SelectorRow[] = [
+    {
+      subcmd: 0,
+      address: null,
+      channel: 'plain',
+      note:
+        traits.modeOne === 'boot-config'
+          ? "reads entry 1 or 2 of the bootloader's config block at run time"
+          : 'picks 0x14050000 or 0x14060000 at run time, from the image id in the boot record',
+    },
+    traits.modeOne === 'literal'
+      ? { subcmd: 1, address: 0x14020000, channel: 'plain', note: 'config/factory area' }
+      : {
+          subcmd: 1,
+          address: null,
+          channel: 'plain',
+          note:
+            "reads entry 4 or 5 of the bootloader's config block at run time (the table the boot " +
+            "record's second word points at), so the block depends on the bootloader, not on this " +
+            'image; subcommand 4 reaches 0x14020000 as a constant instead',
+        },
+  ];
+  switch (traits.modeTwo) {
+    case 'refused':
+      rows.push({
+        subcmd: 2,
+        address: 0x14000000,
+        channel: 'refused',
+        note: 'refused outright (mode == 2), before the channel test',
+      });
+      break;
+    case 'auth':
+      rows.push({
+        subcmd: 2,
+        address: 0x14000000,
+        channel: 'auth',
+        note: 'SPIFI flash base / bootloader block (auth) — this build has no mode-2 refusal',
+      });
+      break;
+    case 'indirect':
+      rows.push({
+        subcmd: 2,
+        address: null,
+        channel: 'auth',
+        note: 'loads the word stored AT 0x14000000 and arms that as the address: not a flash window',
+      });
+      break;
+    case 'differs':
+      /* Both images carry the 0x14000000 literal; only the gate in front of the
+       * switch differs. The address is the image's, and the channel is the
+       * conservative one, since the version cannot say which gate is running. */
+      rows.push({
+        subcmd: 2,
+        address: 0x14000000,
+        channel: 'refused',
+        note:
+          'the 16 Hz build refuses mode 2 outright and the 8 Hz build arms 0x14000000 with the ' +
+          'token; both report the same version, so this table takes the refusal',
+      });
+      break;
+  }
+  rows.push(
+    { subcmd: 3, address: 0x14010000, channel: 'auth', note: 'boot config block (auth)' },
+    {
+      subcmd: 4,
+      address: 0x14020000,
+      channel: 'auth',
+      note: 'config/factory area, second door (auth)',
+    },
+    { subcmd: 5, address: 0x14030000, channel: 'auth', note: 'protected bank (auth)' },
+    { subcmd: 6, address: 0x14040000, channel: 'auth', note: 'protected bank (auth)' },
+    { subcmd: 7, address: 0x14050000, channel: 'auth', note: 'app image slot (auth)' },
+    { subcmd: 8, address: 0x14060000, channel: 'auth', note: 'app image slot (auth)' },
+    { subcmd: 9, address: 0x14070000, channel: 'auth', note: 'app image slot (auth)' },
   );
   for (let subcmd = 0x0a; subcmd <= 0x21; subcmd++) {
-    entries.push({
+    const linear = LINEAR_BASE + (subcmd - 0x0a) * WINDOW_SIZE;
+    const address = subcmd === 0x0e ? traits.modeFourteen : linear;
+    rows.push({
       subcmd,
-      address: 0x14080000 + (subcmd - 0x0a) * WINDOW_SIZE,
-      auth: false,
-      note: 'linear window',
+      address,
+      channel: 'plain',
+      note:
+        address === linear
+          ? 'linear window'
+          : `this build's own table gives 0x0E the address ${hexUp(address)}, not ${hexUp(linear)}`,
     });
   }
-  entries.sort((a, b) => a.address - b.address);
-  return entries;
+  return rows;
+}
+
+/** The reasons for every block a build's rows leave unread. */
+function legacyHoles(traits: LegacyTraits): readonly UnreachableRange[] {
+  const holes: UnreachableRange[] = [UPPER_HOLE];
+  const bootReason: Record<LegacyTraits['modeTwo'], string | null> = {
+    refused:
+      'Bootloader block — this build refuses mode 2 outright (the `mode == 2` test runs before ' +
+      'the channel test), so no payload arms it.',
+    auth: null,
+    indirect:
+      "Bootloader block — this build's mode 2 does not arm it: the handler loads the word stored " +
+      'at 0x14000000 and arms THAT as the address, which is not a flash window, so it is not sent.',
+    differs:
+      'Bootloader block — 1.3.0.8 ships as a 16 Hz build that refuses mode 2 outright and an 8 Hz ' +
+      'build that arms it with the token. GetFirmwareInfo reports 1.3.0.8 for both, so it is not ' +
+      'read.',
+  };
+  const boot = bootReason[traits.modeTwo];
+  if (boot !== null) holes.push({ address: FLASH_BASE, length: WINDOW_SIZE, reason: boot });
+  const gapFourteen = LINEAR_BASE + (0x0e - 0x0a) * WINDOW_SIZE;
+  if (traits.modeFourteen !== gapFourteen) {
+    holes.push({
+      address: gapFourteen,
+      length: WINDOW_SIZE,
+      reason:
+        `No subcommand arms ${hexUp(gapFourteen)} on this build: its own window table gives ` +
+        `subcommand 0x0E the address ${hexUp(traits.modeFourteen)}, the same block as 0x0D (the ` +
+        'image carries that literal twice). Left as a gap rather than filled from another address.',
+    });
+  }
+  return holes;
+}
+
+/**
+ * Every build of this line whose table has been decoded from its image, by the
+ * version its GetFirmwareInfo reports. `test/firmware-facts.test.ts` fails if a
+ * corpus image of this line is missing here, or if a row disagrees with that
+ * image's own switch.
+ *
+ * Builds older than 0.8.0.0 are not here: their tables decode too, but they have
+ * no read command a dump can use (see `compact-2014`).
+ */
+const LEGACY_BUILDS: ReadonlyMap<string, LegacyTraits> = new Map<string, LegacyTraits>([
+  ['0.8.0.0', { modeOne: 'boot-config', modeTwo: 'indirect', modeFourteen: 0x140b0000 }],
+  ...['0.9.0.2', '0.9.0.6', '0.9.0.7', '0.9.1.0', '0.10.0.0', '1.0.0.0', '1.2.0.0', '1.3.0.0'].map(
+    (v): [string, LegacyTraits] => [
+      v,
+      { modeOne: 'literal', modeTwo: 'auth', modeFourteen: 0x140b0000 },
+    ],
+  ),
+  ['1.3.0.8', { modeOne: 'literal', modeTwo: 'differs', modeFourteen: 0x140c0000 }],
+  ['1.0.3.0', { modeOne: 'literal', modeTwo: 'refused', modeFourteen: 0x140c0000 }],
+  ['1.0.3.2', { modeOne: 'literal', modeTwo: 'refused', modeFourteen: 0x140c0000 }],
+]);
+
+/** The versions `legacyWindowPlan` has a decoded table for, in no particular order. */
+export const LEGACY_KNOWN_VERSIONS: readonly string[] = [...LEGACY_BUILDS.keys()];
+
+/** The table a version's own image decodes to, or null for a build not in the corpus. */
+export function legacySelectorRows(version: string): readonly SelectorRow[] | null {
+  const traits = LEGACY_BUILDS.get(version);
+  return traits === undefined ? null : legacyRows(traits);
+}
+
+/** `1.3.0.8`, from whatever GetFirmwareInfo's four bytes became. */
+function normalisedVersion(version: string | null): string | null {
+  if (version === null) return null;
+  const match = /^\s*(\d+)\.(\d+)\.(\d+)\.(\d+)/.exec(version);
+  if (match === null) return null;
+  return match
+    .slice(1, 5)
+    .map((n) => String(Number.parseInt(n, 10)))
+    .join('.');
+}
+
+/** The first build with a read handler for GetFeaturedFirmwareData (see `compact-2014`). */
+function predatesReadHandler(version: string): boolean {
+  const [major, minor] = version.split('.').map((n) => Number.parseInt(n, 10));
+  return major === 0 && (minor ?? 0) < 8;
+}
+
+const plainOrAuth = {
+  flashBase: FLASH_BASE,
+  flashSize: FLASH_SIZE,
+  windowSize: WINDOW_SIZE,
+  authPayload: (subcmd: number) => authPayload(subcmd),
+  markPlain: true,
+} as const;
+
+/**
+ * The plan for one build of this line: its own table when the version is one
+ * this file has decoded, the rows every decoded build agrees on otherwise.
+ *
+ * `compact-2016` uses this too: the two profiles differ in their cipher, not in
+ * their selector tables.
+ */
+export function legacyWindowPlan(firmwareVersion: string | null): WindowPlan {
+  const version = normalisedVersion(firmwareVersion);
+
+  if (version !== null && predatesReadHandler(version)) {
+    return {
+      firmwareVersion,
+      table: `none: ${version} predates the read handler (see compact-2014)`,
+      selectors: [],
+      windows: [],
+      unreachable: [
+        {
+          address: FLASH_BASE,
+          length: FLASH_SIZE,
+          reason:
+            `Firmware ${version} has no read handler for GetFeaturedFirmwareData, so no window ` +
+            'can be read on it whatever the selector map says.',
+        },
+      ],
+    };
+  }
+
+  const traits = version === null ? undefined : LEGACY_BUILDS.get(version);
+  if (traits !== undefined && version !== null) {
+    return buildWindowPlan({
+      ...plainOrAuth,
+      table: `legacy ${version}: this build's own BeginFirmwareUpgrade table`,
+      firmwareVersion,
+      selectors: legacyRows(traits),
+      holes: legacyHoles(traits),
+    });
+  }
+
+  /* Not a build this file knows, or no version at all: only what every known
+   * build agrees on. Mode 1 disagrees (0.8.0.0 computes it), so 0x14020000 is
+   * read through subcommand 4 and the token; mode 2 and mode 0x0E disagree, so
+   * 0x14000000 and 0x140C0000 are gaps that say why. */
+  const known = [...LEGACY_BUILDS.values()].map(legacyRows);
+  const agreed = agreedRows(
+    known,
+    (subcmd) =>
+      `the builds this profile knows disagree about subcommand ${hexUp(subcmd, 2)}, and the ` +
+      'version did not say which one this is',
+  );
+  const unknown =
+    version === null
+      ? 'the firmware version could not be read'
+      : `firmware ${version} is not a build whose table has been decoded`;
+  const unknownSentence =
+    version === null
+      ? 'The firmware version could not be read'
+      : `Firmware ${version} is not a build whose table has been decoded`;
+  return buildWindowPlan({
+    ...plainOrAuth,
+    table: `legacy, version unknown: the rows every decoded build agrees on (${unknown})`,
+    firmwareVersion,
+    selectors: agreed,
+    holes: [
+      UPPER_HOLE,
+      {
+        address: FLASH_BASE,
+        length: WINDOW_SIZE,
+        reason:
+          `Bootloader block — ${unknown}, and the builds disagree about mode 2 (refused outright, ` +
+          'armed with the token, or armed through a pointer), so it is not read.',
+      },
+      {
+        address: LINEAR_BASE + (0x0e - 0x0a) * WINDOW_SIZE,
+        length: WINDOW_SIZE,
+        reason:
+          `${unknownSentence}, and subcommand 0x0E arms 0x140C0000 on the 2016-2017 builds but ` +
+          '0x140B0000 on the 2014 ones, so it is not read.',
+      },
+    ],
+  });
+}
+
+/**
+ * The selector map when the version is not known — `legacyWindowPlan(null)`.
+ *
+ * Kept for listings and for callers with no camera to ask. A dump, a sweep and
+ * a device read resolve the version and use `legacyWindowPlan` itself.
+ */
+export function buildLegacyWindowMap(): readonly WindowEntry[] {
+  return legacyWindowPlan(null).windows;
 }
 
 /* ---- descriptors -------------------------------------------------------- */
@@ -192,22 +470,15 @@ export const LEGACY_MEMORY: MemoryLayout = {
   flashSize: FLASH_SIZE,
   windowSize: WINDOW_SIZE,
   bootConfigBase: 0x14010000,
-  /* Same bootloader-block geometry as the 4.x line; the block itself is only
-   * readable through the authenticated channel here. */
+  /* Same bootloader-block geometry as the 4.x line. Whether the block itself
+   * can be read is a per-build question: see `legacyWindowPlan`. */
   deviceKeySlotOffset: 0x218,
   deviceKeySlotLength: 16,
-  unreachable: [
-    {
-      address: FLASH_BASE,
-      length: WINDOW_SIZE,
-      reason: 'Live XIP/boot base — hard-blocked by the legacy firmware on every channel.',
-    },
-    {
-      address: LEGACY_TOP,
-      length: FLASH_BASE + FLASH_SIZE - LEGACY_TOP,
-      reason: 'Upper 2 MiB — the legacy firmware exposes no read-window selector here.',
-    },
-  ],
+  /* Only what NO build of this line reaches. The bootloader block used to be
+   * listed here as "hard-blocked on every channel"; that is true of the 2016
+   * Compact PRO and the 1.3.0.8 16 Hz build and false of the 2014 Compacts from
+   * 0.9.0.2 on, which arm it with the token. */
+  unreachable: [UPPER_HOLE],
 };
 
 /**
@@ -306,20 +577,39 @@ const SCORE_WEAK = 0.3;
  * ids the modern line uses (`test/firmware/facts.json`). `0.x` was excluded
  * here until 2026-09-22 purely because the test was `major === 1`.
  *
- * The five builds OLDER than 0.7 are a different matter and have their own
- * profile; see `compact-2014`.
+ * The builds OLDER than 0.8 are a different matter and have their own profile;
+ * see `compact-2014`. Five have no GetFeaturedFirmwareData at all, and 0.7.0.7
+ * and 0.7.0.8 have it at 0x4F with the right name and the handler in the SETTER
+ * column, so a read cannot be dispatched (corrected 2026-09-23: this said 0.7).
  */
 const LEGACY_MAJORS: readonly number[] = [0, 1];
 
 function detectLegacy(evidence: DeviceEvidence): DetectionVerdict {
   const reasons: string[] = [];
 
+  /* FIRST, BEFORE ANY CHANNEL EVIDENCE. A 0.7.0.x camera refuses the plain arm
+   * of a protected bank exactly as this line does — its handler is this line's —
+   * and then cannot serve a byte, because its read command has no getter. The
+   * version is what separates them, so it is asked before the refusal can
+   * score. */
+  const early = primaryVersion(evidence);
+  if (early !== null && early.major === 0 && early.minor < 8) {
+    reasons.push(
+      `firmware ${early.text} is older than 0.8.0.0: its RPC table has no read handler for ` +
+        'GetFeaturedFirmwareData (none at all before 0.7.0.7, and a setter only on 0.7.0.7 and ' +
+        '0.7.0.8) — that is compact-2014, not this profile',
+    );
+    return { score: 0, reasons };
+  }
+
   /* THE OBSERVATION THIS PROFILE'S OWN COMMENTS SAID NOBODY MADE.
    * `probeSelectorChannel` sends a plain 2-byte arm at a bank this firmware
    * locks, precisely so the refusal can be seen. A refusal is this generation
-   * and nothing else: 26 corpus firmwares accept that arm and nine refuse it,
-   * and the nine are exactly the 1.0.3.x / 1.3.0.8 builds whose reconstructed
-   * handler contains the `(mode - 2) <= 7` guard. */
+   * and nothing else: the 26 post-2018 corpus firmwares accept that arm, and the
+   * ones that refuse it are exactly the builds whose handler contains the
+   * `(mode - 2) <= 7` guard — FW-V1's reconstructions of 1.0.3.0 and 1.3.0.8,
+   * and every 2014 image's own switch from 0.5.0.2 on (`plainChannelLockedModes`
+   * in `test/firmware/facts.json`). */
   if (evidence.plainSelectorRefused === true) {
     reasons.push(
       'a plain 2-byte BeginFirmwareUpgrade of a protected bank was REFUSED, which is this ' +
@@ -353,17 +643,6 @@ function detectLegacy(evidence: DeviceEvidence): DetectionVerdict {
     );
     return { score: 0, reasons };
   }
-  if (version !== null && version.major === 0 && version.minor < 7) {
-    /* Older than the dump protocol itself. `compact-2014` owns those builds and
-     * refuses to read them; scoring them here would hand a camera whose 0x52 is
-     * EnterBootloaderMode to a profile that dumps. */
-    reasons.push(
-      `firmware ${version.text} is older than 0.7, whose RPC table has no ` +
-        'GetFeaturedFirmwareData at all — that is compact-2014, not this profile',
-    );
-    return { score: 0, reasons };
-  }
-
   let score = 0;
   /* "The authenticated channel worked" is not "the plain channel was refused".
    * A firmware that ignores the extra 16 bytes arms on it too — the modern one
@@ -395,18 +674,20 @@ export const legacyAuth: FirmwareProfile = {
   id: 'legacy-auth',
   name: 'Legacy locked firmware',
   summary:
-    'The 2014-2017 locked line: Compact 0.7.0.7-1.3.0.8 and Compact PRO 1.0.3.x. Its ' +
+    'The 2014-2017 locked line: Compact 0.8.0.0-1.3.0.8 and Compact PRO 1.0.3.x. Its ' +
     'BeginFirmwareUpgrade refuses subcommands 2..9 on the plain channel and opens them to an ' +
     '18-byte payload carrying a 16-byte token (the same token in all 22 corpus images that ' +
-    'have one); 0x14000000 is blocked on every channel and there is no selector above ' +
-    '0x141fffff. 25 of 63 windows answer plain, all 31 with the token. Read-only: the write ' +
-    'path was never validated on this generation.',
+    'have one), and there is no selector above 0x141fffff. Each build is dumped with its own ' +
+    'selector table: 31 blocks on the 2016-2017 builds (25 of the modern map answer plain), ' +
+    'and on the 2014 builds 0x140C0000 is out of reach because their table gives subcommand ' +
+    '0x0E the address of 0x0D. Read-only: the write path was never validated on this generation.',
   cipher: LEGACY_CIPHER,
   memory: LEGACY_MEMORY,
   capabilities: CAPABILITIES,
   slots: LEGACY_SLOTS,
   boot: LEGACY_BOOT,
   windowMap: buildLegacyWindowMap,
+  windowPlan: legacyWindowPlan,
   sweepRange: LEGACY_SWEEP_RANGE,
   detect: detectLegacy,
 };

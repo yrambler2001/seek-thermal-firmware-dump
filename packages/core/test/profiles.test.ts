@@ -15,6 +15,7 @@ import {
   GENERIC_BASELINE,
   OLD_FW_UNLOCK_TOKEN,
   WINDOW_SIZE,
+  LEGACY_KNOWN_VERSIONS,
   buildLegacyWindowMap,
   buildModernWindowMap,
   compact2016,
@@ -22,6 +23,7 @@ import {
   generic,
   getProfile,
   legacyAuth,
+  legacyWindowPlan,
   listProfiles,
   modern4x,
   registerProfile,
@@ -117,12 +119,16 @@ describe('modern-4x selector map', () => {
   });
 });
 
-describe('legacy-auth selector map', () => {
+describe('legacy-auth selector map, version unknown', () => {
+  /* `windowMap()` is the plan for a camera whose version did not come back:
+   * only the rows every decoded build agrees on. A dump resolves the version
+   * first and uses that build's own table (next block). */
   const map = buildLegacyWindowMap();
 
-  /** Exactly the banks the legacy firmware locks behind the 18-byte channel. */
+  /** Rows 3..9, all on the 18-byte channel. 0x14020000 is here through
+   *  subcommand 4 because 0.8.0.0 computes subcommand 1 at run time. */
   const EXPECTED_AUTH_BANKS = [
-    0x14010000, 0x14030000, 0x14040000, 0x14050000, 0x14060000, 0x14070000,
+    0x14010000, 0x14020000, 0x14030000, 0x14040000, 0x14050000, 0x14060000, 0x14070000,
   ];
 
   /** Ground truth from legacy/index.html — recovered from one Compact PRO unit. */
@@ -137,6 +143,7 @@ describe('legacy-auth selector map', () => {
   it('marks exactly the protected banks as needing the authenticated channel', () => {
     const authed = map.filter((e) => e.auth === true).map((e) => e.address);
     expect(authed).toEqual(EXPECTED_AUTH_BANKS);
+    expect(map.filter((e) => e.auth === true).map((e) => e.subcmd)).toEqual([3, 4, 5, 6, 7, 8, 9]);
   });
 
   it('carries the unlock token verbatim', () => {
@@ -173,25 +180,160 @@ describe('legacy-auth selector map', () => {
     expect(modernBySubcmd.get(0x14070000)).toBe(0x9);
   });
 
-  it('reaches 0x14010000..0x141fffff and records the rest as gaps', () => {
-    const missing = addressesMissingFrom(map);
-    expect(missing[0]).toBe(FLASH_BASE);
-    expect(missing.slice(1).every((a) => a >= 0x14200000)).toBe(true);
+  it('reads nothing the builds disagree about, and says why for each block', () => {
+    const plan = legacyWindowPlan(null);
+    expect(addressesMissingFrom(map)).toEqual([
+      FLASH_BASE,
+      0x140c0000,
+      ...allWindowAddresses().filter((a) => a >= 0x14200000),
+    ]);
+    expect(plan.unreachable.map((g) => [g.address, g.length])).toEqual([
+      [FLASH_BASE, WINDOW_SIZE],
+      [0x140c0000, WINDOW_SIZE],
+      [0x14200000, 0x200000],
+    ]);
+    expect(plan.unreachable[0]?.reason).toMatch(/disagree about mode 2/i);
+    expect(plan.unreachable[1]?.reason).toMatch(/0x0E arms 0x140C0000 on the 2016-2017/);
+    expect(plan.unreachable[2]?.reason).toMatch(/upper 2 mib/i);
+    expect(plan.table).toMatch(/version could not be read/);
+    /* Only what NO build reaches is the profile's static gap list. */
+    expect(legacyAuth.memory.unreachable.map((g) => [g.address, g.length])).toEqual([
+      [0x14200000, 0x200000],
+    ]);
+  });
+});
 
-    const gaps = legacyAuth.memory.unreachable;
-    expect(gaps.map((g) => g.address)).toEqual([FLASH_BASE, 0x14200000]);
-    const gapped = gaps.reduce((sum, g) => sum + g.length, 0);
-    expect(gapped).toBe(missing.length * WINDOW_SIZE);
-    expect(gaps[0]?.reason).toMatch(/xip\/boot base/i);
-    expect(gaps[1]?.reason).toMatch(/upper 2 mib/i);
+describe('legacy-auth per-build tables (each build dumped with its own)', () => {
+  const plans = LEGACY_KNOWN_VERSIONS.map((v) => legacyWindowPlan(v));
 
-    // No entry may sit inside a declared gap.
-    for (const entry of map) {
-      for (const gap of gaps) {
-        expect(entry.address >= gap.address && entry.address < gap.address + gap.length).toBe(
-          false,
+  /** Every block, exactly once: read through one window or declared a gap. */
+  function expectTiled(plan: ReturnType<typeof legacyWindowPlan>): void {
+    const blocks = new Map<number, string>();
+    for (const w of plan.windows) blocks.set(w.address, `window ${hexUp(w.subcmd, 2)}`);
+    for (const g of plan.unreachable) {
+      for (let a = g.address; a < g.address + g.length; a += WINDOW_SIZE) {
+        expect(blocks.has(a), `${plan.table}: ${hexUp(a)} is both read and a gap`).toBe(false);
+        blocks.set(a, 'gap');
+      }
+    }
+    expect(blocks.size, plan.table).toBe(WINDOW_COUNT);
+  }
+
+  it('tiles the part exactly on every known build', () => {
+    for (const plan of plans) expectTiled(plan);
+    expectTiled(legacyWindowPlan(null));
+  });
+
+  it('reads each window at the address its own row gives that subcommand', () => {
+    /* The property the bug broke: a window's address comes from THIS build's
+     * row for that subcommand, never from a shared linear guess. */
+    for (const plan of plans) {
+      for (const w of plan.windows) {
+        const row = plan.selectors.find((r) => r.subcmd === w.subcmd);
+        expect(row?.address, `${plan.table} subcmd ${hexUp(w.subcmd, 2)}`).toBe(w.address);
+        expect(row?.channel).not.toBe('refused');
+        expect(w.auth === true, `${plan.table} subcmd ${hexUp(w.subcmd, 2)}`).toBe(
+          row?.channel === 'auth',
         );
       }
+    }
+  });
+
+  it('reads 31 blocks, 0x14010000..0x141FFFFF, on the 2016-2017 Compact PRO', () => {
+    for (const v of ['1.0.3.0', '1.0.3.2']) {
+      const plan = legacyWindowPlan(v);
+      expect(plan.windows.map((w) => w.address)).toEqual(
+        allWindowAddresses().filter((a) => a >= 0x14010000 && a < 0x14200000),
+      );
+      expect(plan.windows.filter((w) => w.auth === true).map((w) => w.subcmd)).toEqual([
+        3, 5, 6, 7, 8, 9,
+      ]);
+      expect(plan.windows.find((w) => w.address === 0x140c0000)?.subcmd).toBe(0x0e);
+      expect(plan.unreachable.map((g) => g.address)).toEqual([FLASH_BASE, 0x14200000]);
+      expect(plan.unreachable[0]?.reason).toMatch(/refuses mode 2 outright/);
+    }
+  });
+
+  it('never reads 0x140C0000 on a 2014 build, whose table sends 0x0E to 0x140B0000', () => {
+    for (const v of [
+      '0.8.0.0',
+      '0.9.0.2',
+      '0.9.0.6',
+      '0.9.0.7',
+      '0.9.1.0',
+      '0.10.0.0',
+      '1.0.0.0',
+      '1.2.0.0',
+      '1.3.0.0',
+    ]) {
+      const plan = legacyWindowPlan(v);
+      expect(plan.selectors.find((r) => r.subcmd === 0x0e)?.address, v).toBe(0x140b0000);
+      expect(
+        plan.windows.some((w) => w.address === 0x140c0000),
+        v,
+      ).toBe(false);
+      expect(
+        plan.windows.some((w) => w.subcmd === 0x0e),
+        v,
+      ).toBe(false);
+      expect(plan.windows.find((w) => w.address === 0x140b0000)?.subcmd, v).toBe(0x0d);
+      const gap = plan.unreachable.find((g) => g.address === 0x140c0000);
+      expect(gap?.reason, v).toMatch(/gives subcommand 0x0E the address 0x140B0000/);
+    }
+  });
+
+  it('reads the bootloader block with the token only where the build has no mode-2 refusal', () => {
+    for (const v of [
+      '0.9.0.2',
+      '0.9.0.6',
+      '0.9.0.7',
+      '0.9.1.0',
+      '0.10.0.0',
+      '1.0.0.0',
+      '1.2.0.0',
+      '1.3.0.0',
+    ]) {
+      const boot = legacyWindowPlan(v).windows.find((w) => w.address === FLASH_BASE);
+      expect(boot?.subcmd, v).toBe(2);
+      expect(boot?.auth, v).toBe(true);
+      expect(legacyWindowPlan(v).windows, v).toHaveLength(31);
+    }
+    /* 0.8.0.0 loads THROUGH the word at 0x14000000; 1.3.0.8 differs by build. */
+    expect(legacyWindowPlan('0.8.0.0').unreachable[0]?.reason).toMatch(/not a flash window/);
+    expect(legacyWindowPlan('1.3.0.8').unreachable[0]?.reason).toMatch(/16 Hz build .* 8 Hz/);
+    expect(legacyWindowPlan('1.3.0.8').windows).toHaveLength(31);
+  });
+
+  it('reads 0x14020000 through subcommand 4 on 0.8.0.0, whose subcommand 1 is computed', () => {
+    const plan = legacyWindowPlan('0.8.0.0');
+    expect(plan.selectors.find((r) => r.subcmd === 1)?.address).toBeNull();
+    const config = plan.windows.find((w) => w.address === 0x14020000);
+    expect(config?.subcmd).toBe(4);
+    expect(config?.auth).toBe(true);
+    expect(plan.windows).toHaveLength(30);
+  });
+
+  it('plans nothing for a build with no read handler, and says so', () => {
+    for (const v of ['0.7.0.7', '0.7.0.8', '0.3.0.1']) {
+      const plan = legacyWindowPlan(v);
+      expect(plan.windows, v).toEqual([]);
+      expect(
+        plan.unreachable.map((g) => [g.address, g.length]),
+        v,
+      ).toEqual([[FLASH_BASE, FLASH_SIZE]]);
+      expect(plan.unreachable[0]?.reason, v).toMatch(/no read handler/);
+    }
+  });
+
+  it('falls back to the agreed rows for a build it has not decoded', () => {
+    const unknown = legacyWindowPlan('1.1.0.0');
+    expect(unknown.windows).toEqual(legacyWindowPlan(null).windows);
+    expect(unknown.table).toMatch(/1\.1\.0\.0 is not a build whose table has been decoded/);
+  });
+
+  it('gives compact-2016 exactly the plan legacy-auth gives, build for build', () => {
+    for (const v of [...LEGACY_KNOWN_VERSIONS, null]) {
+      expect(compact2016.windowPlan(v)).toEqual(legacyAuth.windowPlan(v));
     }
   });
 });

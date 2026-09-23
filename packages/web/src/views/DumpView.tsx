@@ -163,9 +163,10 @@ export function DumpView({
             recovered from a Compact PRO (PIR324) unit. On firmware with a different token the
             protected banks just stall and are gap-filled — the same result as the normal dump, and
             still safe. The app images come through <em>encrypted</em> (the key&apos;s boot bank at{' '}
-            <code>0x14000000</code> stays blocked on every channel), but that no longer matters:
-            decryption recovers the key from each encrypted image itself, so any slot that is
-            actually captured still decrypts here.
+            <code>0x14000000</code> is refused on the 2016-2017 builds, and read with the token on
+            the 2014 ones from 0.9.0.2), but that no longer matters: decryption recovers the key
+            from each encrypted image itself, so any slot that is actually captured still decrypts
+            here.
           </p>
         </Prose>
 
