@@ -351,6 +351,13 @@ export interface StartOptions {
  *  backstop, not a wait: a healthy one exits in well under a second. */
 const STOP_GRACE_MS = 30_000;
 
+/** How long an emulator whose run has ended on its own gets to finish printing before
+ *  `stop()` sends SIGTERM. Its summary and its `fault:` line come AFTER the `stopped:`
+ *  line the death is noticed on, and by then `seek_emu.py` has put SIGTERM back to the
+ *  default action, so a prompt SIGTERM cuts the diagnosis off. A backstop, not a wait:
+ *  it exits by itself within milliseconds. */
+const DEATH_GRACE_MS = 3_000;
+
 /** What `startOnce` wires to the child's output and exit before the `Emulator`
  *  object exists; the constructor fills the two hooks in. */
 interface ChildWatch {
@@ -815,6 +822,14 @@ export class Emulator {
     if (this.stopped) return;
     this.stopped = true;
     live.delete(this.child);
+    if (this.deathReason !== null && this.alive) {
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        this.closed,
+        new Promise((resolve) => (timer = setTimeout(resolve, DEATH_GRACE_MS))),
+      ]);
+      clearTimeout(timer);
+    }
     if (this.child.exitCode !== null || this.child.signalCode !== null) {
       this.diedOnItsOwn = true;
       this.markDead(

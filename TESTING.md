@@ -2393,6 +2393,11 @@ What happens then:
   death the race did not see (the socket can close a moment before the line is read) still fails
   the row when it is audited, before anything is recorded or compared — in both modes, so the
   regenerator cannot turn it into a gap either.
+- `stop()` gives an emulator that is already dying up to 3 s (`DEATH_GRACE_MS`, a backstop — it
+  exits within milliseconds) to finish printing before it sends SIGTERM: its summary and its
+  `fault:` line come after the `stopped:` line the death is noticed on, and by then `seek_emu.py`
+  has put SIGTERM back to the default action, so a prompt SIGTERM cut the fault address out of the
+  defect's message (seen on one of the two Nano 300 rows in the control run of §15.3).
 - `measureRow` rethrows `InfrastructureDefect` (as it already did `HarnessFidelityError`) instead
   of turning it into a gap. Tier 1's `ProbeUnmeasurable` re-draw now covers only a camera that
   stopped answering while its emulator kept running; tier 2's attempts loop, which existed only
