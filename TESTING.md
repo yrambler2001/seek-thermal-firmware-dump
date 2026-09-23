@@ -1324,11 +1324,14 @@ window is misplaced on any row.**
 **One row group is a finding, pinned as measured:** 0.5.1.0 and 0.5.1.3 stall every vendor
 request for a while after enumeration on the emulator — `GetFirmwareInfo` and
 `GetErrorCode` included, over USB/IP and in-process — so no version is known when the plan
-is made. The probe's plain arm of 5 is then refused, `legacy-auth` wins on that, and the
-plan is the version-unknown one: 30 windows, all unread. The dump would read nothing, and
-nothing unsafe is sent (0x52 is `BeginFirmwareUpgrade` on those builds). The version gate
-treats an unknown version as not old; on a 0.3.0.1 that did not answer `GetFirmwareInfo` it
-would therefore not engage. Whether a real 0.5.1.x camera behaves like this is not known.
+is made. The probe's plain arm of 5 is then "refused" too, as every request is at that
+point, and `legacy-auth` wins on that refusal. The plan is the version-unknown one: 30
+windows, all unread. The dump would read nothing, and nothing unsafe is sent (0x52 is
+`BeginFirmwareUpgrade` on those builds). The version gate treats an unknown version as not
+old, and the probe cannot tell "refused the plain arm" from "refused everything"; on a
+0.3.0.1 that did not answer `GetFirmwareInfo` the gate would therefore not engage. Whether a
+real 0.5.1.x camera behaves like this is not known.
+`scripts/selector-tables/early_version_read.ts` reproduces it (0.5.0.2 is the control).
 
 ### 10.5 The measurements
 
@@ -1355,7 +1358,8 @@ design. No standard request stalled.
 ### 10.6 Still open
 
 - **The version gate cannot see a build that does not answer `GetFirmwareInfo`** (§10.4,
-  0.5.1.x). Refusing unknown versions would stop every camera that is slow to answer it.
+  0.5.1.x), and a plain arm refused along with every other request reads as the legacy
+  line's lock. Refusing unknown versions would stop every camera that is slow to answer.
 - **1.3.0.8 8 Hz could give its bootloader block** (no mode-2 test), but the version does not
   tell it from the 16 Hz build. The build string might.
 - **0.8.0.0's mode 1 on a real 2014 bootloader** is unmeasured; the plan does not use it.

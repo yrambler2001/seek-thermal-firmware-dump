@@ -18,6 +18,9 @@ export default defineConfig([
        * into the USB/IP adapter's private session through `any` and load the toolkit by
        * computed dynamic import. scripts/recipient-fidelity/README.md has the reason. */
       'scripts/recipient-fidelity/**',
+      /* The same kind of instrument, for the same reason: it loads the toolkit and the
+       * emulator harness by computed dynamic import. scripts/selector-tables/README.md. */
+      'scripts/selector-tables/**',
     ],
   },
 
