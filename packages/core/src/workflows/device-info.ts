@@ -59,7 +59,9 @@ import {
   type DumpOptions,
   type SlotState,
   type WorkflowContext,
+  warnIfRecipientFellBack,
 } from './types.js';
+import { planForDevice } from './window-plan.js';
 
 /** Bytes of the bootloader block scanned for the key table. */
 const BOOT_BLOCK_BYTES = 0x8000;
@@ -253,15 +255,22 @@ export async function readDeviceInfo(
     armedBanks.push(entry);
   };
 
-  reporter.log('firmware info selectors ...', 'detail');
-  const build = await device.tryFwInfo(0, 36, 'build info');
-  const version =
-    build && build.length >= 4 ? [build[0], build[1], build[2], build[3]].join('.') : null;
-  const buildString = build && build.length >= 4 ? asciiz(build.subarray(4)) : null;
-  /* Every arm below goes through THIS build's own table, resolved from the
-   * version just read, as a dump's does (`planForDevice`). */
-  const entries = profile.windowPlan(version).windows;
+  /* THE BUILD FIRST, AND NOTHING ELSE UNTIL IT IS KNOWN. This read used to
+   * open with `tryFwInfo(0)` — SetFirmwareInfoFeatures, a SETTER — and to arm
+   * the boot config, the bootloader block and the slots whatever the version
+   * said, or whether it said anything: on 0.3.0.1 every one of those arms is
+   * `EnterBootloaderMode`. It now goes through the dump's own gate: one
+   * unarmed GetFirmwareInfo (in `SAFE_BEFORE_IDENTITY`), a refusal for no
+   * version or a build that predates the dump protocol, and otherwise THIS
+   * build's own table for every arm below. Selector 0 of GetFirmwareInfo is
+   * the build block, so the unarmed read is the same bytes `tryFwInfo(0)` got. */
+  const { firmware, plan } = await planForDevice(ctx, 'read the device info');
+  const version = firmware.version;
+  const buildString = firmware.buildString;
+  const entries = plan.windows;
+  warnIfRecipientFellBack(ctx);
 
+  reporter.log('firmware info selectors ...', 'detail');
   const boot = await device.tryFwInfo(1, 36, 'bootloader info');
   const bootloaderVersion =
     boot && boot.length >= 4 ? [boot[0], boot[1], boot[2], boot[3]].join('.') : null;

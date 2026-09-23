@@ -48,6 +48,7 @@ import {
   transportInfoOf,
   unlockTokenOf,
   usesAuthChannel,
+  warnIfRecipientFellBack,
   type DumpOptions,
   type DumpResult,
   type WorkflowContext,
@@ -226,7 +227,9 @@ async function readWindowsInto(
     }
   } finally {
     /* The original released the interface here so a standalone dump leaves the
-     * camera to the OS. The flash path reopens before it writes. */
+     * camera to the OS. The flash path reopens before it writes. After this
+     * the transport reports `claimedInterface: false`, which is why `runDump`
+     * takes the manifest's transport record BEFORE the read, not after it. */
     await device.transport.close();
   }
 
@@ -272,6 +275,14 @@ export async function runDump(
    * for a build with no read handler before anything is armed. */
   const { firmware, plan } = await planForDevice(ctx, 'dump');
   const entries = plan.windows;
+  /* THE TRANSPORT THE WINDOWS ARE READ OVER, recorded while it is open. The
+   * manifest used to take it after `readWindowsInto` had closed the transport,
+   * so it said `claimedInterface: false` on every dump. The recipient cannot
+   * change after this point — `WebUsbTransport` decides it once and a reopen
+   * that cannot re-claim fails the dump — so one snapshot describes every
+   * window. */
+  const transport = transportInfoOf(device.transport.info);
+  warnIfRecipientFellBack(ctx);
   const legacy = usesAuthChannel(entries);
   const unlockToken = unlockTokenOf(entries);
 
@@ -308,7 +319,8 @@ export async function runDump(
     'detail',
   );
   reporter.log(
-    `transport: vendor control, recipient=${device.transport.info.recipient}, ` +
+    `transport: vendor control, recipient=${transport.recipient}` +
+      `${transport.claimedInterface ? ' (interface claimed)' : ''}, ` +
       `chunk=${String(args.chunk)} B, retries=${String(args.retries)}`,
     'detail',
   );
@@ -376,7 +388,7 @@ export async function runDump(
     chunk: args.chunk,
     gapFill: args.gapFill,
     producer: `seek-thermal-firmware-dump (${device.transport.info.api}, ${profile.id})`,
-    transport: transportInfoOf(device.transport.info),
+    transport,
     safety: legacy ? SAFETY_AUTH : SAFETY_STANDARD,
     windows: records,
     gaps,

@@ -90,6 +90,37 @@ export const READ_ONLY_OPS: ReadonlySet<Opcode> = new Set<Opcode>([
   OP.GET_FIRMWARE_INFO,
 ]);
 
+/**
+ * The ONLY requests this toolkit sends before the camera has told it which
+ * firmware it runs — and each only as a control IN.
+ *
+ * A wire id is an index into each build's own RPC method table, and the tables
+ * are not the same: on Compact 0.3.0.1 wire id 0x52, the selector arm, is
+ * `EnterBootloaderMode`. So until `GetFirmwareInfo` has come back with a
+ * version, a request is safe only if it means the same READ on every image
+ * there is. Built from `test/firmware/facts.json` (all 36 decrypted corpus
+ * images, 0.3.0.1 to 44.27.3.10): the wire ids whose method-table row has the
+ * same name on every image, a getter, and nothing in the setter column. There
+ * are ten —
+ *
+ *   0x35 GetErrorCode      0x36 GetChipID       0x39 GetShutterPolarity
+ *   0x3D GetOperationMode  0x3F GetIPMode       0x41 GetDataPage
+ *   0x44 GetCurrentCmd     0x47 GetDefaultCmd   0x4D GetRDAC
+ *   0x4E GetFirmwareInfo
+ *
+ * — and this toolkit needs three of them. Everything else it sends differs
+ * somewhere: 0x52 and 0x4F change meaning, and 0x3C and 0x55 are the same name
+ * everywhere but are setters. `identity-gate.test.ts` re-derives the ten from
+ * the facts on every run, pins them, and holds this set to them; it also runs
+ * every entry point against a camera whose version does not come back and
+ * checks that nothing outside this set went on the wire.
+ */
+export const SAFE_BEFORE_IDENTITY: ReadonlySet<Opcode> = new Set<Opcode>([
+  OP.GET_ERROR_CODE,
+  OP.GET_OPERATION_MODE,
+  OP.GET_FIRMWARE_INFO,
+]);
+
 /** Every opcode that can change the camera, plus the info reads that only the
  *  flash path needs. Nothing in here may ever run during a dump. */
 export const FLASH_OPS: ReadonlySet<Opcode> = new Set<Opcode>([
@@ -155,7 +186,73 @@ export const USB_TIMEOUT_MS = 5000;
  */
 export const USB_PROBE_TIMEOUT_MS = 1500;
 
-/** CompleteMemoryUpgrade erases and programs inside the transfer. */
+/* ---- CompleteMemoryUpgrade: how long the ONE transfer can take --------- *
+ *
+ * The firmware erases, programs and verifies inside the request, and only then
+ * completes the transfer. What it does there, for the flash path's selector 0
+ * (data type 0), is the same in all eight FW-V1 reconstructions of a writable
+ * build — `cmd_CompleteMemoryUpgrade` (targets/compact_pro_ff/src/rpc_cmds.c)
+ * calling `fw_validate_decrypt_program` and `update_write_boot_config`
+ * (targets/compact_pro_ff/src/update.c):
+ *
+ *   1. sum the staged bytes and compare with the host's checksum      CPU
+ *   2. decrypt with Key A, re-encrypt with the device's key          CPU
+ *   3. erase the slot's 64 KiB block (`flash_erase_block`: unlock, one
+ *      block erase, read the block back to check it is all 0xFF)      flash
+ *   4. erase the NEXT block too, only if the length exceeds 0x10000    flash
+ *   5. program the image, at most 65,536 B = 256 pages of 256 B      flash
+ *   6. read it back and compare                                      CPU
+ *   7. erase the boot-config block at 0x14010000                     flash
+ *   8. program the 284-byte boot record: 2 pages                     flash
+ *   9. read it back and compare                                      CPU
+ *
+ * Step 4 cannot run on the path this toolkit uses — BeginFirmwareUpgrade sets
+ * the staging capacity to FLASH_BLOCK_BYTES (0x10000) and SetFeaturedFirmwareData
+ * refuses to stage past it — but it is in the code, so the bound counts it,
+ * and counts step 5 as 128 KiB (512 pages) to go with it.
+ *
+ * The part is a Winbond W25Q32FV (the firmware's own SPIFI device table: JEDEC
+ * EF 40 16, 64 blocks of 64 KiB, 256-byte pages). Its datasheet, rev. J of
+ * 2016-06-03, sec.9.6 "AC Electrical Characteristics", MAX column:
+ * tBE2 (64 KB block erase) 2,000 ms, tPP (page program) 3 ms, tW (write status
+ * register) 15 ms. Typical values are 150 ms, 0.7 ms and 10 ms.
+ *
+ *   block erases       3 x 2,000 ms                          = 6,000 ms
+ *   page programs    514 x     3 ms   (512 image + 2 record) = 1,542 ms
+ *   status writes      5 x    15 ms   (one per erase/program,
+ *                                      counted, not verified) =    75 ms
+ *   CPU work: two cipher passes and a sum over 64 KiB, three read-backs —
+ *   single-digit milliseconds at the LPC43xx clock; an allowance of      500 ms
+ *                                                              ---------
+ *   worst case, every operation at its datasheet maximum        8,117 ms
+ *
+ * The path that can actually run (2 erases, 258 pages, 4 status writes) is
+ * 5,334 ms at the maximums and about 0.52 s at the typical values.
+ *
+ * The deadline is TWICE the 8,117 ms bound, rounded up to a whole 5 s: 20 s,
+ * the value this constant already had. It was right and was not being honoured:
+ * under the CLI the `usb` package gave the transfer its own 1,000 ms default,
+ * below the 5.3 s the reachable path can take (TESTING.md sec.11). The
+ * transport now hands this number to the host stack, and in a browser, which
+ * has no per-transfer timeout, it is the transport's own timer — so on either
+ * host nothing ends a commit sooner than 20 s.
+ */
+const W25Q32FV_BLOCK_ERASE_64K_MAX_MS = 2000; /* tBE2 */
+const W25Q32FV_PAGE_PROGRAM_MAX_MS = 3; /* tPP, one 256-byte page */
+const W25Q32FV_WRITE_STATUS_MAX_MS = 15; /* tW */
+const COMMIT_BLOCK_ERASES = 3;
+const COMMIT_PAGE_PROGRAMS = 512 + 2;
+const COMMIT_STATUS_WRITES = 5;
+const COMMIT_CPU_ALLOWANCE_MS = 500;
+
+/** The longest `CompleteMemoryUpgrade` can take, from the firmware's steps and the datasheet. */
+export const COMMIT_WORST_CASE_MS =
+  COMMIT_BLOCK_ERASES * W25Q32FV_BLOCK_ERASE_64K_MAX_MS +
+  COMMIT_PAGE_PROGRAMS * W25Q32FV_PAGE_PROGRAM_MAX_MS +
+  COMMIT_STATUS_WRITES * W25Q32FV_WRITE_STATUS_MAX_MS +
+  COMMIT_CPU_ALLOWANCE_MS;
+
+/** CompleteMemoryUpgrade erases and programs inside the transfer: 2 x the worst case, rounded up. */
 export const USB_COMMIT_TIMEOUT_MS = 20000;
 
 /** How long to let a camera finish leaving imaging mode. */

@@ -3,8 +3,10 @@
  *
  * The `usb` package ships a WebUSB-shaped API, and core's `WebUsbTransport`
  * already speaks that shape — so this file contains no protocol code at all.
- * It finds Seek devices, wraps each one in the transport core exports, and
- * turns libusb's permission failures into the udev advice from the README.
+ * It finds Seek devices, wraps each one in the transport core exports — through
+ * `fromNodeUsb`, which corrects the four places `usb` 3.x behaves unlike WebUSB
+ * (timeouts, stalls, an unconfigured device, a refused claim) — and turns the
+ * host's permission failures into the udev advice from the README.
  *
  * `usb` is imported DYNAMICALLY: it is a native addon, and `seek-fw decrypt`
  * must keep working on a machine with no camera, no udev rule and no
@@ -17,9 +19,11 @@ import {
   type RecipientPreference,
   type UsbBackend,
   type UsbTransport,
-  type WebUsbDevice,
 } from '@seek-fw/core';
 import { CliError, looksLikeAccessError, permissionHint } from './errors.js';
+import { fromNodeUsb, type NodeUsbDevice } from './node-usb.js';
+
+export type { NodeUsbDevice } from './node-usb.js';
 
 /** Recorded in every dump manifest, so a capture says which host read it. */
 export const CLI_TRANSPORT_API = 'node-usb 3.x (WebUSB shim)';
@@ -29,19 +33,19 @@ export function hostString(): string {
 }
 
 /** The camera enumeration a backend performs, injectable for tests. */
-export type Enumerate = () => Promise<readonly WebUsbDevice[]>;
+export type Enumerate = () => Promise<readonly NodeUsbDevice[]>;
 
 export interface BackendOptions {
   readonly recipient?: RecipientPreference;
-  /** Called when the interface could not be claimed and 'auto' fell back. */
+  /** Called when the OS refused the claim on interface 0 and 'auto' fell back. */
   readonly onWarning?: (message: string) => void;
   /** Replaces the real `usb` enumeration. Tests pass fake devices here. */
   readonly enumerate?: Enumerate;
 }
 
 /** Enumerates through the `usb` package's WebUSB shim. No user prompt in Node. */
-export async function enumerateSeekDevices(): Promise<readonly WebUsbDevice[]> {
-  let devices: readonly WebUsbDevice[];
+export async function enumerateSeekDevices(): Promise<readonly NodeUsbDevice[]> {
+  let devices: readonly NodeUsbDevice[];
   try {
     const { WebUSB } = await import('usb');
     const webusb = new WebUSB({ allowAllDevices: true });
@@ -92,8 +96,8 @@ export class NodeUsbBackend implements UsbBackend {
     return first;
   }
 
-  private wrap(device: WebUsbDevice): UsbTransport {
-    return new WebUsbTransport(device, {
+  private wrap(device: NodeUsbDevice): UsbTransport {
+    return new WebUsbTransport(fromNodeUsb(device), {
       recipient: this.recipient,
       api: CLI_TRANSPORT_API,
       host: hostString(),

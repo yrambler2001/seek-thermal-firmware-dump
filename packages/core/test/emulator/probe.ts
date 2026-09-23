@@ -13,16 +13,28 @@
 import { readFileSync } from 'node:fs';
 
 import { SeekError } from '../../src/errors.js';
+import { silentReporter } from '../../src/events.js';
 import { SeekDevice } from '../../src/protocol/client.js';
 import { OP } from '../../src/protocol/ops.js';
+import type {
+  DeviceDescription,
+  TransportInfo,
+  UsbTransport,
+} from '../../src/protocol/transport.js';
 import { WebUsbTransport } from '../../src/protocol/webusb.js';
 import { authPayload } from '../../src/profiles/legacy-auth.js';
 import { buildModernWindowMap, FLASH_BASE } from '../../src/profiles/modern-4x.js';
 import { detectProfile } from '../../src/profiles/registry.js';
 import type { DeviceEvidence, WindowEntry } from '../../src/profiles/types.js';
-import { predatesDumpProtocol, readRunningFirmware } from '../../src/workflows/capability.js';
+import {
+  evidenceFromChannelProbe,
+  identityGate,
+  probeSelectorChannel,
+  readRunningFirmware,
+} from '../../src/workflows/capability.js';
+import { runDump } from '../../src/workflows/dump.js';
 import type { Emulator } from './harness.js';
-import { assertRealHostPath } from './webusb-over-usbip.js';
+import { assertRealHostPath, type UsbIpWebUsbDevice } from './webusb-over-usbip.js';
 
 const HEX = (n: number, w = 2): string => `0x${n.toString(16).toUpperCase().padStart(w, '0')}`;
 
@@ -241,6 +253,39 @@ export interface AuthProbe {
   readonly subcmd: number;
 }
 
+/**
+ * THE TOOLKIT'S OWN FIRST CONTACT, run as the CLI's `dump` runs it, and what it
+ * put on the wire before it knew which firmware it was talking to.
+ *
+ * Everything else in this row is the INSTRUMENT asking — it arms all 63 modern
+ * selectors on every firmware, which is the point of a measurement and would be
+ * reckless from a tool. This is the tool: `probeSelectorChannel`, the same
+ * `detectProfile` over the same evidence `chooseProfileByProbe` hands it, then
+ * `runDump`. The dump runs with its signal already aborted, so a dump that
+ * plans stops at the head of its window loop, before its first arm; a dump
+ * that refuses throws first. Either way the record says which.
+ *
+ * `sentBeforeIdentity` is every distinct request that went out before a
+ * GetFirmwareInfo came back with a version (four bytes or more), in the order
+ * first sent. The rule it is held to (TESTING.md sec.11): only control INs of
+ * `SAFE_BEFORE_IDENTITY`. On Compact 0.5.1.0 and 0.5.1.3 the version never
+ * comes back on the emulator, so that list is everything the toolkit sent.
+ */
+export interface GateProbe {
+  /** What the probe's version read — the toolkit's first request — returned. */
+  readonly firmwareVersion: string | null;
+  /**
+   * Whether ANY GetFirmwareInfo of this first contact came back with a version:
+   * the probe's, or the dump's own read after it. 0.6.0.4 does not answer the
+   * first and answers the second.
+   */
+  readonly identified: boolean;
+  readonly profile: string;
+  /** `<code>: <message>` of the dump's refusal, or null when it planned a read. */
+  readonly refusal: string | null;
+  readonly sentBeforeIdentity: readonly string[];
+}
+
 export interface Tier1Result {
   readonly entryId: string;
   readonly identity: IdentityProbe;
@@ -250,6 +295,8 @@ export interface Tier1Result {
   readonly auth: AuthProbe;
   /** The dump's own plan for this firmware, measured window by window. */
   readonly plan: PlanProbe;
+  /** The toolkit's own first contact, and what it sent before identity. */
+  readonly gate: GateProbe;
   /** Bytes actually returned for a control IN of each probed size. */
   readonly controlInBytes: Readonly<Record<string, number | null>>;
   /** sha256 of the 4 MiB image the emulator says it is serving. */
@@ -316,6 +363,118 @@ function sameAt(hay: Uint8Array, offset: number, got: Uint8Array): boolean {
   if (offset < 0 || offset + got.length > hay.length) return false;
   for (let i = 0; i < got.length; i++) if (hay[offset + i] !== got[i]) return false;
   return true;
+}
+
+/**
+ * A pass-through `UsbTransport` that notes each request until the camera has
+ * named its build. The instrument's own record, not the toolkit's: it decides
+ * "identified" by the same criterion `readRunningFirmware` uses.
+ */
+class IdentityRecorder implements UsbTransport {
+  readonly sentBeforeIdentity: string[] = [];
+  identified = false;
+  private readonly inner: UsbTransport;
+
+  constructor(inner: UsbTransport) {
+    this.inner = inner;
+  }
+
+  get description(): DeviceDescription {
+    return this.inner.description;
+  }
+
+  get info(): TransportInfo {
+    return this.inner.info;
+  }
+
+  get isOpen(): boolean {
+    return this.inner.isOpen;
+  }
+
+  open(): Promise<void> {
+    return this.inner.open();
+  }
+
+  close(): Promise<void> {
+    return this.inner.close();
+  }
+
+  async controlIn(request: number, length: number, timeoutMs: number): Promise<Uint8Array> {
+    this.note('IN', request);
+    const data = await this.inner.controlIn(request, length, timeoutMs);
+    if (request === OP.GET_FIRMWARE_INFO && data.length >= 4) this.identified = true;
+    return data;
+  }
+
+  controlOut(request: number, data: Uint8Array, timeoutMs: number): Promise<void> {
+    this.note('OUT', request);
+    return this.inner.controlOut(request, data, timeoutMs);
+  }
+
+  private note(direction: 'IN' | 'OUT', request: number): void {
+    if (this.identified) return;
+    const key = `${direction} ${HEX(request)}`;
+    if (!this.sentBeforeIdentity.includes(key)) this.sentBeforeIdentity.push(key);
+  }
+}
+
+/**
+ * `GateProbe`, measured on a transport of its own over the same device, so the
+ * row's main transport and its real-host-path check are untouched. The dump
+ * closes the device when it plans; the caller reopens its own transport after.
+ */
+async function probeGate(device: UsbIpWebUsbDevice, entryId: string): Promise<GateProbe> {
+  const transport = new WebUsbTransport(device, {
+    recipient: 'auto',
+    api: 'usbip (emulator)',
+    host: 'vitest',
+  });
+  await transport.open();
+  assertRealHostPath(device, transport.info, `${entryId}: toolkit first contact`);
+  const recorder = new IdentityRecorder(transport);
+  try {
+    const probe = await probeSelectorChannel(new SeekDevice(recorder));
+    const description = recorder.description;
+    const evidence: DeviceEvidence = {
+      ...(description.productName === null ? {} : { productName: description.productName }),
+      vendorId: description.vendorId,
+      productId: description.productId,
+      ...evidenceFromChannelProbe(probe),
+    };
+    const profile = detectProfile(evidence).best.profile;
+    const stop = new AbortController();
+    stop.abort();
+    let refusal: string | null = null;
+    try {
+      await runDump(
+        {
+          device: new SeekDevice(recorder, { signal: stop.signal }),
+          profile,
+          detection: null,
+          reporter: silentReporter,
+          signal: stop.signal,
+        },
+        { decrypt: false },
+      );
+    } catch (error) {
+      if (
+        !(error instanceof SeekError) ||
+        (error.code !== 'device/version-unknown' && error.code !== 'profile/unsupported')
+      ) {
+        throw error;
+      }
+      refusal = `${error.code}: ${error.message}`;
+    }
+    return {
+      firmwareVersion: probe.firmwareVersion,
+      identified: recorder.identified,
+      profile: profile.id,
+      refusal,
+      sentBeforeIdentity: [...recorder.sentBeforeIdentity],
+    };
+  } finally {
+    await transport.close().catch(() => undefined);
+  }
 }
 
 export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<Tier1Result> {
@@ -498,6 +657,19 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
      * claim and the transport silently measured device recipient instead
      * (TESTING.md sec.9.9); that is now a failure, not a quiet fallback. */
     assertRealHostPath(device, transport.info, `${emu.entryId}: first open()`);
+
+    /* ---- the toolkit's own first contact, FIRST ----
+     * A CLI run meets the camera fresh, so this is measured before anything
+     * else is asked. It was measured LAST at first, and that was not first
+     * contact: the command probe's SetFirmwareInfoFeatures(1) leaves the info
+     * selector at 1, so the unarmed GetFirmwareInfo read the BOOTLOADER's
+     * version (2.0.2.3 on 4.8.1.7), and on the 4.8.1.7 and 4.16.1.7 images
+     * the probe's window read that late in a row faulted the emulator
+     * (unmapped 0x35202088 at PC 0x100078F0), which a fresh emulator does not
+     * (TESTING.md sec.11.8). On its own transport over the same device; the dump
+     * closes the device when it plans, so this row's transport is reopened. */
+    const toolkit = await probeGate(device, emu.entryId);
+    await recover();
     wasAnswering = await answersSomething();
 
     const identity: IdentityProbe = {
@@ -519,7 +691,9 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
 
     /* ORDER MATTERS AND IS NOT ARBITRARY.
      * The selector map is the measurement this whole tier exists for, so it runs
-     * FIRST, before anything that could wedge the control endpoint. The command
+     * first of the instrument's own questions — only the toolkit's first contact
+     * above precedes it, as it precedes everything on a real host — and before
+     * anything that could wedge the control endpoint. The command
      * probe deliberately sends things the firmware may refuse — an unarmed
      * GetFeaturedFirmwareData stalls by design — so it runs LAST, where a wedge
      * costs one recorded outcome instead of the whole row. */
@@ -682,21 +856,29 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
      * again; its measurement is reused and marked so. */
     await recover();
     const running = await readRunningFirmware(seek);
+    /* THE TOOLKIT'S OWN RULE decides what the CLI would have observed:
+     * `identityGate`, the gate `probeSelectorChannel` and `planForDevice` both
+     * apply. A build that predates the dump protocol, or one that did not say
+     * which build it is, gets no arm from the CLI — so no channel observation
+     * goes into the evidence and no plan is made. (Until sec.11 an unknown
+     * version counted as "not old": the CLI armed, 0.5.1.x's stall read as the
+     * legacy lock refusing, and legacy-auth won on it.) */
+    const gate = identityGate(running);
     const evidence: DeviceEvidence = {
       ...(running.version === null ? {} : { firmwareVersion: running.version }),
-      ...(predatesDumpProtocol(running.version)
-        ? {}
-        : {
+      ...(gate.permitsArming
+        ? {
             plainSelectorWorks: auth.plainAccepted,
             plainSelectorRefused: !auth.plainAccepted,
             authSelectorWorks: auth.authAccepted,
-          }),
+          }
+        : {}),
     };
     const planProfile = detectProfile(evidence).best.profile;
-    const dumps = planProfile.capabilities.dump.supported && !predatesDumpProtocol(running.version);
-    const dumpPlan = planProfile.windowPlan(running.version);
+    const dumps = planProfile.capabilities.dump.supported && gate.permitsArming;
+    const dumpPlan = running.version === null ? null : planProfile.windowPlan(running.version);
     const planWindows: PlanWindowProbe[] = [];
-    for (const entry of dumps ? dumpPlan.windows : []) {
+    for (const entry of dumps && dumpPlan !== null ? dumpPlan.windows : []) {
       const already =
         entry.payload === undefined
           ? windows.find(
@@ -716,9 +898,9 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
       firmwareVersion: running.version,
       profile: planProfile.id,
       dumps,
-      table: dumpPlan.table,
+      table: dumpPlan?.table ?? 'none: no plan is made without the firmware version',
       windows: planWindows,
-      gaps: dumpPlan.unreachable.map((u) => HEX(u.address, 8)),
+      gaps: dumpPlan?.unreachable.map((u) => HEX(u.address, 8)) ?? [],
     };
 
     /* ---- which commands answer ---- */
@@ -776,6 +958,7 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
       windows,
       auth,
       plan,
+      gate: toolkit,
       controlInBytes,
       servedSha256: emu.ready.flash_sha256,
       fillSeed: emu.ready.fill?.seed ?? null,

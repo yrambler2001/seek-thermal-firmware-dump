@@ -6,10 +6,12 @@ import { collectingReporter } from '../src/events.js';
 import { SeekDevice, u16Payload } from '../src/protocol/client.js';
 import {
   assertOpSetsDisjoint,
+  COMMIT_WORST_CASE_MS,
   FLASH_OPS,
   MIN_READ_CHUNK,
   OP,
   READ_ONLY_OPS,
+  USB_COMMIT_TIMEOUT_MS,
   WINDOW_SIZE,
 } from '../src/protocol/ops.js';
 import type { WindowEntry } from '../src/profiles/types.js';
@@ -319,6 +321,8 @@ interface StubOptions {
   /** Never settles, like a camera that has simply stopped answering. */
   readonly hang?: boolean;
   readonly claimFails?: boolean;
+  /** What a failing claim rejects with. Default: a plain Error('Access denied'). */
+  readonly claimError?: Error;
 }
 
 function stubDevice(options: StubOptions = {}): WebUsbDevice & { setups: unknown[] } {
@@ -345,7 +349,9 @@ function stubDevice(options: StubOptions = {}): WebUsbDevice & { setups: unknown
     },
     selectConfiguration: () => Promise.resolve(),
     claimInterface: () =>
-      options.claimFails === true ? Promise.reject(new Error('Access denied')) : Promise.resolve(),
+      options.claimFails === true
+        ? Promise.reject(options.claimError ?? new Error('Access denied'))
+        : Promise.resolve(),
     releaseInterface: () => Promise.resolve(),
     controlTransferIn: (setup) => {
       setups.push(setup);
@@ -406,8 +412,14 @@ describe('WebUsbTransport', () => {
       index: 1,
     });
 
+    /* The one claim failure 'auto' answers with device recipient: the platform
+     * refusing it (WebUSB's NetworkError). Any other failure is an error now —
+     * transport-session.test.ts. */
     const warnings: string[] = [];
-    const busy = stubDevice({ claimFails: true });
+    const busy = stubDevice({
+      claimFails: true,
+      claimError: new DOMException('Unable to claim interface.', 'NetworkError'),
+    });
     const fallback = new WebUsbTransport(busy, {
       recipient: 'auto',
       interfaceNumber: 1,
@@ -417,7 +429,8 @@ describe('WebUsbTransport', () => {
     await fallback.controlIn(OP.GET_ERROR_CODE, 4, 1000);
     expect(fallback.info.recipient).toBe('device');
     expect(fallback.info.claimedInterface).toBe(false);
-    expect(warnings[0]).toMatch(/using recipient=device instead/);
+    expect(warnings[0]).toMatch(/recipient=device/);
+    expect(fallback.info.recipientFallback).toBe(warnings[0]);
     expect(busy.setups[0]).toMatchObject({ recipient: 'device', index: 0 });
   });
 
@@ -430,6 +443,58 @@ describe('WebUsbTransport', () => {
     expect(error).toBeInstanceOf(SeekError);
     expect((error as SeekError).code).toBe('usb/not-open');
     expect((error as SeekError).message).toMatch(/another program or a system driver/);
+  });
+
+  it('gives the flash commit twice its worst case, worked out from the firmware and datasheet', () => {
+    /* ops.ts shows the arithmetic: 3 x 2,000 ms block erases + 514 x 3 ms page
+     * programs + 5 x 15 ms status writes + a 500 ms CPU allowance. */
+    expect(COMMIT_WORST_CASE_MS).toBe(3 * 2000 + 514 * 3 + 5 * 15 + 500);
+    expect(COMMIT_WORST_CASE_MS).toBe(8117);
+    expect(USB_COMMIT_TIMEOUT_MS).toBeGreaterThanOrEqual(2 * COMMIT_WORST_CASE_MS);
+  });
+
+  it('in a browser, lets a worst-case commit finish, and times out only at its own deadline', async () => {
+    /* WebUSB has no per-transfer timeout, so the transport's timer is the only
+     * one: it must not fire before USB_COMMIT_TIMEOUT_MS, and a commit that
+     * takes the worst case must complete. */
+    vi.useFakeTimers();
+    try {
+      let commitMs = COMMIT_WORST_CASE_MS;
+      const device: WebUsbDevice = {
+        ...stubDevice(),
+        controlTransferOut: (setup) =>
+          setup.request === OP.COMPLETE_MEMORY_UPGRADE
+            ? new Promise<WebUsbOutTransferResult>((resolve) => {
+                setTimeout(() => {
+                  resolve({ status: 'ok', bytesWritten: 2 });
+                }, commitMs);
+              })
+            : Promise.resolve({ status: 'ok', bytesWritten: 0 }),
+      };
+      const transport = new WebUsbTransport(device);
+      await transport.open();
+      const dev = new SeekDevice(transport);
+
+      const done = dev.completeMemoryUpgrade(0x1234).then(() => 'committed');
+      await vi.advanceTimersByTimeAsync(COMMIT_WORST_CASE_MS);
+      await expect(done).resolves.toBe('committed');
+
+      commitMs = 10 * USB_COMMIT_TIMEOUT_MS;
+      let settled: unknown = 'pending';
+      const hung = dev.completeMemoryUpgrade(0x1234).then(
+        () => 'committed',
+        (e: unknown) => e,
+      );
+      void hung.then((value) => (settled = value));
+      await vi.advanceTimersByTimeAsync(USB_COMMIT_TIMEOUT_MS - 1);
+      expect(settled).toBe('pending');
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBeInstanceOf(SeekError);
+      expect((settled as SeekError).code).toBe('usb/timeout');
+      expect((settled as SeekError).message).toContain(`${String(USB_COMMIT_TIMEOUT_MS)} ms`);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('refuses transfers before open()', async () => {

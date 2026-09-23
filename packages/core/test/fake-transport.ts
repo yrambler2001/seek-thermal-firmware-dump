@@ -200,6 +200,7 @@ export class FakeCamera implements UsbTransport {
       interfaceNumber: 0,
       claimedInterface: true,
       host: null,
+      recipientFallback: null,
     };
   }
 

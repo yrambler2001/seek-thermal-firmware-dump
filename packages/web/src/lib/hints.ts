@@ -104,6 +104,9 @@ const SEEK_HINTS: Partial<Record<SeekErrorCode, string>> = {
   'device/window':
     'The selector map this profile uses did not match the camera. Run "Dump all selectors" to ' +
     'see what the camera actually exposes.',
+  'device/version-unknown':
+    'Nothing that could change the camera was sent. Unplug it, let it finish starting up, plug ' +
+    'it back in and try again; a camera that reports its firmware version is read normally.',
   'image/malformed': 'The file is not a decrypted Seek firmware image.',
   'image/unsupported': 'This image cannot be packaged for the camera as it is.',
   'image/key-table':

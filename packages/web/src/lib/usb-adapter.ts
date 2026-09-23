@@ -47,6 +47,10 @@ export function asWebUsbDevice(device: USBDevice): WebUsbDevice {
     selectConfiguration: (value) => device.selectConfiguration(value),
     claimInterface: (n) => device.claimInterface(n),
     releaseInterface: (n) => device.releaseInterface(n),
+    /* The transport's per-call deadline (core's third argument) is not passed
+     * on: WebUSB has no per-transfer timeout, so in the browser the transport's
+     * own timer is the only deadline — for a flash commit, USB_COMMIT_TIMEOUT_MS,
+     * twice the commit's worst case (core ops.ts). */
     controlTransferIn: (setup, length) => device.controlTransferIn(setup, length),
     controlTransferOut: (setup, data) => device.controlTransferOut(setup, data as BufferSource),
   };

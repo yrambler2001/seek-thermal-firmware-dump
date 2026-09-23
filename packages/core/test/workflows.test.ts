@@ -32,13 +32,19 @@ import {
   OLD_FW_UNLOCK_TOKEN,
 } from '../src/profiles/legacy-auth.js';
 import { FLASH_BASE, FLASH_SIZE, GAP_ADDRESS, modern4x } from '../src/profiles/modern-4x.js';
+import { detectProfile } from '../src/profiles/registry.js';
 import type { FirmwareProfile, SlotKey } from '../src/profiles/types.js';
 import { decryptDump, detectProfileForDump, evidenceFromDump } from '../src/workflows/decrypt.js';
 import { readDeviceInfo } from '../src/workflows/device-info.js';
 import { runDump } from '../src/workflows/dump.js';
-import { prepareImage } from '../src/workflows/flash.js';
+import { prepareImage, writeFirmware } from '../src/workflows/flash.js';
 import { runSweep } from '../src/workflows/sweep.js';
-import type { DeviceState, SlotState, WorkflowContext } from '../src/workflows/types.js';
+import type {
+  DeviceState,
+  PreparedFlash,
+  SlotState,
+  WorkflowContext,
+} from '../src/workflows/types.js';
 import {
   fakeCamera,
   patternFlash,
@@ -49,6 +55,20 @@ import {
 /* ==================================================================== *
  * Fixtures
  * ==================================================================== */
+
+/**
+ * The version a `cameraFor(profile)` camera reports, chosen so that the plan
+ * the profile makes for it IS `profile.windowMap()`, the map the camera serves.
+ *
+ * These cameras used to report nothing, and the dump then planned for an
+ * unknown version. It refuses that now (`identity-gate.test.ts`), so each one
+ * names a build: the modern line's 4.18.2.0, and on the legacy line 1.1.0.0 —
+ * a build whose table has NOT been decoded, so the plan is the rows every
+ * decoded build agrees on, which is exactly `buildLegacyWindowMap()`.
+ */
+function versionServedBy(profile: FirmwareProfile): string {
+  return profile.id === 'legacy-auth' || profile.id === 'compact-2016' ? '1.1.0.0' : '4.18.2.0';
+}
 
 /** A fake camera whose selector map is exactly `profile`'s. */
 function cameraFor(
@@ -64,6 +84,7 @@ function cameraFor(
     .map((entry) => entry.subcmd);
   return fakeCamera({
     windows,
+    fwInfo: new Map([[0, buildBlock(versionServedBy(profile))]]),
     ...(options.flash ? { flash: options.flash } : {}),
     ...(options.stallAt ? { stallAt: options.stallAt } : {}),
     ...(authBanks.length > 0 ? { authBanks, authToken: OLD_FW_UNLOCK_TOKEN } : {}),
@@ -449,8 +470,10 @@ describe('runDump', () => {
     /* The unification under test: one runDump, two algorithms. Nothing branches
      * on the profile id — the authenticated payloads in the map itself are what
      * select the legacy manifest, its unlock-token bookkeeping and its README.
-     * This camera does not answer GetFirmwareInfo, so the plan is the one for an
-     * unknown version: only the rows every decoded build agrees on. */
+     * This camera reports 1.1.0.0, a legacy build whose table has not been
+     * decoded, so the plan is only the rows every decoded build agrees on.
+     * (It used to report nothing and get the same plan; a camera that reports
+     * nothing is now refused — identity-gate.test.ts.) */
     const camera = cameraFor(legacyAuth);
     const ctx = await contextFor(legacyAuth, camera);
     const entries = buildLegacyWindowMap();
@@ -468,14 +491,16 @@ describe('runDump', () => {
     expect(manifest.combinedFile).toContain('legacy');
     expect(manifest.safety.join(' ')).toContain('channel-0x12 unlock token');
 
-    /* the blocks THIS plan does not reach — for an unknown version, the ones
+    /* the blocks THIS plan does not reach — for an undecoded build, the ones
      * the builds disagree about as well as the ones none of them reaches */
     expect(manifest.gaps.map((g) => g.address)).toEqual(
-      legacyWindowPlan(null).unreachable.map((u) => hex(u.address, 8)),
+      legacyWindowPlan('1.1.0.0').unreachable.map((u) => hex(u.address, 8)),
     );
     expect(manifest.gaps.map((g) => g.address)).toContain(hex(FLASH_BASE, 8));
-    expect(manifest.selectorTable?.firmwareVersion).toBeNull();
-    expect(manifest.selectorTable?.table).toMatch(/version unknown/);
+    expect(manifest.selectorTable?.firmwareVersion).toBe('1.1.0.0');
+    expect(manifest.selectorTable?.table).toMatch(
+      /version unknown: .*firmware 1\.1\.0\.0 is not a build whose table has been decoded/,
+    );
 
     const readme = result.artifacts.find((a) => a.name === 'README.md');
     expect(new TextDecoder().decode(readme?.data ?? new Uint8Array())).toContain(
@@ -948,9 +973,13 @@ describe('readDeviceInfo', () => {
     expect(state.evidence.authSelectorWorks).toBe(true);
     expect(state.evidence.plainSelectorWorks).toBeUndefined();
     expect(state.detection.best.profile.id).toBe('legacy-auth');
-    /* and on evidence that weak the family is a lead, not a verdict: the flag
-     * is set by this profile's own map, so it cannot confirm the profile */
-    expect(state.detection.ambiguous).toBe(true);
+    /* and on that flag alone the family is a lead, not a verdict: the flag is
+     * set by this profile's own map, so it cannot confirm the profile. The
+     * camera also reports 1.1.0.0 now (it used to report nothing), and a
+     * legacy-line version is what corroborates the detection, not the flag. */
+    expect(state.evidence.firmwareVersion).toBe('1.1.0.0');
+    const { firmwareVersion: _version, ...channelOnly } = state.evidence;
+    expect(detectProfile(channelOnly).ambiguous).toBe(true);
 
     /* nothing in the flash command set was ever sent */
     const flashOps = new Set([0x50, 0x51]);
@@ -984,6 +1013,25 @@ describe('readDeviceInfo', () => {
     const legacyMatch = state.detection.ranked.find((m) => m.profile.id === 'legacy-auth');
     expect(legacyMatch?.score).toBe(0);
   }, 60_000);
+});
+
+describe('writeFirmware', () => {
+  it('refuses an analysis that does not say which firmware the camera runs', async () => {
+    /* Every id the write sends — 0x52, 0x50, 0x51 — is per build. readDeviceInfo
+     * refuses a camera that does not name its build, so a state with no version
+     * did not come from it, and nothing is sent. */
+    const camera = cameraFor(modern4x);
+    const ctx = await contextFor(modern4x, camera);
+    const state: DeviceState = { ...makeDeviceState(makeKey(60), makeKey(61)), version: null };
+    const error = await writeFirmware(ctx, state, {} as PreparedFlash).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(SeekError);
+    expect((error as SeekError).code).toBe('flash/refused');
+    expect((error as SeekError).message).toContain('does not say which firmware');
+    expect(camera.calls).toHaveLength(0);
+  });
 });
 
 /* ==================================================================== *

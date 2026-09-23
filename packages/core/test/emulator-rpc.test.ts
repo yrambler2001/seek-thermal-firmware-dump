@@ -78,10 +78,12 @@
 
 import { afterAll, describe, expect, it } from 'vitest';
 
+import { SAFE_BEFORE_IDENTITY, type Opcode } from '../src/protocol/ops.js';
 import { liveEmulatorCount, RowEmulators } from './emulator/harness.js';
 import {
   probeTier1,
   ProbeUnmeasurable,
+  type GateProbe,
   type Tier1Result,
   type WindowProbe,
 } from './emulator/probe.js';
@@ -142,6 +144,36 @@ export interface RpcExpectation {
    * the address it is filed under is the one failure a dump must never have.
    */
   readonly plan: PlanExpectation;
+  /**
+   * The toolkit's own first contact — probe, detection, `runDump` — and every
+   * request it sent before the camera named its build (TESTING.md sec.11).
+   * Null only on a row that could not be measured at all.
+   */
+  readonly gate: GateProbe | null;
+}
+
+/**
+ * THE RULE, checked on every row whatever the pin says, in both modes: before
+ * the camera has named its build the toolkit sends only control INs of
+ * `SAFE_BEFORE_IDENTITY`, and a camera that never names it is refused. ("Never"
+ * is the whole first contact: 0.6.0.4 does not answer the probe's version read
+ * and does answer the dump's, which then refuses it as a pre-0.8 build.)
+ */
+function assertIdentityRule(entryId: string, gate: GateProbe | null): void {
+  if (gate === null) return;
+  const safe = [...SAFE_BEFORE_IDENTITY].map(
+    (op: Opcode) => `IN 0x${op.toString(16).toUpperCase().padStart(2, '0')}`,
+  );
+  for (const sent of gate.sentBeforeIdentity) {
+    expect(safe, `${entryId}: '${sent}' went out before the camera named its build`).toContain(
+      sent,
+    );
+  }
+  if (!gate.identified) {
+    expect(gate.refusal ?? '', `${entryId}: no version came back, so the dump must refuse`).toMatch(
+      /^device\/version-unknown: refusing to dump: the camera did not report its firmware version/,
+    );
+  }
 }
 
 export interface PlanExpectation {
@@ -262,6 +294,7 @@ function summarize(result: Tier1Result, entry: (typeof ENTRIES)[number]): RpcExp
     windowsRefused: refused,
     auth: result.auth,
     plan: summarizePlan(result),
+    gate: result.gate,
   };
 }
 
@@ -394,6 +427,7 @@ async function measureRow(
         armedHere: [],
         gaps: [],
       },
+      gate: null,
       gap: { reason: gapReason(error).slice(0, 300) },
     };
   }
@@ -416,7 +450,10 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
           'A `gap` records a firmware that could not be measured and why; the suite asserts ' +
           'that exact reason, so one that starts working (or changes) turns the suite red. ' +
           'Measured on the path a real host takes: interface 0 claimed without a packet, ' +
-          'every vendor request sent as bmRequestType 0x41/0xC1 (TESTING.md sec.9.9).',
+          'every vendor request sent as bmRequestType 0x41/0xC1 (TESTING.md sec.9.9). ' +
+          '`gate` is the toolkit itself — probe, detection, runDump — and every request it ' +
+          'sent before the camera named its build; only control INs of SAFE_BEFORE_IDENTITY ' +
+          'are allowed there, and a camera with no version is refused (TESTING.md sec.11).',
         generatedBy: 'packages/core/test/emulator-rpc.test.ts (SEEK_EMU_REGEN=1)',
         fill: { seed: FILL_SEED, scope: FILL_SCOPE },
         readChunk: 64,
@@ -474,6 +511,7 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
           /* A plan that files bytes under the wrong address is a bug, not a
            * measurement to pin. */
           expect(now.plan.misplaced, 'plan windows serving bytes from another address').toEqual({});
+          assertIdentityRule(entry.id, now.gate);
           measured[entry.id] = now;
           status = now.gap === null ? 'supported' : 'known-gap';
           return;
@@ -526,6 +564,11 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
          * bytes it did not serve fails every row, whatever the pin says. */
         expect(now.plan.misplaced, 'plan windows serving bytes from another address').toEqual({});
         expect(now.plan, "the dump's own plan, measured").toEqual(want.plan);
+
+        /* ---- THE TOOLKIT'S FIRST CONTACT: nothing but agreed reads before
+         * identity, and a refusal when identity never comes (sec.11) ---- */
+        assertIdentityRule(entry.id, now.gate);
+        expect(now.gate, "the toolkit's own first contact").toEqual(want.gate);
         status = now.gap === null ? 'supported' : 'known-gap';
       } catch (error) {
         status = 'failed';

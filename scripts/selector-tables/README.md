@@ -12,6 +12,10 @@ an independent Python decoder of the same switch, and a reader of the boot recor
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `early_version_read.ts <entry-substring>` | Boots one corpus entry with the tier-1 fill, attaches over USB/IP and prints GetFirmwareInfo (36 and 4 bytes, twice), GetErrorCode, then `probeSelectorChannel()`'s result and notes, and the delivery audit. | §10.4: on 0.5.1.0 and 0.5.1.3 every request stalls at that point, so the probe sees no version and its plain arm is "refused" with everything else. 0.5.0.2 is the control. |
 
+Since `TESTING.md` §11 the probe it runs sends nothing after an unanswered version read, so
+on 0.5.1.0 and 0.5.1.3 its last line now reports `skippedForSafety: true` and no arm; the
+§10.4 result above is what the toolkit did before that fix.
+
 Run from this checkout with `npx jiti`. `SEEK_TOOLKIT_DIR` defaults to the current directory
 and `SEEK_EMU_DIR` to `<toolkit>/../FW-V1/emu`. It sends only GetFirmwareInfo, GetErrorCode
 and what `probeSelectorChannel` sends, all in `READ_ONLY_OPS`, and it drives the emulator

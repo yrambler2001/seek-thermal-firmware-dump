@@ -154,6 +154,20 @@ export const FOREIGN_KEY_B = Uint8Array.from([
   0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x1f, 0x20,
 ]);
 
+/**
+ * GetFirmwareInfo selector 0 of the build `buildPlainImage` stamps: 4.9.5.0.
+ *
+ * The camera reports the version of the image it runs, as every corpus build
+ * does. Until the version rule (identity-gate.test.ts) this fixture reported
+ * nothing, which a dump, a sweep and an analysis now refuse.
+ */
+export function runningBuildBlock(): Uint8Array {
+  const block = new Uint8Array(36);
+  block.set([4, 9, 5, 0], 0);
+  block.set(utf8('Sep 20 2026 00:00:00'), 4);
+  return block;
+}
+
 /** A fake camera wired to the selector map the modern profile actually issues. */
 export function cameraWithFlash(
   flash: Uint8Array,
@@ -169,7 +183,7 @@ export function cameraWithFlash(
     subcmd: modern4x.boot.updateTargetSubcmd,
     offset: slotAddress('b') - FLASH_BASE,
   });
-  return fakeCamera({ ...options, flash, windows });
+  return fakeCamera({ fwInfo: new Map([[0, runningBuildBlock()]]), ...options, flash, windows });
 }
 
 /** A `UsbBackend` that hands out exactly the transports it was given. */

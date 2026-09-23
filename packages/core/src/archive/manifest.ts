@@ -38,8 +38,14 @@ export interface TransportInfo {
   readonly bmRequestTypeOut: string;
   readonly bmRequestTypeIn: string;
   readonly interface: number;
+  /** Whether interface 0 was claimed while the windows were read. */
   readonly claimedInterface: boolean;
   readonly userAgent: string;
+  /**
+   * Why the run addressed the device instead of interface 0, when the
+   * platform refused the claim; null when it did not have to fall back.
+   */
+  readonly recipientFallback: string | null;
 }
 
 /** NEW field recorded on every manifest: which firmware profile the tool acted under. */

@@ -277,6 +277,17 @@ async function measureRow(
     }
     expect(truth.length, 'the emulator wrote a 4 MiB ground-truth image').toBe(FLASH_SIZE);
 
+    /* WHAT THE MANIFEST SAYS ABOUT ITS TRANSPORT is what the run used: interface
+     * 0 claimed, no fallback. It used to say `claimedInterface: false` on every
+     * dump, because it was built after the dump had closed the transport
+     * (TESTING.md sec.11). */
+    expect(result.manifest.transport, 'the transport the manifest records').toMatchObject({
+      recipient: 'interface',
+      bmRequestTypeIn: '0xc1',
+      claimedInterface: true,
+      recipientFallback: null,
+    });
+
     /* The dump's OWN gap list — and it must be the plan the profile gives for
      * the version the dump says it planned for, block for block. */
     const table = result.manifest.selectorTable;

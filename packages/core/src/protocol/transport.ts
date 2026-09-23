@@ -8,8 +8,9 @@
  * second protocol implementation to keep in sync.
  */
 
-/** USB control-transfer recipient. Some hosts refuse to claim interface 0, in
- *  which case the camera still answers device-recipient requests. */
+/** USB control-transfer recipient. When the host refuses the claim on interface 0
+ *  because something else holds it, the camera still answers device-recipient
+ *  requests, and answers them the same way (see `isPlatformClaimRefusal`). */
 export type Recipient = 'device' | 'interface';
 
 export interface DeviceDescription {
@@ -28,6 +29,13 @@ export interface TransportInfo {
   readonly claimedInterface: boolean;
   /** Free-form host identification recorded in dump manifests. */
   readonly host: string | null;
+  /**
+   * Why this transport addresses the device rather than interface 0, when it
+   * had to fall back — the platform refused the claim — or null when it did
+   * not. Set once per transport and kept, so a manifest built after close()
+   * still says it.
+   */
+  readonly recipientFallback: string | null;
 }
 
 export interface UsbTransport {
@@ -35,7 +43,10 @@ export interface UsbTransport {
   readonly info: TransportInfo;
   readonly isOpen: boolean;
 
-  /** Idempotent. Selects the configuration and claims the interface if it can. */
+  /**
+   * Idempotent. Selects the configuration and claims the interface. The
+   * recipient is decided by the first call and kept by every later one.
+   */
   open(): Promise<void>;
   /** Idempotent, and safe to call on a device that has already vanished. */
   close(): Promise<void>;

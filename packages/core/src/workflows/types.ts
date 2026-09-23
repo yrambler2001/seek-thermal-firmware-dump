@@ -420,7 +420,18 @@ export function transportInfoOf(info: TransportInfo): ManifestTransportInfo {
     interface: info.interfaceNumber,
     claimedInterface: info.claimedInterface,
     userAgent: info.host ?? 'unknown',
+    recipientFallback: info.recipientFallback,
   };
+}
+
+/**
+ * Says, as a warning in the run's own log, that the transport fell back to
+ * device recipient. The transport also tells its `onWarning`, but a caller need
+ * not pass one, and a fallback is never allowed to go unreported.
+ */
+export function warnIfRecipientFellBack(ctx: WorkflowContext): void {
+  const fallback = ctx.device.transport.info.recipientFallback;
+  if (fallback !== null) ctx.reporter.log(`transport: ${fallback}`, 'warn');
 }
 
 /* ==================================================================== *

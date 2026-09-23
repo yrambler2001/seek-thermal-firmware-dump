@@ -56,15 +56,35 @@ export interface WebUsbDevice {
   selectConfiguration(configurationValue: number): Promise<void>;
   claimInterface(interfaceNumber: number): Promise<void>;
   releaseInterface(interfaceNumber: number): Promise<void>;
-  controlTransferIn(setup: WebUsbControlSetup, length: number): Promise<WebUsbInTransferResult>;
+  /**
+   * `timeoutMs` is the transport's own deadline for this transfer, passed on
+   * every call. WebUSB has no per-transfer timeout, so a browser's device (and
+   * `asWebUsbDevice` in the web app) ignores it and the transport's own timer
+   * is the only deadline. A host stack WITH a per-transfer timeout must apply
+   * it: the CLI's `usb` 3.x shim takes it as this same third argument and
+   * otherwise uses 1000 ms (node_modules/usb/dist/index.js:8, :22, :32), which
+   * is how a 5 s read and a 20 s flash commit became 1 s ones (TESTING.md sec.11).
+   */
+  controlTransferIn(
+    setup: WebUsbControlSetup,
+    length: number,
+    timeoutMs: number,
+  ): Promise<WebUsbInTransferResult>;
   controlTransferOut(
     setup: WebUsbControlSetup,
     data: ArrayBufferView,
+    timeoutMs: number,
   ): Promise<WebUsbOutTransferResult>;
 }
 
-/** Which recipient to use. 'auto' claims interface 0 if it can and quietly falls
- *  back to device-recipient requests if a driver is holding it. */
+/**
+ * Which recipient to use. 'auto' claims interface 0, and falls back to
+ * device-recipient requests only when the platform REFUSED the claim — the
+ * interface held by another program or a kernel driver — which it reports
+ * through `onWarning` AND `info.recipientFallback`, so a dump manifest records
+ * it. The choice is made on the first open() and kept for the transport's
+ * lifetime; see `open()`.
+ */
 export type RecipientPreference = Recipient | 'auto';
 
 export interface WebUsbTransportOptions {
@@ -74,8 +94,39 @@ export interface WebUsbTransportOptions {
   /** Recorded in dump manifests, e.g. 'WebUSB' or 'node-usb 3.x (WebUSB shim)'. */
   readonly api?: string;
   readonly host?: string | null;
-  /** Called when the interface could not be claimed but 'auto' let us continue. */
+  /** Called once, when the platform refused the claim and 'auto' fell back to device recipient. */
   readonly onWarning?: (message: string) => void;
+}
+
+/**
+ * True when claimInterface() failed because the PLATFORM would not give this
+ * program the interface — the one failure device recipient is the right answer to.
+ *
+ * WebUSB names that failure: claimInterface performs "the necessary
+ * platform-specific steps to request exclusive control over" the interface, and
+ * "if the platform-specific steps above failed, reject promise with a
+ * NetworkError" (WICG WebUSB, `claimInterface` method steps). Its other
+ * rejections are something else: InvalidStateError for a device not opened or
+ * not configured, NotFoundError for an interface that does not exist,
+ * SecurityError for a protected class. A disconnect is not "someone else holds
+ * it" either.
+ *
+ * Why falling back is right for that one failure and no other: the claim is
+ * host-side only, no packet is sent (TESTING.md sec.9.9); a device-recipient
+ * control request needs no claimed interface on either host (WebUSB's "check
+ * the validity of the control transfer parameters" asks for a claim only for
+ * the interface and endpoint recipients; node-usb-rs sends a device-recipient
+ * request on the device handle, off Windows); and every Seek firmware's vendor
+ * handler checks only the request type and `wIndex == 0`, never the recipient
+ * bits, so `0xC0/0x40` with wIndex 0 is the same request to the camera as
+ * `0xC1/0x41` to interface 0 (sec.9.9, all eleven FW-V1 `usb_core.c`
+ * reconstructions). The CLI's adapter maps nusb's two "held by someone else"
+ * claim errors onto this same name.
+ */
+export function isPlatformClaimRefusal(error: unknown): boolean {
+  return (
+    typeof error === 'object' && error !== null && 'name' in error && error.name === 'NetworkError'
+  );
 }
 
 /**
@@ -115,6 +166,14 @@ export class WebUsbTransport implements UsbTransport {
   private recipient: Recipient;
   private claimed = false;
   private opened = false;
+  /**
+   * The recipient this transport settled on at its FIRST successful open(),
+   * and why, if it had to fall back. Null until then. Never re-decided: a
+   * dump reopens between failed windows, and deciding again there is how one
+   * dump could switch recipient half way through (TESTING.md sec.9.9).
+   */
+  private decision: { readonly recipient: Recipient; readonly fallback: string | null } | null =
+    null;
 
   constructor(device: WebUsbDevice, options: WebUsbTransportOptions = {}) {
     this.device = device;
@@ -144,6 +203,7 @@ export class WebUsbTransport implements UsbTransport {
       interfaceNumber: this.interfaceNumber,
       claimedInterface: this.claimed,
       host: this.host,
+      recipientFallback: this.decision?.fallback ?? null,
     };
   }
 
@@ -151,6 +211,22 @@ export class WebUsbTransport implements UsbTransport {
     return this.opened;
   }
 
+  /**
+   * Opens the device, selects the configuration, and claims the interface.
+   *
+   * THE RECIPIENT IS DECIDED ONCE. The first open() settles it; every later
+   * open() — `runDump` reopens between attempts at a failed window — keeps it:
+   *
+   *   - settled on interface: the interface must be claimed again, and a claim
+   *     that fails now is an error. Switching to device recipient part-way
+   *     would leave one dump read over two different paths.
+   *   - settled on device (a fallback, or `recipient: 'device'`): no claim is
+   *     attempted, so the path cannot flip back either.
+   *
+   * With 'auto', only `isPlatformClaimRefusal` falls back, and it is never
+   * silent: `onWarning` is called and `info.recipientFallback` carries the
+   * reason from then on, which the workflows log and the manifest records.
+   */
   async open(): Promise<void> {
     if (this.opened) return;
     const dev = this.device;
@@ -161,7 +237,8 @@ export class WebUsbTransport implements UsbTransport {
 
     this.claimed = false;
 
-    if (this.preference === 'device') {
+    if (this.preference === 'device' || this.decision?.recipient === 'device') {
+      this.decision ??= { recipient: 'device', fallback: null };
       this.recipient = 'device';
       this.opened = true;
       return;
@@ -170,22 +247,43 @@ export class WebUsbTransport implements UsbTransport {
     try {
       await dev.claimInterface(this.interfaceNumber);
       this.claimed = true;
+      this.decision ??= { recipient: 'interface', fallback: null };
       this.recipient = 'interface';
     } catch (error) {
+      const which = `USB interface ${String(this.interfaceNumber)}`;
       if (this.preference === 'interface') {
         throw new SeekError(
           'usb/not-open',
-          `could not claim USB interface ${String(this.interfaceNumber)}: ` +
-            `${errorMessage(error)} — another program or a system driver is holding the ` +
-            `camera. See the platform notes for how to release it.`,
+          `could not claim ${which}: ${errorMessage(error)} — another program or a system ` +
+            `driver is holding the camera. See the platform notes for how to release it.`,
           { cause: error },
         );
       }
+      if (this.decision !== null) {
+        throw new SeekError(
+          'usb/not-open',
+          `could not claim ${which} again after reopening: ${errorMessage(error)}. This ` +
+            'session has addressed the interface since it opened, and it does not switch ' +
+            'recipient part-way through a run.',
+          { cause: error },
+        );
+      }
+      if (!isPlatformClaimRefusal(error)) {
+        throw new SeekError(
+          'usb/not-open',
+          `could not claim ${which}: ${errorMessage(error)}. Only a claim the host refused ` +
+            'because another program or a system driver holds the interface falls back to ' +
+            'device recipient; this failure is not that one, so nothing was sent.',
+          { cause: error },
+        );
+      }
+      const fallback =
+        `could not claim interface ${String(this.interfaceNumber)} (${errorMessage(error)}): ` +
+        'another program or a system driver holds it, so every request goes to the device ' +
+        'instead (recipient=device, wIndex 0), which the camera answers the same way';
+      this.decision = { recipient: 'device', fallback };
       this.recipient = 'device';
-      this.onWarning?.(
-        `could not claim interface ${String(this.interfaceNumber)} (${errorMessage(error)}); ` +
-          `using recipient=device instead`,
-      );
+      this.onWarning?.(fallback);
     }
     this.opened = true;
   }
@@ -214,7 +312,11 @@ export class WebUsbTransport implements UsbTransport {
   ): Promise<Uint8Array> {
     this.assertOpen();
     const what = `control IN ${hex(request)}`;
-    const result = await withTimeout(this.transferIn(request, length, what), timeoutMs, what);
+    const result = await withTimeout(
+      this.transferIn(request, length, timeoutMs, what),
+      timeoutMs,
+      what,
+    );
     /* WebUSB resolves on a stall instead of rejecting, so status must be checked
      * explicitly — otherwise a stalled read silently becomes a zero-length one,
      * indistinguishable from the end of the data. */
@@ -231,7 +333,11 @@ export class WebUsbTransport implements UsbTransport {
   ): Promise<void> {
     this.assertOpen();
     const what = `control OUT ${hex(request)}`;
-    const result = await withTimeout(this.transferOut(request, data, what), timeoutMs, what);
+    const result = await withTimeout(
+      this.transferOut(request, data, timeoutMs, what),
+      timeoutMs,
+      what,
+    );
     if (result.status !== 'ok') throw statusError(what, result.status);
   }
 
@@ -251,14 +357,19 @@ export class WebUsbTransport implements UsbTransport {
     }
   }
 
+  /* A host adapter that has already classified its failure (the CLI's maps
+   * nusb's own deadline to `usb/timeout`) throws a SeekError, and it is passed
+   * through; anything else a device throws is a transfer failure. */
   private async transferIn(
     request: number,
     length: number,
+    timeoutMs: number,
     what: string,
   ): Promise<WebUsbInTransferResult> {
     try {
-      return await this.device.controlTransferIn(this.setupPacket(request), length);
+      return await this.device.controlTransferIn(this.setupPacket(request), length, timeoutMs);
     } catch (error) {
+      if (error instanceof SeekError) throw error;
       throw new SeekError('usb/transfer-failed', `${what} failed: ${errorMessage(error)}`, {
         cause: error,
       });
@@ -268,11 +379,13 @@ export class WebUsbTransport implements UsbTransport {
   private async transferOut(
     request: number,
     data: Uint8Array,
+    timeoutMs: number,
     what: string,
   ): Promise<WebUsbOutTransferResult> {
     try {
-      return await this.device.controlTransferOut(this.setupPacket(request), data);
+      return await this.device.controlTransferOut(this.setupPacket(request), data, timeoutMs);
     } catch (error) {
+      if (error instanceof SeekError) throw error;
       throw new SeekError('usb/transfer-failed', `${what} failed: ${errorMessage(error)}`, {
         cause: error,
       });

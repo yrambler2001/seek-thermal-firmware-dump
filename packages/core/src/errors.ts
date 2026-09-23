@@ -12,6 +12,11 @@ export type SeekErrorCode =
   | 'device/error-code'
   | 'device/mode'
   | 'device/window'
+  /**
+   * The camera did not report its firmware version, so nothing that could mean
+   * something else on another build was sent. See `SAFE_BEFORE_IDENTITY`.
+   */
+  | 'device/version-unknown'
   | 'image/malformed'
   | 'image/unsupported'
   | 'image/key-table'

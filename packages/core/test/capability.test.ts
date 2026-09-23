@@ -17,6 +17,7 @@ import { detectProfile } from '../src/profiles/registry.js';
 import { OLD_FW_UNLOCK_TOKEN } from '../src/profiles/legacy-auth.js';
 import {
   evidenceFromChannelProbe,
+  identityGate,
   predatesDumpProtocol,
   PROBE_OPEN_SUBCMD,
   PROBE_PROTECTED_SUBCMD,
@@ -144,15 +145,20 @@ describe('probeSelectorChannel', () => {
     expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO]);
   });
 
-  it('survives a camera that will not answer GetFirmwareInfo', async () => {
-    /* 0.6.0.4 does exactly this over the emulator. An unknown version must not
-     * stop the probe, because the arms are what will actually settle it. */
+  it('sends nothing more to a camera that will not answer GetFirmwareInfo', async () => {
+    /* Compact 0.5.1.0 and 0.5.1.3 do exactly this over the emulator. This test
+     * used to require the opposite — "an unknown version must not stop the
+     * probe, because the arms are what will actually settle it" — and the arm is
+     * wire id 0x52, which on 0.3.0.1 is EnterBootloaderMode. With no version,
+     * nothing but the version read goes out (identity-gate.test.ts). */
     const camera = fakeCamera({ initialMode: 0 });
     await camera.open();
     const probe = await probeSelectorChannel(new SeekDevice(camera));
     expect(probe.firmwareVersion).toBeNull();
-    expect(probe.plainAccepted).toBe(true);
+    expect(probe.skippedForSafety).toBe(true);
+    expect(probe.plainAccepted).toBe(false);
     expect(probe.notes.some((n) => n.includes('GetFirmwareInfo did not answer'))).toBe(true);
+    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO]);
   });
 
   it('records a window that arms but serves nothing', async () => {
@@ -190,11 +196,15 @@ describe('predatesDumpProtocol', () => {
   });
 
   it('says no when there is no version to judge', () => {
-    /* An unknown version must not be treated as old: refusing to read a camera
-     * because it did not answer one optional command would be a worse failure
-     * than the one this guard prevents. */
+    /* "Old" is a property of a version, and no version is not old. That is NOT
+     * permission to arm: `identityGate` refuses an unknown version on its own
+     * terms, and it is what every caller consults (identity-gate.test.ts). */
     expect(predatesDumpProtocol(null)).toBe(false);
     expect(predatesDumpProtocol('PIR206 Thermal Camera')).toBe(false);
+    expect(identityGate({ version: null, buildString: null, note: 'no answer' })).toMatchObject({
+      permitsArming: false,
+      code: 'device/version-unknown',
+    });
   });
 });
 

@@ -36,7 +36,9 @@ vi.mock('../lib/download', () => ({
 /**
  * The smallest camera that answers the five read-only opcodes. Every window
  * reads back as a single 0xA5-filled block, so no firmware image is found and
- * the decrypt stage stays out of the way.
+ * the decrypt stage stays out of the way. It reports firmware 4.18.2.0: a
+ * dump refuses a camera that does not say which build it runs (core
+ * identity-gate.test.ts), and this fake used to answer GetFirmwareInfo empty.
  */
 function fakeCamera(onWindowRead?: (count: number) => void): WebUsbDevice {
   let opened = false;
@@ -68,6 +70,11 @@ function fakeCamera(onWindowRead?: (count: number) => void): WebUsbDevice {
       }
       if (setup.request === OP.GET_OPERATION_MODE) {
         return Promise.resolve({ status: 'ok', data: new DataView(new ArrayBuffer(2)) });
+      }
+      if (setup.request === OP.GET_FIRMWARE_INFO) {
+        const build = new Uint8Array(36);
+        build.set([4, 18, 2, 0], 0);
+        return Promise.resolve({ status: 'ok', data: new DataView(build.buffer) });
       }
       if (setup.request === OP.GET_FEATURED_FIRMWARE_DATA) {
         windowsRead += 1;

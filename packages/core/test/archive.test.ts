@@ -525,6 +525,7 @@ function sampleTransport(): TransportInfo {
     interface: 0,
     claimedInterface: false,
     userAgent: 'test-agent',
+    recipientFallback: null,
   };
 }
 

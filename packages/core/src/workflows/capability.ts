@@ -25,10 +25,16 @@
  * `OP.BEGIN_FIRMWARE_UPGRADE` / `OP.GET_FEATURED_FIRMWARE_DATA` are ever sent,
  * and every one of them is in `READ_ONLY_OPS`, which `ops.ts` asserts is
  * disjoint from the write set at module load.
+ *
+ * AND NOTHING BUT THE VERSION READ UNTIL THE VERSION IS KNOWN. Steps 2-4 go
+ * out only after step 1 came back with a version this toolkit can read windows
+ * on (`identityGate`). A camera that does not answer step 1 gets nothing more:
+ * wire ids mean different things on different builds, and the commands every
+ * build reads the same way are listed in `SAFE_BEFORE_IDENTITY`.
  * ==================================================================== */
 
 import { asciiz, hex } from '../bytes.js';
-import { CancelledError, errorMessage } from '../errors.js';
+import { CancelledError, errorMessage, type SeekErrorCode } from '../errors.js';
 import type { SeekDevice } from '../protocol/client.js';
 import { DEFAULT_READ_CHUNK, OP } from '../protocol/ops.js';
 import { OLD_FW_UNLOCK_TOKEN, authPayload } from '../profiles/legacy-auth.js';
@@ -94,7 +100,14 @@ const PROBE_READ_BYTES = DEFAULT_READ_CHUNK;
 export const FIRST_DUMPABLE_MAJOR = 0;
 export const FIRST_DUMPABLE_MINOR = 8;
 
-/** Is this version old enough that it has no read handler, or `0x52` may not be BeginFirmwareUpgrade? */
+/**
+ * Is this version old enough that it has no read handler, or `0x52` may not be BeginFirmwareUpgrade?
+ *
+ * A question about a version, so `null` — no version — is not "old" and says
+ * false. That is NOT permission to arm: `identityGate` refuses an unknown
+ * version on its own terms, and every caller that decides whether to send an
+ * arm goes through it rather than through this.
+ */
 export function predatesDumpProtocol(version: string | null): boolean {
   if (version === null) return false;
   const match = /^\s*(\d+)\.(\d+)/.exec(version);
@@ -126,6 +139,59 @@ export interface RunningFirmware {
   readonly note: string;
 }
 
+/** Why nothing beyond `SAFE_BEFORE_IDENTITY` goes out to a camera that has not said what it runs. */
+export function versionUnknownReason(note: string): string {
+  return (
+    `the camera did not report its firmware version (${note}); a command number does not ` +
+    'mean the same thing on every Seek firmware — on Compact 0.3.0.1 wire id 0x52, the id ' +
+    'that arms a read window, is EnterBootloaderMode — so until the version is known nothing ' +
+    'is sent but GetErrorCode, GetOperationMode and GetFirmwareInfo, the reads every build ' +
+    'answers the same way'
+  );
+}
+
+/** What the version read allows the toolkit to send next. */
+export type IdentityGate =
+  | { readonly permitsArming: true; readonly version: string }
+  | {
+      readonly permitsArming: false;
+      /** `device/version-unknown` when there was no version; `profile/unsupported` when it predates. */
+      readonly code: Extract<SeekErrorCode, 'device/version-unknown' | 'profile/unsupported'>;
+      readonly reason: string;
+    };
+
+/**
+ * THE ONE DECISION BEFORE ANYTHING IS ARMED, shared by the probe, the dump,
+ * the sweep and the device-info read.
+ *
+ * An arm is wire id 0x52, and that id is `BeginFirmwareUpgrade` only on some
+ * builds, so it may go out only once the camera has named its build and the
+ * build is one whose table this toolkit reads (`predatesDumpProtocol`). With no
+ * version there is no build to look up, and guessing is how 0x52 reaches a
+ * 0.3.0.1's `EnterBootloaderMode`; so no version is a refusal too. On the
+ * emulator Compact 0.5.1.0 and 0.5.1.3 stall every request for a while after
+ * enumeration, `GetFirmwareInfo` included, which is exactly this case — and a
+ * real camera that is slow to start is refused rather than guessed at, and
+ * reads fine once it answers.
+ */
+export function identityGate(firmware: RunningFirmware): IdentityGate {
+  if (firmware.version === null) {
+    return {
+      permitsArming: false,
+      code: 'device/version-unknown',
+      reason: versionUnknownReason(firmware.note),
+    };
+  }
+  if (predatesDumpProtocol(firmware.version)) {
+    return {
+      permitsArming: false,
+      code: 'profile/unsupported',
+      reason: predatesDumpProtocolReason(firmware.version),
+    };
+  }
+  return { permitsArming: true, version: firmware.version };
+}
+
 /**
  * The running build's version, from a command every build has.
  *
@@ -139,8 +205,8 @@ export interface RunningFirmware {
  * date string. `GetFirmwareInfo` has a getter at 0x4E in all 36 corpus images.
  *
  * Never throws for a refusal or a timeout — a camera that does not say is a
- * camera whose version is unknown, and the caller decides what that means —
- * but a cancellation propagates.
+ * camera whose version is unknown, and `identityGate` says what that means:
+ * nothing more is sent — but a cancellation propagates.
  */
 export async function readRunningFirmware(device: SeekDevice): Promise<RunningFirmware> {
   try {
@@ -181,8 +247,9 @@ export interface SelectorChannelProbe {
   /** A window open on both lines served bytes. */
   readonly openWindowReadable: boolean;
   /**
-   * Nothing after the version read was sent, because the version said this
-   * build predates the dump protocol and `0x52` may be `EnterBootloaderMode`.
+   * Nothing after the version read was sent: either the version said this
+   * build predates the dump protocol, or there was no version at all — and in
+   * both cases `0x52` may be `EnterBootloaderMode` (`identityGate`).
    */
   readonly skippedForSafety: boolean;
   /** One line per step, for the reporter and the dump manifest. */
@@ -226,8 +293,9 @@ export async function probeSelectorChannel(
   const buildString = running.buildString;
   notes.push(running.note);
 
-  if (predatesDumpProtocol(firmwareVersion)) {
-    notes.push(`${predatesDumpProtocolReason(String(firmwareVersion))}. Nothing further was sent.`);
+  const gate = identityGate(running);
+  if (!gate.permitsArming) {
+    notes.push(`${gate.reason}. Nothing further was sent.`);
     return {
       firmwareVersion,
       buildString,

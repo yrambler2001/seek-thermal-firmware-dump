@@ -230,6 +230,41 @@ describe('seek-fw sweep', () => {
   });
 });
 
+describe('a camera that does not report its firmware version', () => {
+  /* Command ids mean different things on different builds — on Compact 0.3.0.1
+   * wire id 0x52, which arms a window, is EnterBootloaderMode — so until the
+   * version is known only GetErrorCode, GetOperationMode and GetFirmwareInfo
+   * may be sent, and a dump, a sweep or an analysis refuses rather than guess. */
+  for (const argv of [
+    ['dump'],
+    ['dump', '--no-probe'],
+    ['dump', '--profile', 'legacy-auth'],
+    ['sweep'],
+    ['info'],
+    ['info', '--profile', 'modern-4x'],
+  ]) {
+    it(`refuses \`seek-fw ${argv.join(' ')}\` and arms nothing`, async () => {
+      const camera = cameraWithFlash(synthetic.flash, { fwInfo: new Map() });
+      const { io, stderr } = testIo({ backend: fixedBackend([camera]) });
+      const code = await run([...argv, '--out', join(dir, 'never')], io, signal());
+
+      expect(code).toBe(EXIT_FAILED);
+      expect(stderr.text).toContain('did not report its firmware version');
+      expect(camera.calls.length).toBeGreaterThan(0);
+      for (const call of camera.calls) {
+        expect(call.direction, `op 0x${call.op.toString(16)}`).toBe('in');
+        expect(
+          [OP.GET_ERROR_CODE, OP.GET_OPERATION_MODE, OP.GET_FIRMWARE_INFO].includes(
+            call.op as never,
+          ),
+          `op 0x${call.op.toString(16)}`,
+        ).toBe(true);
+      }
+      await expect(readdir(join(dir, 'never'))).rejects.toThrow();
+    });
+  }
+});
+
 describe('failure reporting', () => {
   it('maps a missing camera onto a clear message and exit 1', async () => {
     const { io, stderr } = testIo({ backend: fixedBackend([]) });

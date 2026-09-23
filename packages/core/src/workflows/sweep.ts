@@ -38,6 +38,7 @@ import {
   transportInfoOf,
   unlockTokenOf,
   usesAuthChannel,
+  warnIfRecipientFellBack,
   type DumpOptions,
   type SweepResult,
   type WorkflowContext,
@@ -93,6 +94,10 @@ export async function runSweep(
    * arm of a sweep would be `EnterBootloaderMode`. */
   const { plan } = await planForDevice(ctx, 'sweep');
   const entries = plan.windows;
+  /* Recorded while the transport is open: the sweep closes it before the
+   * manifest is built (see `runDump`). */
+  const transport = transportInfoOf(device.transport.info);
+  warnIfRecipientFellBack(ctx);
   const legacy = usesAuthChannel(entries);
   const unlockToken = unlockTokenOf(entries);
   const addressBySubcmd = placeableAddresses(plan);
@@ -267,7 +272,7 @@ export async function runSweep(
     gapFill: args.gapFill,
     unlockToken,
     producer: `seek-thermal-firmware-dump (${device.transport.info.api}, selector sweep)`,
-    transport: transportInfoOf(device.transport.info),
+    transport,
     safety: SAFETY,
     selectors,
     combinedFile,

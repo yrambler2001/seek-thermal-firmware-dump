@@ -134,6 +134,7 @@ export type {
 
 /* ---- USB protocol: opcodes, the transport boundary, the client -------- */
 export {
+  COMMIT_WORST_CASE_MS,
   CONFIGURATION_VALUE,
   DEFAULT_READ_CHUNK,
   EP0_BUF,
@@ -145,6 +146,7 @@ export {
   OP,
   OP_DIRECTION,
   READ_ONLY_OPS,
+  SAFE_BEFORE_IDENTITY,
   SEEK_VENDOR_ID,
   SeekDevice,
   USB_COMMIT_TIMEOUT_MS,
@@ -154,6 +156,7 @@ export {
   WebUsbTransport,
   assertOpSetsDisjoint,
   isFlashOp,
+  isPlatformClaimRefusal,
   isReadOnlyOp,
   u16Payload,
   withTimeout,
@@ -170,7 +173,12 @@ export type {
   TransportInfo,
   UsbBackend,
   UsbTransport,
+  WebUsbConfiguration,
+  WebUsbControlSetup,
   WebUsbDevice,
+  WebUsbInTransferResult,
+  WebUsbOutTransferResult,
+  WebUsbTransferStatus,
   WebUsbTransportOptions,
 } from './protocol/index.js';
 
@@ -307,6 +315,7 @@ export {
   evidenceFromChannelProbe,
   evidenceFromDump,
   flashInvalidatesAnalysis,
+  identityGate,
   isCancelled,
   planForDevice,
   predatesDumpProtocol,
@@ -324,6 +333,7 @@ export {
   transportInfoOf,
   unlockTokenOf,
   usesAuthChannel,
+  versionUnknownReason,
   writeFirmware,
 } from './workflows/index.js';
 export type {
@@ -335,7 +345,9 @@ export type {
   DeviceState,
   DumpOptions,
   DumpResult,
+  IdentityGate,
   KeyPatchRecord,
+  PlannedOperation,
   PreparedFlash,
   SlotState,
   SweepResult,

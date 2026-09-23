@@ -60,6 +60,7 @@ import {
   type PreparedFlash,
   type SlotState,
   type WorkflowContext,
+  warnIfRecipientFellBack,
 } from './types.js';
 
 function sleep(ms: number): Promise<void> {
@@ -373,6 +374,7 @@ export async function writeFirmware(
   const { device, reporter } = ctx;
 
   if (!device.transport.isOpen) await device.transport.open(); /* a dump closes it */
+  warnIfRecipientFellBack(ctx);
 
   /* The analysis can go stale between preparing and writing — a disconnect
    * during the rescue dump drops it — and a payload is only valid for the
@@ -383,6 +385,16 @@ export async function writeFirmware(
       'the device analysis went stale before the write — read the device info again and ' +
         're-pick your image. Nothing was written.',
       { detail: { blockedBy: state.flashBlockedBy } },
+    );
+  }
+  /* Everything below arms 0x52 and streams 0x50 / commits 0x51, ids whose
+   * meaning is per build; `readDeviceInfo` refuses a camera that does not name
+   * its build, so a state without a version did not come from it. */
+  if (state.version === null) {
+    throw new SeekError(
+      'flash/refused',
+      'the analysis does not say which firmware the camera runs, and command ids mean ' +
+        'different things on different builds. Read the device info again. Nothing was written.',
     );
   }
   const target = targetSlot(state);
