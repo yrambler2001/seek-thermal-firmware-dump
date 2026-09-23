@@ -1722,9 +1722,12 @@ machine as §10.5.
   sent `SetFirmwareInfoFeatures` without the read after it. The emulator showed exactly
   this (`2.0.2.3` on 4.8.1.7, §11.8). A second unarmed read would return selector 0, and it
   stays inside `SAFE_BEFORE_IDENTITY`. Not changed here.
-- **The late-row emulator fault on 4.8.1.7 and 4.16.1.7** (§11.8) is not diagnosed. A
-  window read after the whole tier-1 row faults at `0x35202088`; a fresh emulator does
-  not. The pinned rows no longer reach it.
+- ~~**The late-row emulator fault on 4.8.1.7 and 4.16.1.7** (§11.8) is not diagnosed.~~
+  Diagnosed in §13.3 (2026-09-23): a `GetFirmwareInfo` record handler assembles a build-date
+  string into an info-response buffer that aliases the spifilib device-handle global at
+  `0x10082A0C`, so the next window read dereferences a corrupted handle and faults at
+  `0x35202088`. It is not the Thumb IT-state bug (still present after FW-V1's Phase 23 fix).
+  The pinned rows measure first contact gate-first and no longer reach it.
 - **A camera slow to answer GetFirmwareInfo is refused**, and reads once it answers (§11.1).
   Whether a real 0.5.1.x camera behaves like the emulated one is still not known (§10.4).
 - **The commit bound assumes one status-register write per erase or program.** The SPIFI
@@ -2113,3 +2116,124 @@ re-run.
 | `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run`        | exit 0, 547 passed, 3 skipped                           |
 | `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npm run test:coverage` | exit 0, 547 passed, 3 skipped; profiles functions 100 % |
 | `npm run build` twice, then `git status --porcelain -- docs`    | identical files both times; clean after the commit      |
+
+---
+
+## 13. Re-run against the IT-state-fixed emulator; the late-row fault, diagnosed (2026-09-23)
+
+The emulator gained two fixes since these pins were last taken: bit-band aliases (FW-V1 Phase
+20, already reflected in the §12.3.1 pins, which were made at FW-V1 `653ee4f5`) and a Unicorn
+stale-Thumb-IT-state fix (FW-V1 Phase 23, `68757074`/`345c6dd9`, taken **after** those pins).
+Fix 2 changes how the emulator runs every instruction after a memory hook, so every pinned
+emulator result was re-checked. The toolkit is at `08f6e16`; FW-V1 is at `345c6dd9` (`emu-corpus`).
+
+### 13.1 Every pin re-checked, and every one identical
+
+`node scripts/update-emulator-expectations.mjs` (both tiers) against the IT-fixed emulator:
+exit 0, 462 core tests, 205 s, tier 1 20,756 replies delivered = received, tier 2 873,048, 0
+dropped. **`git status` was clean afterwards: `expectations.rpc.json` and
+`expectations.roundtrip.json` are byte-identical to the committed pins.** Nothing the dump tool
+observes moved.
+
+That is the expected outcome, and it is not vacuous. The IT-state fix only changed rows that
+reach the sensor/frame path (FW-V1 Phase 23 moved exactly four: Compact PRO 4.9.1.15 and
+1.0.3.2). Both emulator suites run every firmware with `--no-sensor` and measure first contact
+**gate-first**, so neither tier ever executes the frame path or the late window read the fix
+was thought to bear on. No pin needed regenerating, so there is no pins commit.
+
+### 13.2 The two `npm run check` runs, and the emulator-absent run
+
+Both consecutive, on the committed toolkit (`08f6e16`) against FW-V1 `345c6dd9`. 10-core
+machine, a desktop session beside it. `pgrep -fl seek_emu.py` was empty before, between and
+after; no run was interrupted by an outside `pkill`.
+
+| run                                                      | exit | passed / failed       | wall (vitest)   | slowest row (tier 1 / tier 2) | delivered = received (t1 / t2) | dropped | emulators left |
+| -------------------------------------------------------- | ---- | --------------------- | --------------- | ----------------------------- | ------------------------------ | ------- | -------------- |
+| `npm run check` 1                                        | 0    | 683 / 0               | 217 s (201.7 s) | 120.7 s (0.6.0.4) / 92.8 s    | 20,756 / 873,048               | 0       | 0              |
+| `npm run check` 2                                        | 0    | 683 / 0               | 209 s (195.5 s) | 120.1 s (0.6.0.4) / 89.5 s    | 20,756 / 873,048               | 0       | 0              |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run` | 0    | 547 passed, 3 skipped | 11 s            | —                             | —                              | —       | —              |
+
+The wire line on each check: tier 1 sent every vendor request as `0x41/0xC1`, 0 as `0x40/0xC0`;
+0 SET_CONFIGURATION, 0 SET_INTERFACE; tier 2 the same. The slowest tier-1 row is still the
+0.6.0.4 Compact (§13.4).
+
+### 13.3 The late-row fault on 4.8.1.7 and 4.16.1.7 is NOT gone — and it was never the IT bug
+
+§11.10 left this open and FW-V1 STATE.MD named Phase 23's stale IT state a **candidate**. It is
+not the cause. Re-measured the way the suite runs a row — a whole tier-1 probe, then a fresh
+import and the toolkit's own first-contact probe (`probeSelectorChannel`, whose "can it serve a
+window" step arms subcommand 1 and reads `GetFeaturedFirmwareData`) — against the IT-fixed
+emulator (`345c6dd9`), **both rows still fault**:
+
+- 4.8.1.7: `unmapped addr=0x35202088 at PC=0x100078F0`
+- 4.16.1.7: `unmapped addr=0x35202088 at PC=0x100078F4`
+
+A fresh emulator issuing the same single window read does not fault; the fault needs the whole
+row's churn first, exactly as §11.8 recorded. So Phase 23 did not fix it, which rules the IT
+state out.
+
+**The cause, traced in the emulator (register, write and call capture at the fault).** It is a
+firmware pointer corruption, not an emulator hook artifact:
+
+1. The spifilib device handle is a persistent global at `0x10082A0C` (`*(0x10082A60)`). Its
+   `[+12]` word is `0x40003000`, the SPIFI register base; it is built once at boot and used for
+   every flash read. `0x10082A0C` was a valid handle for the ~13 window reads earlier in the row.
+2. During the post-row first-contact probe, a `GetFirmwareInfo` record handler runs (reached
+   because the command probe's `SetFirmwareInfoFeatures(1)` left a firmware-info selector set).
+   Inside the USB ISR it assembles its response — a build-date string copied from the boot
+   record at flash `0x140019B8` — into the firmware's info-response buffer, whose write pointer
+   is at `0x10082A0A`. The copy runs through the flash-copy path
+   (`0x1000729C` → `0x1000710C` → block-read `0x100078DC`) and writes the string
+   (`… "Jul  5 2018" …`) over the handle: `[handle+4]` goes from `0x10082A18` to `0x3520206C`
+   (the ASCII bytes `"l  5"`).
+3. The very next flash window read (`BeginFirmwareUpgrade(1)` → `GetFeaturedFirmwareData`, src
+   `0x14020000` → dst `0x20000000`) calls the spifilib block-read helper at `0x100078E0`, which
+   loads `r3 = [handle+4] = 0x3520206C` and executes `ldr r4,[r3,#28]` → reads `0x35202088`,
+   which is unmapped → `UC_ERR_READ_UNMAPPED` at `0x100078F0`.
+
+So the firmware's info-response buffer (`~0x10082A0A`) **aliases** the spifilib handle global
+(`0x10082A0C`), and there is no spifi re-init between the record read and the window read. That
+aliasing is why it is "late" and non-reproducible on a fresh emulator: it needs the exact
+ordering the toolkit's post-row probe produces (stale info selector → build-string record read
+into that buffer → immediate window read).
+
+**Firmware or emulator?** It is a firmware store to a firmware-computed destination, so it is
+not the emulator mis-stepping a hook (contrast the IT-state and bit-band faults). But these two
+entries are **donor chimeras** — the image-only 4.8.1.7 / 4.16.1.7 code on the 4.8.2.1 donor's
+decrypted flash and boot record — and the build string that overflows the buffer is read from
+the **donor's** boot record. Whether a native 4.8.1.7 unit's info-response buffer and spifilib
+handle truly alias cannot be settled without a native (non-chimera) dump. Recorded in FW-V1
+`docs/EMULATOR_CAMPAIGN_LOG.md` (Phase 24) and STATE.MD.
+
+**It does not affect any pinned result.** Both suites measure first contact gate-first, which
+never reaches this late window read, so `npm run check` is unaffected — as §13.1 confirms.
+
+### 13.4 The slow 0.6.0.4 row: measured again, still not made faster
+
+§12.5 left this "looked at, not done". Measured on the emulator this pass (in-process, the
+FW-V1 machine driven through the same requests), and it stays not done, for a reason now backed
+by measurement rather than reading:
+
+- **The row time is unchanged**: 120.1–120.7 s (§13.2), the slowest tier-1 row, against the
+  whole `npm run check` at 209–217 s. Each of its ~127 never-answered requests runs the firmware
+  to the emulator's 20,000-host-step budget (`usb_host.py:158`, `cli.py:404`) — ~1.32 M emulated
+  cycles — and is then recorded `no-answer` (status −110), exactly as before.
+- **0.6.0.4 is not idle during those waits.** It is a tight interrupt-driven loop: an IRQ is
+  delivered about every 7 host steps, and **no `WFI`/`WFE` executes at all** while the request
+  is unanswered. Its complete CPU register file + NVIC pending set + USB0 register state repeat
+  with a period of 7 host steps (462 cycles) from about step 800, and SRAM does not change. So
+  the request provably never answers — but the task's own suggested safe rule (stop when
+  "sleeping, no interrupt pending, no timer due") **never matches**, because the firmware never
+  sleeps. That rule would buy nothing here.
+- **A cycle-detection rule would speed it up but cannot be shown safe cheaply.** SysTick is
+  enabled (reload 119,999) and stays pending-but-undelivered inside the loop, so the
+  firmware-visible state only truly repeats on SysTick-period boundaries, not on the 7-step
+  loop; and because the emulator clock is gated on host activity, ending a wait earlier advances
+  the device's emulated time less and therefore shifts the start cycle of **every later request
+  in the row** — the reproducibility hazard §12.5 named. Proving that no pin moves would need
+  the full emulator change plus a clean 51-row regeneration, and no fixed shorter budget is
+  acceptable (0.5.1.0 / 0.5.1.3 are the documented late-answer risk).
+
+**Decision: left as it is**, as §12.5's option allowed. No emulator code changed, so nothing in
+FW-V1's `emu/` moved and no self-test, `SHA256SUMS`, `verify-noop` or campaign-log-for-a-code-change
+was owed for it.
