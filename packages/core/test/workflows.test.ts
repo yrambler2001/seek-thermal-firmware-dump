@@ -23,6 +23,7 @@ import {
 } from '../src/image/header.js';
 import { SeekDevice } from '../src/protocol/client.js';
 import { OP, OP_DIRECTION, READ_ONLY_OPS, WINDOW_SIZE, type Opcode } from '../src/protocol/ops.js';
+import { compact2014 } from '../src/profiles/compact-2014.js';
 import { compact2016 } from '../src/profiles/compact-2016.js';
 import {
   buildLegacyWindowMap,
@@ -31,7 +32,13 @@ import {
   legacyWindowPlan,
   OLD_FW_UNLOCK_TOKEN,
 } from '../src/profiles/legacy-auth.js';
-import { FLASH_BASE, FLASH_SIZE, GAP_ADDRESS, modern4x } from '../src/profiles/modern-4x.js';
+import {
+  FLASH_BASE,
+  FLASH_SIZE,
+  GAP_ADDRESS,
+  modern4x,
+  modernWindowPlan,
+} from '../src/profiles/modern-4x.js';
 import { detectProfile } from '../src/profiles/registry.js';
 import type { FirmwareProfile, SlotKey } from '../src/profiles/types.js';
 import { decryptDump, detectProfileForDump, evidenceFromDump } from '../src/workflows/decrypt.js';
@@ -326,6 +333,7 @@ function makeDeviceState(keyA: Uint8Array, keyB: Uint8Array): DeviceState {
       ['b', slotB],
     ]),
     boot: { booted: 'a', target: 'b' },
+    updateTargetSubcmd: 0,
     targetConfirmed: null,
     familyOk: true,
     canFlash: true,
@@ -1014,6 +1022,100 @@ describe('readDeviceInfo', () => {
     const legacyMatch = state.detection.ranked.find((m) => m.profile.id === 'legacy-auth');
     expect(legacyMatch?.score).toBe(0);
   }, 60_000);
+
+  it('arms no slot the plan leaves out: compact-2014 picked by hand, past the gate', async () => {
+    /* compact-2014 plans nothing for any version, and a family picked by hand
+     * (`--profile compact-2014`, the web app's override) on a camera that
+     * reports 0.8.0.0 or later gets past the identity gate. The slot loop used
+     * to fall back to each slot descriptor's own subcommand when the plan had
+     * no entry, so this read sent BeginFirmwareUpgrade 7, 8 and 9 under a
+     * profile whose plan says nothing is readable. A modern camera and a 2014
+     * build (whose protected banks refuse the plain arm) both past the gate. */
+    for (const camera of [cameraFor(modern4x), legacyBuildCamera('1.3.0.0')]) {
+      const state = await readDeviceInfo(await contextFor(compact2014, camera), { chunk: 4096 });
+      const version = state.version ?? 'no version';
+      const table = compact2014.windowPlan(state.version).table;
+
+      expect(camera.arms, version).toEqual([]);
+      expect(
+        camera.calls.filter((c) => c.op === OP.BEGIN_FIRMWARE_UPGRADE),
+        version,
+      ).toEqual([]);
+      expect(state.slots.map((s) => s.key)).toEqual(['a', 'b', 'r']);
+      for (const slot of state.slots) {
+        const label = `${version} ${slot.name}`;
+        expect(slot.present, label).toBe(false);
+        expect(slot.unread, label).toBe(true);
+        /* no selector reached it, so none is reported */
+        expect(slot.subcmd, label).toBeNull();
+        expect(slot.reason, label).toContain(`not readable on firmware ${version}`);
+        expect(slot.reason, label).toContain(hex(slot.address, 8));
+        expect(slot.reason, label).toContain(table);
+        expect(slot.reason, label).toContain('nothing was armed for it');
+        expect(state.flashBlockedBy, label).toContain(
+          `${slot.name} could not be read (${slot.reason ?? ''})`,
+        );
+      }
+      expect(state.canFlash, version).toBe(false);
+    }
+  }, 60_000);
+
+  it('reports the selector the plan armed a slot with, never a guessed one', async () => {
+    /* A slot descriptor's subcommand is the profile's label; the plan's entry
+     * for that address is what goes on the wire. The state used to report the
+     * label, which here names a selector (0x55, 0x58, 0x59) that was never
+     * sent and that this camera does not have. */
+    const relabelled: FirmwareProfile = {
+      ...modern4x,
+      id: 'test-relabelled-slots',
+      slots: modern4x.slots.map((s) => ({ ...s, subcmd: s.subcmd + 0x50 })),
+    };
+    const camera = cameraFor(modern4x);
+    const state = await readDeviceInfo(await contextFor(relabelled, camera), { chunk: 4096 });
+
+    expect(state.slots.map((s) => s.subcmd)).toEqual([5, 8, 9]);
+    expect(state.slots.every((s) => !s.unread)).toBe(true);
+    expect(camera.arms.filter((s) => s >= 0x50)).toEqual([]);
+  }, 60_000);
+
+  it("arms the upgrade-target selector only when this firmware's own table has it", async () => {
+    /* The upgrade-target probe arms `profile.boot.updateTargetSubcmd`. That
+     * number is the profile's; whether the running build has it is its table's
+     * to say. Here the table carries every window but not subcommand 0, and
+     * the read still makes a boot prediction, which is when the probe runs. */
+    const noUpgradeRow: FirmwareProfile = {
+      ...modern4x,
+      id: 'test-no-upgrade-row',
+      windowPlan: (version) => {
+        const plan = modernWindowPlan(version);
+        return { ...plan, selectors: plan.selectors.filter((r) => r.subcmd !== 0) };
+      },
+    };
+    const camera = cameraFor(modern4x);
+    const reporter = collectingReporter();
+    const state = await readDeviceInfo(await contextFor(noUpgradeRow, camera, reporter), {
+      chunk: 4096,
+    });
+
+    expect(state.boot).not.toBeNull();
+    expect(camera.arms).not.toContain(0);
+    expect(state.updateTargetSubcmd).toBeNull();
+    expect(state.targetConfirmed).toBeNull();
+    expect(state.canFlash).toBe(false);
+    expect(state.flashBlockedBy.join('\n')).toContain(
+      "no upgrade-target selector 0x0 in this firmware's own table",
+    );
+
+    /* and under modern-4x itself the row is there, and it is the one armed */
+    const modernCamera = cameraFor(modern4x);
+    const modern = await readDeviceInfo(await contextFor(modern4x, modernCamera), {
+      chunk: 4096,
+    });
+    expect(modern.boot).not.toBeNull();
+    expect(modern.updateTargetSubcmd).toBe(0);
+    expect(modernCamera.arms.at(-1)).toBe(0);
+    expect(modern.flashBlockedBy.join('\n')).not.toContain('upgrade-target selector');
+  }, 60_000);
 });
 
 describe('writeFirmware', () => {
@@ -1031,6 +1133,35 @@ describe('writeFirmware', () => {
     expect(error).toBeInstanceOf(SeekError);
     expect((error as SeekError).code).toBe('flash/refused');
     expect((error as SeekError).message).toContain('does not say which firmware');
+    expect(camera.calls).toHaveLength(0);
+  });
+
+  it("refuses an analysis whose firmware's table has no upgrade-target selector", async () => {
+    /* The selector the write arms is the one `readDeviceInfo` took from the
+     * running build's own table, carried on the state. It used to be the
+     * profile's `updateTargetSubcmd`, so an analysis whose table had no such
+     * row still had subcommand 0 armed and the payload streamed at it. */
+    const keyA = makeKey(62);
+    const keyB = makeKey(63);
+    const state: DeviceState = { ...makeDeviceState(keyA, keyB), updateTargetSubcmd: null };
+    const prep = prepareImage(
+      state,
+      makePlainImage(keyA, keyB, modern4x),
+      `fw${keyFilenameSuffix(keyA, keyB)}.bin`,
+    );
+    const camera = cameraFor(modern4x);
+    const ctx = await contextFor(modern4x, camera);
+
+    const error = await writeFirmware(ctx, state, prep).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(error).toBeInstanceOf(SeekError);
+    expect((error as SeekError).code).toBe('flash/refused');
+    expect((error as SeekError).message).toContain('no upgrade-target selector');
+    expect((error as SeekError).message).toContain('Nothing was written');
+    expect(camera.arms).toEqual([]);
     expect(camera.calls).toHaveLength(0);
   });
 });

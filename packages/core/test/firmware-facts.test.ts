@@ -32,7 +32,7 @@ import {
   legacySelectorRows,
   legacyWindowPlan,
 } from '../src/profiles/legacy-auth.js';
-import { buildModernWindowMap } from '../src/profiles/modern-4x.js';
+import { buildModernWindowMap, modernWindowPlan } from '../src/profiles/modern-4x.js';
 import { detectProfile, getProfile } from '../src/profiles/registry.js';
 import type { SelectorRow } from '../src/profiles/types.js';
 import { parseVersion } from '../src/profiles/version.js';
@@ -418,6 +418,25 @@ describe("the selector tables, against each image's own BeginFirmwareUpgrade swi
         expect(claimed, `${id} mode ${String(row.mode)}`).toBe(Number(row.address));
       }
     }
+  });
+
+  it('has a mode 0 on every post-2018 image, computed, as the upgrade-target row says', () => {
+    /* The device read and the write arm the upgrade-target selector only when
+     * the running build's table carries it, so the modern table carries a row
+     * for mode 0 with no address. Every post-2018 image switches on mode 0 and
+     * computes its block (`fw_update_slot_address()`); none carries a constant. */
+    const row = modernWindowPlan('4.18.2.0').selectors.find((r) => r.subcmd === 0);
+    expect(row?.address).toBeNull();
+    let images = 0;
+    for (const [id, f] of IMAGES) {
+      const v = parseVersion(f.version);
+      if (v === null || v.major <= 1) continue;
+      images++;
+      const mode0 = f.windowTable?.rows.find((r) => r.mode === 0);
+      expect(mode0?.kind, id).toBe('computed');
+    }
+    /* the 14 post-2018 images of the corpus (sec.12.2 counts the same 14) */
+    expect(images).toBe(14);
   });
 });
 

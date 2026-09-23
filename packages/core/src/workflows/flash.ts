@@ -401,16 +401,24 @@ export async function writeFirmware(
   if (target === null) {
     throw new SeekError('flash/refused', 'the analysis no longer names a target slot');
   }
-  if (state.profile.boot.updateTargetSubcmd < 0) {
+  /* THE SELECTOR THE ANALYSIS TOOK FROM THIS BUILD'S TABLE, not the profile's
+   * number. `readDeviceInfo` sets it only when the running firmware's own plan
+   * carries the profile's upgrade-target row; a state without one has no
+   * window to write, and nothing is armed on a guess. */
+  const subcmd = state.updateTargetSubcmd;
+  if (subcmd === null) {
+    const named = state.profile.boot.updateTargetSubcmd;
     throw new SeekError(
       'flash/refused',
-      `${state.profile.name} exposes no upgrade-target selector, so there is no window to write`,
+      (named < 0
+        ? `${state.profile.name} exposes no upgrade-target selector`
+        : `the analysis found no upgrade-target selector ${hex(named)} in this firmware's own ` +
+          'table') + ', so there is no window to write. Nothing was written.',
     );
   }
 
   assertBankPayload(prep.payload); /* last gate before anything is sent */
 
-  const subcmd = state.profile.boot.updateTargetSubcmd;
   reporter.log(
     `target: ${target.name} at ${hex(target.address, 8)} (selector ${hex(subcmd)} — the camera ` +
       'resolves this itself)',

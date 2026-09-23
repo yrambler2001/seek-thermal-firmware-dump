@@ -51,6 +51,7 @@ import type {
   SlotDescriptor,
   SlotKey,
   WindowEntry,
+  WindowPlan,
 } from '../profiles/types.js';
 import {
   entryForAddress,
@@ -73,7 +74,10 @@ const BOOT_CONFIG_BYTES = 0x120;
 interface RawSlot {
   readonly present: boolean;
   readonly reason: string | null;
-  /** True only when the read threw; a clean read of an empty slot is false. */
+  /**
+   * True when the slot was not read: the read threw, or the plan has no window
+   * for it and nothing was armed. A clean read of an empty slot is false.
+   */
   readonly unread?: boolean;
   readonly header: ImageHeader | null;
   readonly raw: Uint8Array | null;
@@ -176,6 +180,41 @@ async function analyseSlot(slot: RawSlot, profile: FirmwareProfile): Promise<Ana
   };
 }
 
+/**
+ * Why a slot the running firmware's plan does not reach was not read.
+ *
+ * NO SUBCOMMAND IS GUESSED IN ITS PLACE. The slot descriptor carries one, but
+ * that number is the profile's label for the slot on the builds it was decoded
+ * from. On the camera in front of us only the plan says what arms what, and a
+ * plan with no window at this address (`compact-2014` plans none at all, for
+ * any version) is that firmware's answer. This read used to fall back to the
+ * descriptor's subcommand, so a `compact-2014` read of a camera past the
+ * identity gate armed 7, 8 and 9 under a profile whose plan reads nothing.
+ */
+function notInPlan(plan: WindowPlan, version: string | null, address: number): string {
+  return (
+    `not readable on firmware ${version ?? 'of unknown version'}: its plan (${plan.table}) has ` +
+    `no window at ${hex(address, 8)}, so nothing was armed for it`
+  );
+}
+
+/**
+ * The upgrade-target selector, if the running firmware's own table has it.
+ *
+ * The profile's boot policy names the subcommand an upgrade arms (0 on the
+ * post-2018 line, none on the legacy line); whether THIS build switches on it
+ * is its table's to say. The camera computes the block, so the row carries no
+ * address, but it has to be there, and plain, because the read-back here and
+ * `writeFirmware` both send the plain 2-byte payload.
+ */
+function upgradeSelectorIn(plan: WindowPlan, profile: FirmwareProfile): number | null {
+  const subcmd = profile.boot.updateTargetSubcmd;
+  if (subcmd < 0) return null;
+  return plan.selectors.some((row) => row.subcmd === subcmd && row.channel === 'plain')
+    ? subcmd
+    : null;
+}
+
 /* ---- upgrade-target confirmation ------------------------------------ */
 
 /**
@@ -267,7 +306,12 @@ export async function readDeviceInfo(
   const { firmware, plan } = await planForDevice(ctx, 'read the device info');
   const version = firmware.version;
   const buildString = firmware.buildString;
+  /* EVERY ARM BELOW COMES FROM THIS PLAN, and a block it has no window for is
+   * reported as not readable on this firmware rather than armed some other
+   * way: the boot config, the bootloader block, each slot, and the upgrade
+   * target, which must be a row of this build's table too. */
   const entries = plan.windows;
+  const updateTargetSubcmd = upgradeSelectorIn(plan, profile);
   warnIfRecipientFellBack(ctx);
 
   reporter.log('firmware info selectors ...', 'detail');
@@ -352,34 +396,45 @@ export async function readDeviceInfo(
   /* ---- the slots ---------------------------------------------------- */
   reporter.log('');
   const analysed: AnalysedSlot[] = [];
+  /* The selector each slot was armed with, from the plan, or null for none. */
+  const armedWith: (number | null)[] = [];
   const descriptors: readonly SlotDescriptor[] = profile.slots;
   const budget = descriptors.length * WINDOW_SIZE; /* upper bound; slots are usually 0xc000 */
   let done = 0;
   for (const descriptor of descriptors) {
     reporter.progress(done, budget, `Reading ${descriptor.name} ...`);
-    reporter.log(`reading ${descriptor.name} at ${hex(descriptor.address, 8)} ...`, 'detail');
-    const entry: WindowEntry = entryForAddress(entries, descriptor.address) ?? {
-      subcmd: descriptor.subcmd,
-      address: descriptor.address,
-      note: descriptor.name,
-    };
+    /* The plan's entry or nothing: see `notInPlan`. */
+    const entry = entryForAddress(entries, descriptor.address);
+    armedWith.push(entry?.subcmd ?? null);
     let read: RawSlot;
-    try {
-      read = await readSlot(device, entry, chunk, (n) => {
-        done += n;
-        reporter.progress(done, budget);
-      });
-      noteArmed(entry);
-    } catch (error) {
-      if (error instanceof CancelledError) throw error;
+    if (entry === null) {
       read = {
         present: false,
-        reason: errorMessage(error),
+        reason: notInPlan(plan, version, descriptor.address),
         unread: true,
         header: null,
         raw: null,
         footer: null,
       };
+    } else {
+      reporter.log(`reading ${descriptor.name} at ${hex(descriptor.address, 8)} ...`, 'detail');
+      try {
+        read = await readSlot(device, entry, chunk, (n) => {
+          done += n;
+          reporter.progress(done, budget);
+        });
+        noteArmed(entry);
+      } catch (error) {
+        if (error instanceof CancelledError) throw error;
+        read = {
+          present: false,
+          reason: errorMessage(error),
+          unread: true,
+          header: null,
+          raw: null,
+          footer: null,
+        };
+      }
     }
     analysed.push(await analyseSlot(read, profile));
   }
@@ -450,7 +505,7 @@ export async function readDeviceInfo(
     const state: SlotState = {
       key: descriptor.key,
       name: descriptor.name,
-      subcmd: descriptor.subcmd,
+      subcmd: armedWith[i] ?? null,
       address: descriptor.address,
       present: slot.present,
       reason: slot.reason,
@@ -531,24 +586,33 @@ export async function readDeviceInfo(
       }
     }
 
-    if (profile.boot.updateTargetSubcmd >= 0) {
+    /* The selector comes from this build's table (`upgradeSelectorIn`), not
+     * from the profile alone: a profile's number is armed only where the
+     * running firmware's own switch has that row. */
+    if (updateTargetSubcmd !== null) {
       const targetAddress = byKey.get(prediction.target)?.address ?? profile.memory.flashBase;
       targetConfirmed = await confirmUpgradeTarget(
         ctx,
         chunk,
-        profile.boot.updateTargetSubcmd,
+        updateTargetSubcmd,
         targetAddress,
         byKeyAnalysed,
       );
       if (targetConfirmed !== null && targetConfirmed !== prediction.target) {
         reporter.log(
-          `  the window selector ${hex(profile.boot.updateTargetSubcmd)} arms is ` +
+          `  the window selector ${hex(updateTargetSubcmd)} arms is ` +
             `${byKey.get(targetConfirmed)?.name ?? targetConfirmed} — trusting that over the ` +
             'boot-config replay',
           'warn',
         );
         prediction = { booted: prediction.booted, target: targetConfirmed };
       }
+    } else if (profile.boot.updateTargetSubcmd >= 0) {
+      reporter.log(
+        `  this firmware's own table (${plan.table}) has no upgrade-target selector ` +
+          `${hex(profile.boot.updateTargetSubcmd)}, so nothing was armed to confirm the target`,
+        'warn',
+      );
     }
 
     const targetSlot = byKey.get(prediction.target);
@@ -637,6 +701,16 @@ export async function readDeviceInfo(
   if (!flashSupport.supported) {
     blocked.push(`${profile.name} does not support flashing: ${flashSupport.reason}`);
   }
+  /* A profile that writes through a selector this build's table does not have
+   * has no window to write, and `writeFirmware` would refuse on the state
+   * anyway; saying so here keeps the button honest. A profile that names no
+   * selector at all is already blocked by its capability, or by the write. */
+  if (profile.boot.updateTargetSubcmd >= 0 && updateTargetSubcmd === null) {
+    blocked.push(
+      `there is no upgrade-target selector ${hex(profile.boot.updateTargetSubcmd)} in this ` +
+        `firmware's own table (${plan.table}), so there is no window to write`,
+    );
+  }
   if (keyWhiteningK !== profile.cipher.whiteningK) {
     blocked.push(
       `this camera's key table resolves under K=${hexUp(keyWhiteningK)} but ${profile.name} ` +
@@ -704,6 +778,7 @@ export async function readDeviceInfo(
     slots,
     byKey,
     boot: prediction,
+    updateTargetSubcmd,
     targetConfirmed,
     familyOk,
     canFlash: blocked.length === 0,

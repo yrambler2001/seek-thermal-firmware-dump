@@ -37,7 +37,8 @@ function slotJson(slot: SlotState): Record<string, unknown> {
     key: slot.key,
     name: slot.name,
     address: hexUp(slot.address),
-    subcmd: hex(slot.subcmd),
+    /* null when the firmware's plan has no window for this slot: nothing armed it */
+    subcmd: slot.subcmd === null ? null : hex(slot.subcmd),
     present: slot.present,
     reason: slot.reason,
     version: slot.plainHeader?.versionStr ?? slot.header?.versionStr ?? null,

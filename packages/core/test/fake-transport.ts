@@ -146,6 +146,11 @@ export class FakeCamera implements UsbTransport {
   readonly flash: Uint8Array;
   /** Every vendor request in order. A read-only run must never contain a write op. */
   readonly calls: FakeCall[] = [];
+  /**
+   * The subcommand of every BeginFirmwareUpgrade received, in order, whether
+   * or not it armed. `calls` says an arm went out; this says which selector.
+   */
+  readonly arms: number[] = [];
 
   private readonly windows = new Map<number, FakeWindowSpec>();
   private readonly options: FakeCameraOptions;
@@ -355,6 +360,7 @@ export class FakeCamera implements UsbTransport {
 
   private beginFirmwareUpgrade(data: Uint8Array): void {
     const subcmd = u16le(data);
+    this.arms.push(subcmd);
     this.armed = null;
     this.windowOffset = 0;
     this.staged = [];

@@ -29,6 +29,7 @@ import {
   legacyWindowPlan,
   listProfiles,
   modern4x,
+  placeableAddresses,
   registerProfile,
   requireCapability,
   unregisterProfile,
@@ -558,6 +559,27 @@ describe('modern-4x boot replay (select_boot_slot)', () => {
 
   it('arms selector 0 as the update target', () => {
     expect(modern4x.boot.updateTargetSubcmd).toBe(0);
+  });
+
+  it("carries selector 0 in the family's table as a computed row that reads nothing", () => {
+    /* The device read and the write take the upgrade-target selector from the
+     * running build's table, so the table has to carry it. Its address is the
+     * camera's choice (`fw_update_slot_address()`), so the row has none, and
+     * with no address it can never become a window or place a sweep's bytes. */
+    for (const profile of [modern4x, generic]) {
+      const plan = profile.windowPlan('4.18.2.0');
+      const rows = plan.selectors.filter((r) => r.subcmd === profile.boot.updateTargetSubcmd);
+      expect(rows, profile.id).toHaveLength(1);
+      expect(rows[0]?.address, profile.id).toBeNull();
+      expect(rows[0]?.channel, profile.id).toBe('plain');
+      expect(rows[0]?.note, profile.id).toMatch(/fw_update_slot_address/);
+      expect(
+        plan.windows.some((w) => w.subcmd === 0),
+        profile.id,
+      ).toBe(false);
+      expect(plan.windows, profile.id).toHaveLength(WINDOW_COUNT - 1);
+      expect(placeableAddresses(plan).has(0), profile.id).toBe(false);
+    }
   });
 });
 

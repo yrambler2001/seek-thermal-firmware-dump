@@ -198,6 +198,15 @@ export const MODERN_MEMORY: MemoryLayout = {
  * firmwares confirm all 63 windows on the emulator at these addresses. The two
  * aliases the comment above `buildModernWindowMap` names are left out of the
  * rows as they are left out of the map.
+ *
+ * SUBCOMMAND 0 IS A ROW, WITH NO ADDRESS. It is the upgrade target: every
+ * post-2018 image switches on it and computes the block at run time
+ * (`fw_op_dest = fw_update_slot_address()`, every variant of FW-V1's
+ * `cmd_BeginFirmwareUpgrade.c`; `kind: computed` for mode 0 on all 14 post-2018
+ * images in `test/firmware/facts.json`). With no address it is never a window
+ * and never places a sweep's bytes; it is here because the device read and the
+ * write arm the upgrade-target selector only when the running build's table
+ * carries it (`readDeviceInfo`, `writeFirmware`).
  */
 export function modernWindowPlan(
   firmwareVersion: string | null,
@@ -206,12 +215,20 @@ export function modernWindowPlan(
   return buildWindowPlan({
     table,
     firmwareVersion,
-    selectors: buildModernWindowMap().map((entry) => ({
-      subcmd: entry.subcmd,
-      address: entry.address,
-      channel: 'plain' as const,
-      note: entry.note,
-    })),
+    selectors: [
+      {
+        subcmd: SUBCMD_UPDATE_TARGET,
+        address: null,
+        channel: 'plain',
+        note: 'upgrade target: the camera picks the slot it did not boot from at run time (fw_update_slot_address())',
+      },
+      ...buildModernWindowMap().map((entry) => ({
+        subcmd: entry.subcmd,
+        address: entry.address,
+        channel: 'plain' as const,
+        note: entry.note,
+      })),
+    ],
     holes: MODERN_MEMORY.unreachable,
     flashBase: FLASH_BASE,
     flashSize: FLASH_SIZE,

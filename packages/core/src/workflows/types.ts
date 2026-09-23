@@ -223,14 +223,20 @@ export interface DecryptResult {
 export interface SlotState {
   readonly key: SlotKey;
   readonly name: string;
-  readonly subcmd: number;
+  /**
+   * The selector this slot was armed with: the running firmware's own plan
+   * entry for `address`. Null when that plan has no window there, in which
+   * case nothing was armed for it, and no subcommand is guessed in its place.
+   */
+  readonly subcmd: number | null;
   readonly address: number;
   readonly present: boolean;
   /** Why the slot holds no usable image, when it does not. */
   readonly reason: string | null;
   /**
-   * The READ failed — the window would not arm, or the transfer died — as
-   * opposed to a window that read back cleanly and simply holds no image.
+   * The slot was NOT READ — the window would not arm, the transfer died, or
+   * the running firmware's plan has no window for it so nothing was armed —
+   * as opposed to a window that read back cleanly and simply holds no image.
    * The difference matters: an unread slot means the picture of the camera is
    * incomplete, so nothing may be written on the strength of it.
    */
@@ -293,6 +299,13 @@ export interface DeviceState {
 
   /** The bootloader's own replayed choice, or null when it could not be replayed. */
   readonly boot: BootPrediction | null;
+  /**
+   * The upgrade-target selector, as the running firmware's own table carries
+   * it: the profile's `boot.updateTargetSubcmd`, and only when that build's
+   * plan has a plain row for it. Null when the profile names none or the table
+   * lacks it; then nothing arms it, neither the read-back below nor a write.
+   */
+  readonly updateTargetSubcmd: number | null;
   /** The slot the upgrade selector's window was read back from, when it could be told. */
   readonly targetConfirmed: SlotKey | null;
 
