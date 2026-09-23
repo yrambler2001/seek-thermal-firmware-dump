@@ -2237,3 +2237,103 @@ by measurement rather than reading:
 **Decision: left as it is**, as §12.5's option allowed. No emulator code changed, so nothing in
 FW-V1's `emu/` moved and no self-test, `SHA256SUMS`, `verify-noop` or campaign-log-for-a-code-change
 was owed for it.
+
+## 14. Re-run against the wire-time emulator; 27 pins moved, every one explained (2026-09-23)
+
+FW-V1 Phase 28 changed the emulator twice: handlers now nest by priority (`ba5662e7`), and a
+USB IN transfer completes no sooner than its data bits take at 480 Mb/s (`405f3d28`, USB 2.0
+sec.7.1: 64 B = 1.07 µs). The toolkit is at `f177b2f`; FW-V1 at `ff6cffcf` (`emu-corpus`; its
+`emu/` is `405f3d28`). The FW-V1 agent that made the change ran `npm run check` only on
+`ba5662e7` (679 / 683) and expected exactly one change on `405f3d28`: the four 4.8.1.7 /
+4.16.1.7 rows' `controlInBytes["512"]`, 192 → 512. There were more.
+
+### 14.1 The first `npm run check`: exit 1, 656 / 683
+
+Tier 1: 26 rows failed; tier 2: 1 row failed. Regenerated with
+`node scripts/update-emulator-expectations.mjs` (both tiers, 462 core tests, exit 0) and the
+diff read field by field. Nothing else moved: identity, chip id, commands, windows, auth and
+plan are identical on every other row, and tier 2 is identical on the other 14 dumps.
+
+| rows                                                                                                                                                                                                      | field                       | pinned → now   |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- | -------------- |
+| Compact 4.8.1.7 and 4.16.1.7, image and trimmed (4)                                                                                                                                                       | `controlInBytes["512"]`     | 192 → 512      |
+| Compact 4.8.1.9 image and trimmed, Compact 4.8.2.1 dump, Compact PRO 4.9.1.15 (2), 4.9.2.0 (3), 4.18.2.0-FF (4), Compact XR 4.8.2.1 (2), Mosaic 10.9.1.31 (2), Mosaic 2.27.1.33-FF (2), Nano 200 (2) (20) | `controlInBytes["256"]`     | 128 → 256      |
+| the same 20                                                                                                                                                                                               | `controlInBytes["512"]`     | 128 → 512      |
+| Nano 300 44.27.3.10 dump and decrypted image (tier 1), dump (tier 2)                                                                                                                                      | the whole row → a known gap | measured → not |
+
+### 14.2 The 24 `controlInBytes` rows: the pins recorded an emulator race
+
+All 24 are the defect FW-V1 `405f3d28` removed. The ROM primes the next 64-byte EP0 IN packet
+(`ENDPTPRIME` at `0x10401EB2`) and 39 cycles later write-1-clears the `ENDPTCOMPLETE` bit it
+read before the prime (`0x104020CA`). With a zero-time transfer the emulated host completed
+the new packet inside those 39 cycles, the ROM's clear wiped that completion, the next packet
+was never primed, and the data stage ended short: after two packets (128 B) on these 20 rows,
+after three (192 B) on 4.8.1.7 / 4.16.1.7. Traced at register level on the Compact PRO
+4.18.2.0-FF dump, the row run exactly as the suite runs it (the suite's harness, FW-V1's
+emulator with a tracer injected through `PYTHONPATH`), once on `ba5662e7` and once on
+`405f3d28`:
+
+- `ba5662e7`: packet 2 primed at cycle 58,930,895, retired at 58,930,934, and the ROM's clear
+  at the same cycle took its completion bit; the host got 128 B and the status stage.
+- `405f3d28`: each packet retires 172 cycles after its prime, after the ROM's clear at +39;
+  four packets, 256 B.
+
+The camera serves 256-byte EP0 reads (FW-V1 `docs/USB_DEVICE_READOUT.md`, "the current proven
+chunk size"), so the new values are the ones a camera gives. The FW-V1 agent saw only the four
+192-B rows because on `ba5662e7` the race still produced 128 on the other 20, which matched
+their pins.
+
+### 14.3 The three Nano 300 rows: a firmware race the emulator's timing now hits
+
+On `405f3d28` the emulator dies on the Nano 300's first vendor request (`GetFirmwareInfo`,
+`c1 4e … 24 00`, the 17th SETUP): unmapped read of `0x8808F3A2` at PC `0x1000436C`. The row
+becomes "not measurable … the emulator process exited before the probe finished", and tier 2's
+dump refuses because `GetFirmwareInfo` never answers. Traced the same way on both emulators
+(addresses in the decrypted image, loaded at `0x10000000`):
+
+- `0x1000433C` is a main-loop poll of the MFi (iAP) link's transmit ring. It checks that the
+  platform (`0x1000CBF4`) is `0xF1`, loads the link context from `0x1000B3F8`, checks its
+  enabled flag and whether the head transfer's 1000 ms deadline has passed, then raises BASEPRI
+  (`0x10006BB0`) and **loads the context again** (`0x10004366`) without re-checking it.
+- The USB ISR's first vendor control transfer calls `set_target_platform(0xF0)` (`0x10004A60`),
+  which zeroes that context (`str r2, [r4, #16]` at `0x10004AA2`).
+- If the SETUP arrives between the check and the BASEPRI raise, the poll resumes with context 0,
+  reads `[0 + 908]` and dereferences what it finds. The emulator's address-0 alias is the boot
+  flash, which gives `0x8808F382`; on silicon address 0 is remapped by `M4MEMMAP` and the word
+  would differ, but the pointer is garbage either way.
+- `ba5662e7`: the poll entered at cycle 34,240,073 and the SETUP arrived 11 cycles later, before
+  the platform check; the check saw `0xF0` and the poll did nothing. `405f3d28`: the poll
+  enters at the same cycle (it is timer-driven), but the enumeration's IN transfers now take
+  their wire time and each completes a host step later, which moves the host's step grid: the
+  SETUP arrives **77 cycles** after the poll's entry, inside the window, and the ISR zeroes the
+  context under it (cycles 34,240,394 and 34,240,888). Every run gave the identical fault (both `npm run check`s, the regeneration,
+  two traced runs): the USB/IP clock is gated, so the result is a function of the URB sequence
+  alone.
+
+This is **real firmware behaviour** in the sense that the race is in the image; a camera would
+hit it only if a host's first vendor request happened to land in that window, which on silicon
+is tens of cycles out of the poll's 12.5 ms period. The emulator hits it every time because its
+host steps, and so its SETUP deliveries, come on a grid that the firmware's wake-ups anchor, and
+the first vendor request of this sequence now falls on the poll's first instructions. Nothing in
+the emulator is unphysical there (a SETUP 77 cycles after a poll starts is possible on the wire),
+so nothing was changed in FW-V1 to dodge it, and the rows are pinned as the known gap they now
+are, with the fault in the reason. If FW-V1 changes the host timing again this row will move
+back, and the suite will say so ("was a known gap … and is now fully measured").
+
+### 14.4 The pins commit, and the second `npm run check`
+
+The regenerated pins are commit `795fca8`, on their own.
+
+| run                                   | exit | passed / failed | wall (vitest) | slowest row (tier 1 / tier 2) | delivered = received (t1 / t2) | dropped |
+| ------------------------------------- | ---- | --------------- | ------------- | ----------------------------- | ------------------------------ | ------- |
+| `npm run check` 1 (pins of `f177b2f`) | 1    | 656 / 27        | 703.7 s       | 614.7 s (Nano 300) / 125.0 s  | 19,762 / 808,271               | 0       |
+| `npm run check` 2 (pins of `795fca8`) | 0    | 683 / 0         | 720.4 s       | 617.2 s (Nano 300) / 149.8 s  | 19,762 / 808,271               | 0       |
+
+The wire line on run 2: every vendor request `0x41/0xC1`, 0 `0x40/0xC0`; 0 SET_CONFIGURATION,
+0 SET_INTERFACE. Tier 2 delivered fewer replies than §13.2 (808,271 against 873,048) because
+the Nano 300 dump is now a 12 s gap instead of a full round trip.
+
+**The cost, stated:** the two tier-1 Nano 300 rows now take ~615 s each — the probe meets a
+dead emulator and every reopen sits out its timeout — so `npm run check` went from ~210 s to
+~720 s. The pinned gap is exact, so this is a slow pass, not a flaky one. Making the probe give
+up sooner on a dead emulator is a toolkit-side change and was not made here.
