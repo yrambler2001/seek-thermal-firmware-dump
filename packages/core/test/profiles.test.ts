@@ -18,10 +18,13 @@ import {
   LEGACY_KNOWN_VERSIONS,
   buildLegacyWindowMap,
   buildModernWindowMap,
+  buildWindowPlan,
+  compact2014,
   compact2016,
   detectProfile,
   generic,
   getProfile,
+  hasCapability,
   legacyAuth,
   legacyWindowPlan,
   listProfiles,
@@ -34,7 +37,9 @@ import type {
   CapabilityName,
   FirmwareProfile,
   ProfileId,
+  SelectorRow,
   SlotKey,
+  UnreachableRange,
   WindowEntry,
 } from '../src/profiles/index.js';
 
@@ -325,6 +330,29 @@ describe('legacy-auth per-build tables (each build dumped with its own)', () => 
     }
   });
 
+  it('gives compact-2014 an empty plan whatever version it is handed, the whole part a gap', () => {
+    /* Reached when compact-2014 is the acting profile and the version passes
+     * the identity gate — a family picked by hand (`--profile compact-2014`,
+     * or the web app's override) on a camera that reports 0.8.0.0 or later.
+     * `planForDevice` then asks this for a plan, and it must still plan
+     * nothing: the profile's refusal is about the PROTOCOL it knows, and its
+     * memory map declares no readable block. */
+    for (const v of ['0.3.0.1', '0.7.0.8', '1.3.0.0', '4.18.2.0', null]) {
+      const plan = compact2014.windowPlan(v);
+      expect(plan.firmwareVersion, String(v)).toBe(v);
+      expect(plan.windows, String(v)).toEqual([]);
+      expect(plan.selectors, String(v)).toEqual([]);
+      expect(plan.table, String(v)).toBe('none: no read handler on this generation');
+      expect(
+        plan.unreachable.map((g) => [g.address, g.length]),
+        String(v),
+      ).toEqual([[FLASH_BASE, FLASH_SIZE]]);
+      expect(plan.unreachable[0]?.reason, String(v)).toContain('GetFeaturedFirmwareData');
+      /* The same map the profile declares, not a copy that could drift. */
+      expect(plan.unreachable).toEqual(compact2014.memory.unreachable);
+    }
+  });
+
   it('falls back to the agreed rows for a build it has not decoded', () => {
     const unknown = legacyWindowPlan('1.1.0.0');
     expect(unknown.windows).toEqual(legacyWindowPlan(null).windows);
@@ -335,6 +363,116 @@ describe('legacy-auth per-build tables (each build dumped with its own)', () => 
     for (const v of [...LEGACY_KNOWN_VERSIONS, null]) {
       expect(compact2016.windowPlan(v)).toEqual(legacyAuth.windowPlan(v));
     }
+  });
+});
+
+/* ==================================================================== *
+ * The plan builder refuses a table it cannot stand behind.
+ *
+ * `buildWindowPlan` is where a build's selector rows become the windows a dump
+ * arms. Two tables are programming errors, and both must throw rather than
+ * plan: an authenticated row with no token to send, and rows and declared
+ * gaps that do not tile the part exactly — a block read AND called a gap, or a
+ * block neither read nor explained. A plan built from either would arm a
+ * window it cannot open, or silently leave a block out of the dump.
+ * ==================================================================== */
+
+describe('buildWindowPlan refuses a table that does not tile the part', () => {
+  /** A four-block part, so every address is easy to name in a message. */
+  const PART = { flashBase: FLASH_BASE, flashSize: 4 * WINDOW_SIZE, windowSize: WINDOW_SIZE };
+  const at = (block: number): number => FLASH_BASE + block * WINDOW_SIZE;
+  const row = (subcmd: number, block: number, channel: SelectorRow['channel']): SelectorRow => ({
+    subcmd,
+    address: at(block),
+    channel,
+    note: `block ${String(block)}`,
+  });
+  const hole = (block: number): UnreachableRange => ({
+    address: at(block),
+    length: WINDOW_SIZE,
+    reason: `block ${String(block)} has no selector`,
+  });
+
+  it('plans a table that does tile it, and throws nothing', () => {
+    const plan = buildWindowPlan({
+      table: 'tiling',
+      firmwareVersion: '9.9.9.9',
+      selectors: [row(1, 0, 'plain'), row(2, 1, 'plain'), row(3, 2, 'refused')],
+      holes: [hole(2), hole(3)],
+      ...PART,
+    });
+    expect(plan.windows.map((w) => [w.subcmd, w.address])).toEqual([
+      [1, at(0)],
+      [2, at(1)],
+    ]);
+    expect(plan.unreachable.map((g) => g.address)).toEqual([at(2), at(3)]);
+  });
+
+  it('refuses an authenticated row when no token is set, naming the table and subcommand', () => {
+    expect(() =>
+      buildWindowPlan({
+        table: 'needs-a-token',
+        firmwareVersion: '1.0.3.0',
+        selectors: [row(1, 0, 'plain'), row(5, 1, 'auth'), row(2, 2, 'plain'), row(3, 3, 'plain')],
+        holes: [],
+        ...PART,
+      }),
+    ).toThrow('needs-a-token: subcmd 0x5 needs a token and none is set');
+
+    /* With the token, the same table plans, and the window carries its payload. */
+    const plan = buildWindowPlan({
+      table: 'needs-a-token',
+      firmwareVersion: '1.0.3.0',
+      selectors: [row(1, 0, 'plain'), row(5, 1, 'auth'), row(2, 2, 'plain'), row(3, 3, 'plain')],
+      holes: [],
+      authPayload: (subcmd) => Uint8Array.of(subcmd, 0, ...OLD_FW_UNLOCK_TOKEN),
+      ...PART,
+    });
+    const armed = plan.windows.find((w) => w.subcmd === 5);
+    expect(armed?.auth).toBe(true);
+    expect(armed?.payload?.length).toBe(18);
+  });
+
+  it('refuses rows and holes that disagree, naming every block on both sides', () => {
+    /* Block 1 is read AND declared a gap; blocks 2 and 3 are neither read nor
+     * explained. Both lists must be in the message, in address order. */
+    let message = '';
+    try {
+      buildWindowPlan({
+        table: 'disagrees',
+        firmwareVersion: null,
+        selectors: [row(1, 0, 'plain'), row(2, 1, 'plain')],
+        holes: [hole(1)],
+        ...PART,
+      });
+    } catch (error: unknown) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toBe(
+      'disagrees: holes and rows disagree — no reason for [0x14020000, 0x14030000], ' +
+        'and a reason for readable [0x14010000]',
+    );
+  });
+
+  it('refuses a missing reason on its own, and a stray reason on its own', () => {
+    expect(() =>
+      buildWindowPlan({
+        table: 'unexplained',
+        firmwareVersion: null,
+        selectors: [row(1, 0, 'plain'), row(2, 1, 'plain'), row(3, 2, 'plain')],
+        holes: [],
+        ...PART,
+      }),
+    ).toThrow(/no reason for \[0x14030000\], and a reason for readable \[\]/);
+    expect(() =>
+      buildWindowPlan({
+        table: 'overclaimed',
+        firmwareVersion: null,
+        selectors: [row(1, 0, 'plain'), row(2, 1, 'plain'), row(3, 2, 'plain'), row(4, 3, 'plain')],
+        holes: [hole(0)],
+        ...PART,
+      }),
+    ).toThrow(/no reason for \[\], and a reason for readable \[0x14000000\]/);
   });
 });
 
@@ -655,6 +793,34 @@ describe('capabilities', () => {
       expect(support.reason).toContain('GetFeaturedFirmwareData');
       expect(support.reason).toContain('EnterBootloaderMode');
     }
+  });
+
+  it('answers hasCapability exactly as requireCapability decides, for every profile and op', () => {
+    /* The non-throwing gate a UI can ask before offering a button. If the two
+     * ever disagreed, a page could offer a run the workflow then refuses — or
+     * hide one it would have allowed. */
+    const ops: readonly CapabilityName[] = ['dump', 'sweep', 'decrypt', 'deviceInfo', 'flash'];
+    const seen = new Set<boolean>();
+    for (const profile of listProfiles()) {
+      for (const op of ops) {
+        let refused = false;
+        try {
+          requireCapability(profile, op);
+        } catch (error: unknown) {
+          expect(error, `${profile.id}.${op}`).toBeInstanceOf(SeekError);
+          refused = true;
+        }
+        const allowed = hasCapability(profile, op);
+        expect(allowed, `${profile.id}.${op}`).toBe(!refused);
+        expect(allowed, `${profile.id}.${op}`).toBe(profile.capabilities[op].supported);
+        seen.add(allowed);
+      }
+    }
+    /* Both answers occur among the built-ins, so this is not vacuous. */
+    expect([...seen].sort()).toEqual([false, true]);
+    expect(hasCapability(modern4x, 'flash')).toBe(true);
+    expect(hasCapability(compact2014, 'dump')).toBe(false);
+    expect(hasCapability(compact2014, 'decrypt')).toBe(true);
   });
 
   it('gives compact-2014 no selector map at all, so a bypass still sends nothing', () => {
