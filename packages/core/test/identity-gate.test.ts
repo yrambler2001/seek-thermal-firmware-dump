@@ -33,11 +33,17 @@ import { legacyAuth } from '../src/profiles/legacy-auth.js';
 import { modern4x } from '../src/profiles/modern-4x.js';
 import { detectProfile } from '../src/profiles/registry.js';
 import type { FirmwareProfile } from '../src/profiles/types.js';
-import { evidenceFromChannelProbe, probeSelectorChannel } from '../src/workflows/capability.js';
+import {
+  evidenceFromChannelProbe,
+  probeSelectorChannel,
+  readRunningFirmware,
+  VERSION_READ_ATTEMPTS,
+} from '../src/workflows/capability.js';
 import { readDeviceInfo } from '../src/workflows/device-info.js';
 import { runDump } from '../src/workflows/dump.js';
 import { runSweep } from '../src/workflows/sweep.js';
 import type { WorkflowContext } from '../src/workflows/types.js';
+import { planForDevice } from '../src/workflows/window-plan.js';
 import { fakeCamera } from './fake-transport.js';
 import facts from './firmware/facts.json' with { type: 'json' };
 
@@ -244,7 +250,8 @@ describe('a camera whose firmware version cannot be read', () => {
     expect(probe.skippedForSafety).toBe(true);
     expect(probe.plainAccepted).toBe(false);
     expect(probe.notes.join(' ')).toContain('did not report its firmware version');
-    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO]);
+    /* Two reads: two failures in a row end the version read (readRunningFirmware). */
+    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
   });
 
   it('cannot hand legacy-auth a "refused plain arm" it never observed', async () => {
@@ -332,6 +339,185 @@ describe('a camera whose version says the ids mean something else', () => {
     const error = await refusal(async () => readDeviceInfo(await contextFor(modern4x, camera)));
     expect(error.code).toBe('profile/unsupported');
     expect(error.message).toContain('refusing to read the device info: firmware 0.3.0.1 predates');
-    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO]);
+    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
+  });
+});
+
+/* ---- a camera an earlier program left with the info selector set ------ */
+
+/** GetFirmwareInfo record: four version bytes, then a date string. */
+function infoRecord(version: readonly [number, number, number, number], date: string): Uint8Array {
+  const out = new Uint8Array(36);
+  out.set(version, 0);
+  out.set(new TextEncoder().encode(date), 4);
+  return out;
+}
+
+/**
+ * Compact 4.8.1.7 as the emulator runs it: record 0 is the application's build
+ * block, record 1 the bootloader's (`2.0.2.3`, which is what a single unarmed
+ * read returned on the emulator after the probe's SetFirmwareInfoFeatures(1),
+ * TESTING.md sec.11.8).
+ */
+function compact4817(): ReturnType<typeof fakeCamera> {
+  return fakeCamera({
+    initialMode: 0,
+    fwInfo: new Map([
+      [0, infoRecord([4, 8, 1, 7], 'Sep  4 2018 15:36:50')],
+      [1, infoRecord([2, 0, 2, 3], 'Feb 26 2020 11:23:26')],
+    ]),
+  });
+}
+
+/**
+ * What another program — or an interrupted run of this one — leaves behind:
+ * `SetFirmwareInfoFeatures(n)` with no read after it. The selector is one u16
+ * in the camera's RAM; closing the device does not clear it (the fake keeps it
+ * across close/open, as the firmware keeps it across a USB re-open).
+ */
+async function leaveSelectorAt(camera: ReturnType<typeof fakeCamera>, sel: number): Promise<void> {
+  await camera.open();
+  await new SeekDevice(camera).rpcOut(OP.SET_FIRMWARE_INFO_FEATURES, Uint8Array.of(sel, 0));
+  await camera.close();
+  camera.calls.length = 0;
+}
+
+/** Drops the first `count` GetFirmwareInfo requests before the camera sees them: a lost SETUP. */
+class LosesFirstVersionReads implements UsbTransport {
+  private readonly inner: UsbTransport;
+  private remaining: number;
+  constructor(inner: UsbTransport, count: number) {
+    this.inner = inner;
+    this.remaining = count;
+  }
+  get description(): DeviceDescription {
+    return this.inner.description;
+  }
+  get info(): TransportInfo {
+    return this.inner.info;
+  }
+  get isOpen(): boolean {
+    return this.inner.isOpen;
+  }
+  open(): Promise<void> {
+    return this.inner.open();
+  }
+  close(): Promise<void> {
+    return this.inner.close();
+  }
+  controlIn(request: number, length: number, timeoutMs: number): Promise<Uint8Array> {
+    if (request === OP.GET_FIRMWARE_INFO && this.remaining > 0) {
+      this.remaining -= 1;
+      return Promise.reject(new SeekError('usb/timeout', 'control IN 0x4e: no answer in 5000 ms'));
+    }
+    return this.inner.controlIn(request, length, timeoutMs);
+  }
+  controlOut(request: number, data: Uint8Array, timeoutMs: number): Promise<void> {
+    return this.inner.controlOut(request, data, timeoutMs);
+  }
+}
+
+describe('a camera an earlier command left with the firmware-info selector set', () => {
+  it("reads the application's version, not the record the selector was left on", async () => {
+    const camera = compact4817();
+    await leaveSelectorAt(camera, 1);
+    await camera.open();
+    const running = await readRunningFirmware(new SeekDevice(camera));
+
+    expect(running.version).toBe('4.8.1.7');
+    expect(running.buildString).toBe('Sep  4 2018 15:36:50');
+    expect(running.note).toContain('the first read answered a different record (2.0.2.3)');
+    /* Two unarmed reads, nothing else: both inside SAFE_BEFORE_IDENTITY. */
+    expect(camera.calls).toEqual([
+      { direction: 'in', op: OP.GET_FIRMWARE_INFO, length: 36 },
+      { direction: 'in', op: OP.GET_FIRMWARE_INFO, length: 36 },
+    ]);
+  });
+
+  it('hands the probe and the planner that version too', async () => {
+    const probeCamera = compact4817();
+    await leaveSelectorAt(probeCamera, 1);
+    await probeCamera.open();
+    const probe = await probeSelectorChannel(new SeekDevice(probeCamera));
+    expect(probe.firmwareVersion).toBe('4.8.1.7');
+
+    const planCamera = compact4817();
+    await leaveSelectorAt(planCamera, 1);
+    const { firmware, plan } = await planForDevice(await contextFor(modern4x, planCamera), 'dump');
+    expect(firmware.version).toBe('4.8.1.7');
+    expect(plan.firmwareVersion).toBe('4.8.1.7');
+  });
+
+  it('cannot open the gate on 0.3.0.1 with a record that happens to parse as a later version', async () => {
+    /* The safety case. On 0.3.0.1 wire id 0x52 is EnterBootloaderMode. If the
+     * version read believed a stale record — here the bootloader's 2.0.2.3 —
+     * identityGate would permit arming and the probe would send 0x52. */
+    const camera = fakeCamera({
+      initialMode: 0,
+      fwInfo: new Map([
+        [0, infoRecord([0, 3, 0, 1], 'May  3 2014 10:42:49')],
+        [1, infoRecord([2, 0, 2, 3], 'Feb 26 2020 11:23:26')],
+      ]),
+    });
+    await leaveSelectorAt(camera, 1);
+    await camera.open();
+    const probe = await probeSelectorChannel(new SeekDevice(camera));
+
+    expect(
+      camera.calls.filter((c) => c.op === OP.BEGIN_FIRMWARE_UPGRADE).length,
+      'arms (0x52, EnterBootloaderMode on 0.3.0.1) sent by the probe',
+    ).toBe(0);
+    expect(probe.firmwareVersion).toBe('0.3.0.1');
+    expect(probe.skippedForSafety).toBe(true);
+    expectOnlyAgreedReads(camera, 'probe of 0.3.0.1 with a stale selector');
+
+    await leaveSelectorAt(camera, 1);
+    const error = await refusal(async () =>
+      runDump(await contextFor(modern4x, camera), { chunk: 4096, decrypt: false }),
+    );
+    expect(error.code).toBe('profile/unsupported');
+    expect(error.message).toContain('firmware 0.3.0.1 predates');
+    expectOnlyAgreedReads(camera, 'dump of 0.3.0.1 with a stale selector');
+  });
+
+  it('counts only an ANSWERED read as clearing the selector', async () => {
+    /* A lost first read proves nothing: the camera may never have taken the
+     * SETUP, so the next answer can still be the stale record. */
+    const camera = compact4817();
+    await leaveSelectorAt(camera, 1);
+    await camera.open();
+    const running = await readRunningFirmware(
+      new SeekDevice(new LosesFirstVersionReads(camera, 1)),
+    );
+    expect(running.version).toBe('4.8.1.7');
+    expect(running.note).toContain('(2.0.2.3)');
+    /* The camera saw two reads: the stale answer, then the build block. */
+    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
+  });
+
+  it('gives up after two failures in a row, and after the attempt budget', async () => {
+    const lost = compact4817();
+    await lost.open();
+    const twice = await readRunningFirmware(new SeekDevice(new LosesFirstVersionReads(lost, 2)));
+    expect(twice.version).toBeNull();
+    expect(twice.note).toContain('did not answer');
+    expect(lost.calls).toHaveLength(0);
+
+    /* answered, lost, answered, lost: never two answers in a row. */
+    class Alternating extends LosesFirstVersionReads {
+      private n = 0;
+      override controlIn(request: number, length: number, timeoutMs: number): Promise<Uint8Array> {
+        this.n += 1;
+        return this.n % 2 === 0
+          ? Promise.reject(new SeekError('usb/timeout', 'control IN 0x4e: no answer in 5000 ms'))
+          : super.controlIn(request, length, timeoutMs);
+      }
+    }
+    const flaky = compact4817();
+    await flaky.open();
+    const alternating = await readRunningFirmware(new SeekDevice(new Alternating(flaky, 0)));
+    expect(alternating.version).toBeNull();
+    expect(alternating.note).toContain('never two in a row');
+    expect(flaky.calls).toHaveLength(VERSION_READ_ATTEMPTS / 2);
   });
 });

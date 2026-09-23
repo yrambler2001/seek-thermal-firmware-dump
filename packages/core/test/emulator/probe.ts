@@ -265,9 +265,12 @@ export interface AuthProbe {
  * plans stops at the head of its window loop, before its first arm; a dump
  * that refuses throws first. Either way the record says which.
  *
- * `sentBeforeIdentity` is every distinct request that went out before a
- * GetFirmwareInfo came back with a version (four bytes or more), in the order
- * first sent. The rule it is held to (TESTING.md sec.11): only control INs of
+ * `sentBeforeIdentity` is every distinct request that went out before the
+ * version was known, in the order first sent. "Known" is the criterion
+ * `readRunningFirmware` itself uses: an answered GetFirmwareInfo carrying a
+ * version (four bytes or more) directly after another answered one — the
+ * first answer may be a record an earlier command left the info selector on
+ * (TESTING.md sec.12). The rule it is held to (sec.11): only control INs of
  * `SAFE_BEFORE_IDENTITY`. On Compact 0.5.1.0 and 0.5.1.3 the version never
  * comes back on the emulator, so that list is everything the toolkit sent.
  */
@@ -275,15 +278,32 @@ export interface GateProbe {
   /** What the probe's version read — the toolkit's first request — returned. */
   readonly firmwareVersion: string | null;
   /**
-   * Whether ANY GetFirmwareInfo of this first contact came back with a version:
-   * the probe's, or the dump's own read after it. 0.6.0.4 does not answer the
-   * first and answers the second.
+   * Whether the version became known at any point of this first contact: in
+   * the probe's version read, or in the dump's own after it.
    */
   readonly identified: boolean;
   readonly profile: string;
   /** `<code>: <message>` of the dump's refusal, or null when it planned a read. */
   readonly refusal: string | null;
   readonly sentBeforeIdentity: readonly string[];
+}
+
+/**
+ * THE VERSION READ AFTER AN EARLIER COMMAND LEFT THE INFO SELECTOR SET.
+ *
+ * The command probe ends with `SetFirmwareInfoFeatures(1)` and never reads
+ * record 1 back, which is exactly the state another program — or an
+ * interrupted run of this toolkit — can leave a camera in. The toolkit's own
+ * `readRunningFirmware` is then run as it is on first contact, and every
+ * GetFirmwareInfo it sent is recorded as it came back. A single read, which is
+ * what the toolkit did until TESTING.md sec.12, would have taken `answers[0]`
+ * as the version; on Compact 4.8.1.7 that was the bootloader's `2.0.2.3`.
+ */
+export interface StaleSelectorProbe {
+  /** Each GetFirmwareInfo of that read: `a.b.c.d`, `<n> B`, `stall` or `no-answer`. */
+  readonly answers: readonly string[];
+  /** The version `readRunningFirmware` settled on, or null. */
+  readonly version: string | null;
 }
 
 export interface Tier1Result {
@@ -297,6 +317,8 @@ export interface Tier1Result {
   readonly plan: PlanProbe;
   /** The toolkit's own first contact, and what it sent before identity. */
   readonly gate: GateProbe;
+  /** The toolkit's version read with the info selector left at 1, at the end of the row. */
+  readonly staleSelector: StaleSelectorProbe;
   /** Bytes actually returned for a control IN of each probed size. */
   readonly controlInBytes: Readonly<Record<string, number | null>>;
   /** sha256 of the 4 MiB image the emulator says it is serving. */
@@ -368,11 +390,13 @@ function sameAt(hay: Uint8Array, offset: number, got: Uint8Array): boolean {
 /**
  * A pass-through `UsbTransport` that notes each request until the camera has
  * named its build. The instrument's own record, not the toolkit's: it decides
- * "identified" by the same criterion `readRunningFirmware` uses.
+ * "identified" by the same criterion `readRunningFirmware` uses — an answered
+ * GetFirmwareInfo with a version, directly after another answered one.
  */
 class IdentityRecorder implements UsbTransport {
   readonly sentBeforeIdentity: string[] = [];
   identified = false;
+  private previousInfoAnswered = false;
   private readonly inner: UsbTransport;
 
   constructor(inner: UsbTransport) {
@@ -401,13 +425,25 @@ class IdentityRecorder implements UsbTransport {
 
   async controlIn(request: number, length: number, timeoutMs: number): Promise<Uint8Array> {
     this.note('IN', request);
-    const data = await this.inner.controlIn(request, length, timeoutMs);
-    if (request === OP.GET_FIRMWARE_INFO && data.length >= 4) this.identified = true;
+    if (request !== OP.GET_FIRMWARE_INFO) {
+      this.previousInfoAnswered = false;
+      return this.inner.controlIn(request, length, timeoutMs);
+    }
+    let data: Uint8Array;
+    try {
+      data = await this.inner.controlIn(request, length, timeoutMs);
+    } catch (error) {
+      this.previousInfoAnswered = false;
+      throw error;
+    }
+    if (this.previousInfoAnswered && data.length >= 4) this.identified = true;
+    this.previousInfoAnswered = true;
     return data;
   }
 
   controlOut(request: number, data: Uint8Array, timeoutMs: number): Promise<void> {
     this.note('OUT', request);
+    this.previousInfoAnswered = false;
     return this.inner.controlOut(request, data, timeoutMs);
   }
 
@@ -415,6 +451,54 @@ class IdentityRecorder implements UsbTransport {
     if (this.identified) return;
     const key = `${direction} ${HEX(request)}`;
     if (!this.sentBeforeIdentity.includes(key)) this.sentBeforeIdentity.push(key);
+  }
+}
+
+/** A pass-through `UsbTransport` that records how each GetFirmwareInfo came back. */
+class InfoAnswers implements UsbTransport {
+  readonly answers: string[] = [];
+  private readonly inner: UsbTransport;
+
+  constructor(inner: UsbTransport) {
+    this.inner = inner;
+  }
+
+  get description(): DeviceDescription {
+    return this.inner.description;
+  }
+
+  get info(): TransportInfo {
+    return this.inner.info;
+  }
+
+  get isOpen(): boolean {
+    return this.inner.isOpen;
+  }
+
+  open(): Promise<void> {
+    return this.inner.open();
+  }
+
+  close(): Promise<void> {
+    return this.inner.close();
+  }
+
+  async controlIn(request: number, length: number, timeoutMs: number): Promise<Uint8Array> {
+    if (request !== OP.GET_FIRMWARE_INFO) return this.inner.controlIn(request, length, timeoutMs);
+    try {
+      const data = await this.inner.controlIn(request, length, timeoutMs);
+      this.answers.push(
+        data.length >= 4 ? [...data.subarray(0, 4)].join('.') : `${String(data.length)} B`,
+      );
+      return data;
+    } catch (error) {
+      this.answers.push(classify(error));
+      throw error;
+    }
+  }
+
+  controlOut(request: number, data: Uint8Array, timeoutMs: number): Promise<void> {
+    return this.inner.controlOut(request, data, timeoutMs);
   }
 }
 
@@ -929,6 +1013,20 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
      * wrong; what is recorded here is the toolkit's own guarded path. */
     commands.EnsureMode0 = await measure('EnsureMode0', () => seek.ensureMode0());
 
+    /* ---- the version read, with the info selector left set ----
+     * The command probe's SetFirmwareInfoFeatures(1) above is never read back,
+     * so the selector is still 1 wherever the firmware accepted it — the state
+     * another program can leave a camera in. The toolkit's own version read is
+     * run exactly as it is on first contact; what each of its reads returned is
+     * recorded alongside what it settled on (TESTING.md sec.12). */
+    await recover();
+    const infoAnswers = new InfoAnswers(transport);
+    const settled = await readRunningFirmware(new SeekDevice(infoAnswers));
+    const staleSelector: StaleSelectorProbe = {
+      answers: infoAnswers.answers,
+      version: settled.version,
+    };
+
     /* THE LAST THING ASKED IS WHETHER THERE WAS STILL A CAMERA.
      *
      * `ensureMeasurable` only fires for a device that was seen to answer and
@@ -959,6 +1057,7 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
       auth,
       plan,
       gate: toolkit,
+      staleSelector,
       controlInBytes,
       servedSha256: emu.ready.flash_sha256,
       fillSeed: emu.ready.fill?.seed ?? null,

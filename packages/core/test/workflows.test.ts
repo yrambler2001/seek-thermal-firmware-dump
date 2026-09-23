@@ -585,10 +585,11 @@ describe('runDump', () => {
       expect((error as SeekError).code).toBe('profile/unsupported');
       expect((error as SeekError).message).toContain(`firmware ${version} predates the dump`);
       expect((error as SeekError).message).toContain('setter only');
+      /* The version read (two unarmed reads), and nothing after it. */
       expect(
         camera.calls.map((c) => c.op),
         version,
-      ).toEqual([OP.GET_FIRMWARE_INFO]);
+      ).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
     }
   }, 60_000);
 

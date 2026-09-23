@@ -47,6 +47,7 @@ export {
   FIRST_DUMPABLE_MINOR,
   PROBE_OPEN_SUBCMD,
   PROBE_PROTECTED_SUBCMD,
+  VERSION_READ_ATTEMPTS,
   type CameraIdentification,
   type IdentityGate,
   type ProbeOptions,

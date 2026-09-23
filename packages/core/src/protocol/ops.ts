@@ -84,8 +84,10 @@ export const READ_ONLY_OPS: ReadonlySet<Opcode> = new Set<Opcode>([
    * read-only set would not be much of one.
    *
    * The selector it is normally paired with, `SetFirmwareInfoFeatures`, stays
-   * in `FLASH_OPS`: the probe reads selector 0, which is the default after
-   * reset, so it never has to set one.
+   * in `FLASH_OPS`: the version read never sets one. It does not trust the
+   * selector to be 0 either — an earlier program can leave it set, and only a
+   * read clears it — so it reads twice and takes the second answer
+   * (`readRunningFirmware`).
    */
   OP.GET_FIRMWARE_INFO,
 ]);

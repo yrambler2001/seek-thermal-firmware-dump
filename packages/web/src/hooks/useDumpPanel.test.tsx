@@ -352,7 +352,8 @@ describe('useDumpPanel detects the camera instead of asking', () => {
     expect(refusal?.message).toContain('firmware 0.3.0.1 predates the dump protocol');
     expect(refusal?.hint).toBe(FIRMWARE_TOO_OLD_HINT);
     expect(downloads).toHaveLength(0);
-    expect(calls.map((call) => call.request)).toEqual([OP.GET_FIRMWARE_INFO]);
+    /* The version read — two unarmed reads — and not one request after it. */
+    expect(calls.map((call) => call.request)).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
     unmount();
   });
 
@@ -402,7 +403,7 @@ describe('a family picked by hand still goes through the identity gate', () => {
       expect(
         calls.map((call) => call.request),
         choice,
-      ).toEqual([OP.GET_FIRMWARE_INFO]);
+      ).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
       unmount();
     }
   });

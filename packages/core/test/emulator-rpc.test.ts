@@ -84,6 +84,7 @@ import {
   probeTier1,
   ProbeUnmeasurable,
   type GateProbe,
+  type StaleSelectorProbe,
   type Tier1Result,
   type WindowProbe,
 } from './emulator/probe.js';
@@ -150,14 +151,45 @@ export interface RpcExpectation {
    * Null only on a row that could not be measured at all.
    */
   readonly gate: GateProbe | null;
+  /**
+   * The toolkit's version read at the END of the row, after the command probe's
+   * `SetFirmwareInfoFeatures(1)` left the info selector set: each answer, and
+   * the version it settled on (TESTING.md sec.12). Null only on a row that
+   * could not be measured at all.
+   */
+  readonly staleSelector: StaleSelectorProbe | null;
+}
+
+/**
+ * THE VERSION READ IS NOT FOOLED BY A SELECTOR LEFT SET, checked on every row
+ * in both modes: whatever the command probe's `SetFirmwareInfoFeatures(1)`
+ * left behind, the toolkit's version read at the end of the row names the
+ * build it named when the plan was made, earlier in the same row with the
+ * selector at 0. Rows where either read got no version are left to the pin.
+ */
+function assertVersionReadRule(
+  entryId: string,
+  planned: string | null,
+  stale: StaleSelectorProbe | null,
+): void {
+  const version = stale?.version ?? null;
+  if (version === null || planned === null) return;
+  expect(
+    version,
+    `${entryId}: with the info selector left at 1 the version read returned ${version} ` +
+      `(answers ${stale?.answers.join(', ') ?? ''}), not the ${planned} it read before`,
+  ).toBe(planned);
 }
 
 /**
  * THE RULE, checked on every row whatever the pin says, in both modes: before
  * the camera has named its build the toolkit sends only control INs of
  * `SAFE_BEFORE_IDENTITY`, and a camera that never names it is refused. ("Never"
- * is the whole first contact: 0.6.0.4 does not answer the probe's version read
- * and does answer the dump's, which then refuses it as a pre-0.8 build.)
+ * is the whole first contact: 0.6.0.4 does not answer the first GetFirmwareInfo
+ * it is sent and answers the ones after it. Until the version read took two
+ * answered reads, that first read was the probe's whole version read, and it
+ * was the dump's own read that named the build; now the probe's second and
+ * third reads do, TESTING.md sec.12.)
  */
 function assertIdentityRule(entryId: string, gate: GateProbe | null): void {
   if (gate === null) return;
@@ -295,6 +327,7 @@ function summarize(result: Tier1Result, entry: (typeof ENTRIES)[number]): RpcExp
     auth: result.auth,
     plan: summarizePlan(result),
     gate: result.gate,
+    staleSelector: result.staleSelector,
   };
 }
 
@@ -428,6 +461,7 @@ async function measureRow(
         gaps: [],
       },
       gate: null,
+      staleSelector: null,
       gap: { reason: gapReason(error).slice(0, 300) },
     };
   }
@@ -453,7 +487,10 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
           'every vendor request sent as bmRequestType 0x41/0xC1 (TESTING.md sec.9.9). ' +
           '`gate` is the toolkit itself — probe, detection, runDump — and every request it ' +
           'sent before the camera named its build; only control INs of SAFE_BEFORE_IDENTITY ' +
-          'are allowed there, and a camera with no version is refused (TESTING.md sec.11).',
+          'are allowed there, and a camera with no version is refused (TESTING.md sec.11). ' +
+          "`staleSelector` is the toolkit's version read at the end of the row, after " +
+          'SetFirmwareInfoFeatures(1) was left unread: every GetFirmwareInfo answer, and the ' +
+          'version it settled on, which must be the one the plan was made from (sec.12).',
         generatedBy: 'packages/core/test/emulator-rpc.test.ts (SEEK_EMU_REGEN=1)',
         fill: { seed: FILL_SEED, scope: FILL_SCOPE },
         readChunk: 64,
@@ -512,6 +549,7 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
            * measurement to pin. */
           expect(now.plan.misplaced, 'plan windows serving bytes from another address').toEqual({});
           assertIdentityRule(entry.id, now.gate);
+          assertVersionReadRule(entry.id, now.plan.firmwareVersion, now.staleSelector);
           measured[entry.id] = now;
           status = now.gap === null ? 'supported' : 'known-gap';
           return;
@@ -569,6 +607,13 @@ describe.skipIf(EMU_DIR === null)('emulator RPC surface (tier 1)', () => {
          * identity, and a refusal when identity never comes (sec.11) ---- */
         assertIdentityRule(entry.id, now.gate);
         expect(now.gate, "the toolkit's own first contact").toEqual(want.gate);
+
+        /* ---- THE VERSION READ with the info selector left set: the build the
+         * plan was made from, whatever record the selector named (sec.12) ---- */
+        assertVersionReadRule(entry.id, now.plan.firmwareVersion, now.staleSelector);
+        expect(now.staleSelector, 'the version read with the info selector left set').toEqual(
+          want.staleSelector,
+        );
         status = now.gap === null ? 'supported' : 'known-gap';
       } catch (error) {
         status = 'failed';

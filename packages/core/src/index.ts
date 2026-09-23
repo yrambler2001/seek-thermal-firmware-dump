@@ -337,6 +337,7 @@ export {
   usesAuthChannel,
   versionUnknownReason,
   writeFirmware,
+  VERSION_READ_ATTEMPTS,
 } from './workflows/index.js';
 export type {
   CameraIdentification,

@@ -194,46 +194,126 @@ export function identityGate(firmware: RunningFirmware): IdentityGate {
 }
 
 /**
+ * The most unarmed `GetFirmwareInfo` reads one version read sends.
+ *
+ * Two whenever both are answered, whatever record the selector was left on:
+ * the first clears it and the second is the build block (`readRunningFirmware`).
+ * The rest of the budget is for reads that fail on the way — a lost first read
+ * costs one more — and two failures in a row end it early.
+ */
+export const VERSION_READ_ATTEMPTS = 4;
+
+/** One unarmed GetFirmwareInfo, as it came back. */
+type InfoRead =
+  | { readonly answered: true; readonly bytes: Uint8Array }
+  | { readonly answered: false; readonly error: unknown };
+
+function versionOf(bytes: Uint8Array): string {
+  return [bytes[0], bytes[1], bytes[2], bytes[3]].join('.');
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/**
  * The running build's version, from a command every build has.
  *
  * `GetFirmwareInfo` unarmed, NOT `readFwInfo(0, ...)`. The latter sends
- * `SetFirmwareInfoFeatures` first, which lives in `FLASH_OPS`; this stays inside
- * `READ_ONLY_OPS`. Selector 0 is the default after a reset and the handler
- * clears the selector after every read, and selector 0 is the build block, so
- * the unarmed read returns it — measured on 0.3.0.1, 1.3.0.8, 4.18.2.0, 10.9.1.31
- * and 42.32.3.10, which returned 00 03 00 01, 01 03 00 08, 04 12 02 00,
- * 0A 09 01 1F and 2A 20 03 0A respectively, each followed by that build's own
- * date string. `GetFirmwareInfo` has a getter at 0x4E in all 36 corpus images.
+ * `SetFirmwareInfoFeatures` first, which lives in `FLASH_OPS`; this stays
+ * inside `READ_ONLY_OPS`, and inside `SAFE_BEFORE_IDENTITY`: `GetFirmwareInfo`
+ * has a getter at 0x4E in all 36 corpus images.
+ *
+ * READ TWICE, AND TRUST ONLY THE READ THAT FOLLOWS AN ANSWERED ONE. The
+ * getter answers whichever record the firmware-info selector names, and
+ * selector 0 is the build block — `00 03 00 01`, `01 03 00 08`, `04 12 02 00`,
+ * `0A 09 01 1F` and `2A 20 03 0A` on 0.3.0.1, 1.3.0.8, 4.18.2.0, 10.9.1.31 and
+ * 42.32.3.10 over USB/IP, each followed by that build's own date string. But
+ * the selector is 0 only after a reset or after a read. It is one u16 in RAM
+ * (0x1000B3EE on the completed images) that `SetFirmwareInfoFeatures` (wire
+ * 0x55) latches, and `SetFwOpCharFeatures` (wire 0x5B) latches too; no USB
+ * reset or re-open clears it. What does clear it is the getter itself: every
+ * FW-V1 reconstruction of `cmd_GetFirmwareInfo` (0.3.0.1, 1.3.0.8, the 2016
+ * Compact PRO, 4.9.2.0, the Compact PRO FF, Compact XR, Mosaic 9 Hz and FF,
+ * Nano 200 and 300) writes 0 to it on every path that returns data, and all
+ * but 0.3.0.1 on the unsupported-record path as well. And it does so while
+ * handling the SETUP stage, before the data stage leaves the camera. So one
+ * read that was ANSWERED — data, of any length — leaves the selector at 0,
+ * and the next read returns the build block, whatever an earlier program, or
+ * an interrupted run of this one, left behind. Measured the other way round
+ * on the emulator: after the tier-1 probe's `SetFirmwareInfoFeatures(1)`, a
+ * single unarmed read on Compact 4.8.1.7 returned `2.0.2.3`, its
+ * bootloader's version (TESTING.md sec.11.8).
+ *
+ * The first answer is therefore never the version: it is only proof that the
+ * selector is now 0. A read that FAILED proves nothing — a stall may be the
+ * dispatcher refusing before the getter runs, and a timeout may be a SETUP
+ * the camera never took — so the rule is "an answered read, then another",
+ * with up to `VERSION_READ_ATTEMPTS` reads and two failures in a row ending
+ * it. A stale first answer is named in the note, because it is worth knowing
+ * that something left the camera in that state.
  *
  * Never throws for a refusal or a timeout — a camera that does not say is a
  * camera whose version is unknown, and `identityGate` says what that means:
  * nothing more is sent — but a cancellation propagates.
  */
 export async function readRunningFirmware(device: SeekDevice): Promise<RunningFirmware> {
-  try {
-    const raw = await device.rpcIn(OP.GET_FIRMWARE_INFO, 36);
-    if (raw.length < 4) {
-      return {
-        version: null,
-        buildString: null,
-        note: `GetFirmwareInfo answered ${String(raw.length)} byte(s), too few for a version`,
-      };
+  const reads: InfoRead[] = [];
+  for (let attempt = 0; attempt < VERSION_READ_ATTEMPTS; attempt++) {
+    let read: InfoRead;
+    try {
+      read = { answered: true, bytes: await device.rpcIn(OP.GET_FIRMWARE_INFO, 36) };
+    } catch (error) {
+      if (error instanceof CancelledError) throw error;
+      read = { answered: false, error };
     }
-    const version = [raw[0], raw[1], raw[2], raw[3]].join('.');
-    const buildString = raw.length > 4 ? asciiz(raw.subarray(4)) : null;
-    return {
-      version,
-      buildString,
-      note: `the camera reports firmware ${version}${buildString === null ? '' : ` (${buildString})`}`,
-    };
-  } catch (error) {
-    if (error instanceof CancelledError) throw error;
+    const previous = reads.at(-1);
+    reads.push(read);
+    if (read.answered && previous?.answered === true) {
+      return firmwareFrom(read.bytes, previous.bytes);
+    }
+    if (!read.answered && previous?.answered === false) break;
+  }
+
+  const lastFailure = [...reads].reverse().find((read) => !read.answered);
+  const answered = reads.filter((read) => read.answered).length;
+  return {
+    version: null,
+    buildString: null,
+    note:
+      lastFailure === undefined
+        ? `GetFirmwareInfo was never answered twice in a row in ${String(reads.length)} reads`
+        : `GetFirmwareInfo did not answer (${errorMessage(lastFailure.error)})` +
+          (answered > 0
+            ? `; ${String(answered)} of ${String(reads.length)} reads answered, never two in a ` +
+              'row, so none of them can be told from a record an earlier command left selected'
+            : ''),
+  };
+}
+
+/** The version the second of two answered reads carries, and what the first one said. */
+function firmwareFrom(bytes: Uint8Array, first: Uint8Array): RunningFirmware {
+  const stale =
+    sameBytes(first, bytes) || first.length < 4
+      ? ''
+      : `; the first read answered a different record (${versionOf(first)}), which an ` +
+        'earlier command had left the firmware-info selector on — that read cleared it';
+  if (bytes.length < 4) {
     return {
       version: null,
       buildString: null,
-      note: `GetFirmwareInfo did not answer (${errorMessage(error)})`,
+      note: `GetFirmwareInfo answered ${String(bytes.length)} byte(s), too few for a version${stale}`,
     };
   }
+  const version = versionOf(bytes);
+  const buildString = bytes.length > 4 ? asciiz(bytes.subarray(4)) : null;
+  return {
+    version,
+    buildString,
+    note:
+      `the camera reports firmware ${version}${buildString === null ? '' : ` (${buildString})`}` +
+      stale,
+  };
 }
 
 export interface SelectorChannelProbe {

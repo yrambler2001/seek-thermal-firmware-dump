@@ -116,7 +116,8 @@ describe('probeSelectorChannel', () => {
 
     expect(probe.firmwareVersion).toBe('0.3.0.1');
     expect(probe.skippedForSafety).toBe(true);
-    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO]);
+    /* The version read is two unarmed reads (readRunningFirmware); nothing else. */
+    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
     expect(camera.calls.some((c) => c.op === OP.BEGIN_FIRMWARE_UPGRADE)).toBe(false);
   });
 
@@ -132,7 +133,8 @@ describe('probeSelectorChannel', () => {
 
     expect(probe.firmwareVersion).toBe('0.7.0.7');
     expect(probe.skippedForSafety).toBe(true);
-    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO]);
+    /* The version read is two unarmed reads (readRunningFirmware); nothing else. */
+    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
     expect(probe.notes.join(' ')).toContain('setter only');
     const detection = detectProfile(evidenceFromChannelProbe(probe));
     expect(detection.best.profile.id).toBe('compact-2014');
@@ -143,7 +145,8 @@ describe('probeSelectorChannel', () => {
     const camera = cameraFor([4, 18, 2, 0]);
     await camera.open();
     await probeSelectorChannel(new SeekDevice(camera), { armProbes: false });
-    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO]);
+    /* The version read is two unarmed reads (readRunningFirmware); nothing else. */
+    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
   });
 
   it('sends nothing more to a camera that will not answer GetFirmwareInfo', async () => {
@@ -159,7 +162,8 @@ describe('probeSelectorChannel', () => {
     expect(probe.skippedForSafety).toBe(true);
     expect(probe.plainAccepted).toBe(false);
     expect(probe.notes.some((n) => n.includes('GetFirmwareInfo did not answer'))).toBe(true);
-    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO]);
+    /* The version read is two unarmed reads (readRunningFirmware); nothing else. */
+    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
   });
 
   it('records a window that arms but serves nothing', async () => {

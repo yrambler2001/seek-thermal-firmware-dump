@@ -232,7 +232,7 @@ describe('Read device info asks the camera which family it is', () => {
       expect(
         calls.map((call) => call.request),
         choice,
-      ).toEqual([OP.GET_FIRMWARE_INFO]);
+      ).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
       unmount();
     }
   });
