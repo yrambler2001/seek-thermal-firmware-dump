@@ -2472,3 +2472,52 @@ with 0 differing bytes, as pinned in `f177b2f`. Pins commit `c26a2c6`, on its ow
 emulator death), 0 failed. Every vendor request went out `0x41/0xC1`; 0 SET_CONFIGURATION, 0
 SET_INTERFACE. `npm run check` is back from ~720 s to ~320 s. No toolkit source
 (`packages/*/src`) was changed in this section.
+
+## 16. Re-run against the bus-timed emulator; where a tier-2 row's time goes (2026-09-23)
+
+FW-V1 Phase 31 changed the emulator twice: `8fe53537` fast-forwards the emulated host's settle
+and microframe wait (nothing the emulator computes moves), and `3e5ba1c5` gives every USB
+transaction its USB 2.0 §5.11.3 bus time inside 125 µs microframes, lands IN and OUT
+transfers when their last transaction ends, serves a polled endpoint when it is primed, and
+counts the host's microframe grid in emulated time a core-clock change does not restart
+(FW-V1 `docs/EMULATOR.md` §20). The toolkit is at `470439f`. No toolkit source and no harness
+file changed in this section.
+
+### 16.1 Every pin re-checked, and every one identical
+
+`node scripts/update-emulator-expectations.mjs` (both tiers, exit 0, 466 core tests, 281 s)
+against `3e5ba1c5`: **`expectations.rpc.json` and `expectations.roundtrip.json` are
+byte-identical to the committed pins**, so there is no pins commit. Tier 1: 44 supported / 7
+known-gap / 0 failed, 20,756 replies delivered = received; tier 2: 15 supported, 873,048 =
+received, 0 dropped, every dump 0 differing bytes. The `controlInBytes` values that moved in
+§14 / §15 stay put: each 64-byte EP0 packet now takes 2,166 ns on the wire (it was 1,067 ns of
+data bits), still well clear of the ROM's 39-cycle prime-then-clear window.
+
+### 16.2 The two `npm run check` runs
+
+Both consecutive, on the committed toolkit against FW-V1 `3e5ba1c5`. The machine was shared
+with another session the whole time (load averages 100-200), so the wall times say more about
+the machine than about the suite.
+
+| run                            | exit | passed / failed | wall  | vitest  | slowest row (tier 1 / tier 2) | delivered = received (t1 / t2) | dropped |
+| ------------------------------ | ---- | --------------- | ----- | ------- | ----------------------------- | ------------------------------ | ------- |
+| `npm run check` 1              | 0    | 687 / 0         | 346 s | 322.2 s | 153.4 s (0.6.0.4) / 163.4 s   | 20,756 / 873,048               | 0       |
+| `npm run check` 2, right after | 0    | 687 / 0         | 300 s | 279.6 s | 143.4 s / 150.3 s             | 20,756 / 873,048               | 0       |
+
+Every vendor request went out `0x41/0xC1`; 0 SET_CONFIGURATION, 0 SET_INTERFACE.
+
+### 16.3 Where a tier-2 row's time goes
+
+Measured by FW-V1 on one row (Compact PRO 4.18.2.0-FF `090BB12PR939/dump`) with a timing
+wrapper around `seek_emu.py` (its §20.1): 64,783 control reads of `READ_CHUNK` = 64 bytes, one
+after another. Per read, the emulator spends ~1.1 ms of CPU running the firmware's own ~415
+basic blocks (the ROM's EP0 path, the vendor handler, the flash read), seven engine re-entries
+and ~40 host steps, and ~0.2 ms waits on the round trip: 57 µs for its writer thread, **131 µs
+for the loopback socket and this suite's Node side**, 40 µs to wake. In the tier-2 file alone
+(six rows at a time) a 63-window row takes 84-94 s, 69-77 s of it emulator CPU and 13-15 s at
+the gate; in `npm run check` the tier-1 file runs beside it and the same row takes 150-165 s.
+The Node side was benchmarked on the harness's bare `UsbIpSession` (115 µs a round trip; the
+toolkit adds ~15 µs); parsing replies synchronously in the socket's `data` event measured
+112 µs and was not kept. The lever this suite owns is `READ_CHUNK`: 256 or 512 bytes would
+make four to eight times fewer round trips, but it would change what tier 2 measures (the
+toolkit's 64-byte default path) and the pinned `readChunk`, so it was not touched.
