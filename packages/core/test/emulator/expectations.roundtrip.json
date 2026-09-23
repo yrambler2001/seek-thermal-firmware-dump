@@ -290,18 +290,21 @@
       "family": "nano_300",
       "product": "Nano 300",
       "version": "44.27.3.10",
-      "windowsRead": 0,
-      "windowsExpected": 0,
-      "bytesComparable": 0,
-      "diffBytesComparable": -1,
+      "windowsRead": 63,
+      "windowsExpected": 63,
+      "bytesComparable": 4128768,
+      "diffBytesComparable": 0,
       "diffRangesComparable": [],
-      "bytesUnreachable": 0,
-      "bytesStillErased": null,
-      "decryptedSha256": [],
-      "profile": "",
-      "gap": {
-        "reason": "refusing to dump: the camera did not report its firmware version (GetFirmwareInfo did not answer (control IN 0x4e failed: the USB/IP session has ended)); a command number does not mean the same thing on every Seek firmware — on Compact 0.3.0.1 wire id 0x52, the id that arms a read window, is EnterBo"
-      }
+      "bytesUnreachable": 65536,
+      "bytesStillErased": 538303,
+      "decryptedSha256": [
+        "31f1ed53342e575edc88aada1b201a77ee82dcba6691cb58f7dee8d5ac951da9",
+        "31f1ed53342e575edc88aada1b201a77ee82dcba6691cb58f7dee8d5ac951da9",
+        "31f1ed53342e575edc88aada1b201a77ee82dcba6691cb58f7dee8d5ac951da9",
+        "31f1ed53342e575edc88aada1b201a77ee82dcba6691cb58f7dee8d5ac951da9"
+      ],
+      "profile": "modern-4x",
+      "gap": null
     }
   }
 }

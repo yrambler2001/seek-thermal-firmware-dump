@@ -3612,42 +3612,72 @@
       "product": "Nano 300",
       "version": "44.27.3.10",
       "identity": {
-        "vendorId": "",
-        "productId": "",
-        "manufacturerName": null,
-        "productName": null,
-        "serialNumber": null
+        "vendorId": "0x289D",
+        "productId": "0x0011",
+        "manufacturerName": "Seek Thermal, Inc.",
+        "productName": "Nano300\u0000\u0000\u0000\u0000\u0000\u0000",
+        "serialNumber": "1713A171RJB9"
       },
-      "chipIdHex": null,
-      "commands": {},
-      "controlInBytes": {},
-      "windowsConfirmed": [],
+      "chipIdHex": "17001300f2002b00d700e600",
+      "commands": {
+        "GetErrorCode": "ok",
+        "GetOperationMode": "ok",
+        "GetFeaturedFirmwareData(unarmed)": "ok",
+        "GetFirmwareInfo": "ok",
+        "GetChipID": "ok",
+        "BeginFirmwareUpgrade": "ok",
+        "SetFirmwareInfoFeatures": "ok",
+        "EnsureMode0": "ok"
+      },
+      "controlInBytes": {
+        "32": 32,
+        "64": 64,
+        "128": 128,
+        "256": 128,
+        "512": 128
+      },
+      "windowsConfirmed": [
+        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
+      ],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
       "windowsRefused": [],
       "auth": {
-        "plainAccepted": false,
-        "authAccepted": false,
-        "wrongTokenAccepted": false,
-        "subcmd": 5
+        "subcmd": 5,
+        "plainAccepted": true,
+        "authAccepted": true,
+        "wrongTokenAccepted": true
       },
       "plan": {
-        "firmwareVersion": null,
-        "profile": "",
-        "dumps": false,
-        "table": "",
-        "windows": 0,
-        "confirmed": [],
+        "firmwareVersion": "44.27.3.10",
+        "profile": "modern-4x",
+        "dumps": true,
+        "table": "modern-4x: the post-2018 BeginFirmwareUpgrade table (one table, every build)",
+        "windows": 63,
+        "confirmed": [
+          2, 3, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+          27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+          49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
+        ],
         "misplaced": {},
         "unread": [],
         "armedHere": [],
-        "gaps": []
+        "gaps": ["0x14060000"]
       },
-      "gate": null,
-      "staleSelector": null,
-      "gap": {
-        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: the emulator process exited before the probe finished, so this row describes a run that ended rather than a camera that refused [fault: unmapped addr=0x8808F3A2 at PC=0x1000436C]"
-      }
+      "gate": {
+        "firmwareVersion": "44.27.3.10",
+        "identified": true,
+        "profile": "modern-4x",
+        "refusal": null,
+        "sentBeforeIdentity": ["IN 0x4E"]
+      },
+      "staleSelector": {
+        "answers": ["0.0.0.0", "44.27.3.10"],
+        "version": "44.27.3.10"
+      },
+      "gap": null
     },
     "nano_300/2024.11.21-11.55.00-44.27.3.10/1713A171RJB9/dump": {
       "kind": "full-dump",
@@ -3655,42 +3685,72 @@
       "product": "Nano 300",
       "version": "44.27.3.10",
       "identity": {
-        "vendorId": "",
-        "productId": "",
-        "manufacturerName": null,
-        "productName": null,
-        "serialNumber": null
+        "vendorId": "0x289D",
+        "productId": "0x0011",
+        "manufacturerName": "Seek Thermal, Inc.",
+        "productName": "Nano300\u0000\u0000\u0000\u0000\u0000\u0000",
+        "serialNumber": "1713A171RJB9"
       },
-      "chipIdHex": null,
-      "commands": {},
-      "controlInBytes": {},
-      "windowsConfirmed": [],
+      "chipIdHex": "17001300f2002b00d700e600",
+      "commands": {
+        "GetErrorCode": "ok",
+        "GetOperationMode": "ok",
+        "GetFeaturedFirmwareData(unarmed)": "ok",
+        "GetFirmwareInfo": "ok",
+        "GetChipID": "ok",
+        "BeginFirmwareUpgrade": "ok",
+        "SetFirmwareInfoFeatures": "ok",
+        "EnsureMode0": "ok"
+      },
+      "controlInBytes": {
+        "32": 32,
+        "64": 64,
+        "128": 128,
+        "256": 128,
+        "512": 128
+      },
+      "windowsConfirmed": [
+        1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+        51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
+      ],
       "windowsMisplaced": [],
       "windowsMisplacedTo": {},
       "windowsRefused": [],
       "auth": {
-        "plainAccepted": false,
-        "authAccepted": false,
-        "wrongTokenAccepted": false,
-        "subcmd": 5
+        "subcmd": 5,
+        "plainAccepted": true,
+        "authAccepted": true,
+        "wrongTokenAccepted": true
       },
       "plan": {
-        "firmwareVersion": null,
-        "profile": "",
-        "dumps": false,
-        "table": "",
-        "windows": 0,
-        "confirmed": [],
+        "firmwareVersion": "44.27.3.10",
+        "profile": "modern-4x",
+        "dumps": true,
+        "table": "modern-4x: the post-2018 BeginFirmwareUpgrade table (one table, every build)",
+        "windows": 63,
+        "confirmed": [
+          2, 3, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+          27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+          49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
+        ],
         "misplaced": {},
         "unread": [],
         "armedHere": [],
-        "gaps": []
+        "gaps": ["0x14060000"]
       },
-      "gate": null,
-      "staleSelector": null,
-      "gap": {
-        "reason": "not measurable in 1 attempt(s) from fresh emulators: | attempt 1: the emulator process exited before the probe finished, so this row describes a run that ended rather than a camera that refused [fault: unmapped addr=0x8808F3A2 at PC=0x1000436C]"
-      }
+      "gate": {
+        "firmwareVersion": "44.27.3.10",
+        "identified": true,
+        "profile": "modern-4x",
+        "refusal": null,
+        "sentBeforeIdentity": ["IN 0x4E"]
+      },
+      "staleSelector": {
+        "answers": ["0.0.0.0", "44.27.3.10"],
+        "version": "44.27.3.10"
+      },
+      "gap": null
     }
   }
 }
