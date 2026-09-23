@@ -2418,3 +2418,57 @@ The bound in each is half of one `REOPEN_TIMEOUT_MS` (10 s), so a row that notic
 by sitting out a reopen cannot pass. Negative check, with the race in `guard()` disabled: 3 of 4
 fail (two 60 s test timeouts; the real row came back as a `ProbeUnmeasurable`, the old path to a
 gap, instead of an `InfrastructureDefect`).
+
+### 15.3 The emulator's host timing: SETUPs on the host's microframe grid (FW-V1 `2e32a1a6`)
+
+Why the race was hit every time: FW-V1's emulated host delivered a SETUP at the host step where
+its script was ready, and a host step is the first basic block 64+ cycles after the last — while
+the part sleeps, the first block after a WFI wake. So SETUPs landed where the firmware's own
+wake-ups put them. A real host's timing is its own: a USB 2.0 host controller runs bus time in
+125 µs microframes opened by SOF (USB 2.0 §5.3.3, §8.4.3 / 8.4.3.1) and schedules per microframe
+(EHCI 1.0 §4.4, FRINDEX §2.3.4).
+
+FW-V1 `2e32a1a6` holds each control transfer's SETUP until the first microframe boundary at or
+after it is ready (k × 125 µs in core cycles from cycle 0 at the core clock of the moment), and
+the emulator steps the host on the first basic block at or past that cycle. Only SETUPs: a
+device may not NAK or STALL one (USB 2.0 §8.4.6.4), so its arrival is the host's alone. The grid
+origin is cycle 0 because it involves no choice; no phase or offset was tried against the Nano
+300 (FW-V1 `docs/EMULATOR.md` §19).
+
+Result, traced through this suite (FW-V1 `instruments/usb_probes/consumer_trace`): the Nano
+300's first vendor SETUP now lands at cycle 34,410,001, 169,928 cycles after the MFi-link poll's
+entry (34,240,073, unchanged) and while the part sleeps. The race is not entered and the rows
+measure again. **The race is still in the firmware**; a deterministic emulator cannot sample
+the host/camera crystal drift that lets a real host hit it rarely. Control: with FW-V1's knob
+`UsbHost(setup_on_microframe=False)` (the old timing) both tier-1 rows fail as
+`InfrastructureDefect` with the fault (`0x8808F3A2` at PC `0x1000436C`) in 6.9 s and 7.5 s.
+
+FW-V1's own gates on it: self-test 186 / 0 / 0; oracle 0 of 83,592 pixels; replay 1,077 / 1,077;
+the 51-row corpus 29 `rpc` / 22 `streams`, no tier moved (its `docs/EMULATOR_CORPUS.md` §20).
+
+### 15.4 The pins, re-taken, and two `npm run check` runs
+
+`node scripts/update-emulator-expectations.mjs` (both tiers, exit 0, 466 core tests, 346 s)
+against FW-V1 `2e32a1a6`. Two rows move, one field each; nothing else:
+
+| row                                          | field                   | old → new | why                                                                                                                                                                                                                                                                                               |
+| -------------------------------------------- | ----------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Nano 300 44.27.3.10 dump (tier 1)            | `controlInBytes["256"]` | 128 → 256 | the pin was taken on FW-V1 `ba5662e7` (`f177b2f`, restored by `9855f64`) and never re-measured while the row faulted. It is §14.2's zero-time EP0 race: traced at register level, each 64-byte packet now retires 172 cycles after its prime (`0x10401EB2`), after the ROM's write-1-clear at +39 |
+| the same                                     | `controlInBytes["512"]` | 128 → 512 | the same                                                                                                                                                                                                                                                                                          |
+| Nano 300 44.27.3.10 decrypted image (tier 1) | `controlInBytes["256"]` | 128 → 256 | the same                                                                                                                                                                                                                                                                                          |
+| the same                                     | `controlInBytes["512"]` | 128 → 512 | the same                                                                                                                                                                                                                                                                                          |
+
+The other 49 tier-1 rows and all 15 tier-2 rows equal the pins of `9855f64`;
+`expectations.roundtrip.json` is byte-identical, so the Nano 300 dump round-trips 63/63 windows
+with 0 differing bytes, as pinned in `f177b2f`. Pins commit `c26a2c6`, on its own.
+
+| run                                   | exit | passed / failed | wall (`npm run check`) | vitest  | slowest row (tier 1 / tier 2) | Nano 300 tier-1 rows | delivered = received (t1 / t2) | dropped |
+| ------------------------------------- | ---- | --------------- | ---------------------- | ------- | ----------------------------- | -------------------- | ------------------------------ | ------- |
+| `npm run check` 1 (pins of `c26a2c6`) | 0    | 687 / 0         | 324 s                  | 305.6 s | 144.1 s (0.6.0.4) / 158.6 s   | 12.0 s, 11.2 s       | 20,756 / 873,048               | 0       |
+| `npm run check` 2, right after        | 0    | 687 / 0         | 321 s                  | 301.9 s | 148.3 s (0.6.0.4) / 164.1 s   | 13.6 s, 12.8 s       | 20,756 / 873,048               | 0       |
+
+687 = §14's 683 plus the four fail-fast tests. Tier 1: 44 supported, 7 known gaps (the seven
+2014 Compacts whose selector map reaches no window — each for the firmware's own reason, none an
+emulator death), 0 failed. Every vendor request went out `0x41/0xC1`; 0 SET_CONFIGURATION, 0
+SET_INTERFACE. `npm run check` is back from ~720 s to ~320 s. No toolkit source
+(`packages/*/src`) was changed in this section.
