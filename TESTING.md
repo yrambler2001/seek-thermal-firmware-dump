@@ -2685,3 +2685,26 @@ plans, where both used to stop after the version read.
   device time; no bounded window a real host would accept reaches it. A real camera with a sensor
   passes that watchdog at once, and one without passes it in ~58 ms of its own time (FW-V1's
   estimate, TIMER0 at 10 kHz), inside the 500 ms window.
+
+### 18.5 The checks
+
+The source, tests and `docs/` are `9b03e86`; the pins `14e0bcf`, on their own. Both
+`npm run check` runs were on the committed pins, one after the other, with no other emulator
+running (`seek_emu` processes: 0 before each); the machine was busy with other work.
+
+| run                                                             | exit | tests                 | wall (vitest)   | slowest row (tier 1 / tier 2) | delivered = received (t1 / t2) | load average at start / end |
+| --------------------------------------------------------------- | ---- | --------------------- | --------------- | ----------------------------- | ------------------------------ | --------------------------- |
+| `npm run check` 1                                               | 0    | 692 / 692             | 306 s (287.6 s) | 220.2 s (0.6.0.4) / 146.0 s   | 20,957 / 873,049, 0 dropped    | 15 (1 min; 66 over 5) / 23  |
+| `npm run check` 2                                               | 0    | 692 / 692             | 296 s (278.2 s) | 209.4 s (0.6.0.4) / 138.4 s   | 20,957 / 873,049, 0 dropped    | 22 / 14                     |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run`        | 0    | 555 passed, 4 skipped | 12.3 s          | —                             | —                              | —                           |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npm run test:coverage` | 0    | 555 passed, 4 skipped | —               | —                             | —                              | —                           |
+
+Tier 1 was 44 / 7 / 0 and tier 2 15 / 0 / 0 on both runs; 0.6.0.4 armed its pinned 25 of 63
+both times. Coverage: all files 85.2 % statements, 73.6 % branches; `capability.ts` 94.5 % /
+88 %. `npm run build` after the commits leaves `docs/` unchanged.
+
+The suite is ~75 s slower than §17.3's 222 s, and nearly all of it is the slowest row, 0.6.0.4
+(63-74 s slower). That row never enters the start-up window (its refusal is a timeout, and its
+version reads are as before), and the 5-minute load average was 40-66 during these runs, so the
+difference is the machine's load, not this change. The window itself costs a 0.5.1.x row about
+3 x 25 x 20 ms = 1.5 s of pauses.
