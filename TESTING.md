@@ -2997,15 +2997,16 @@ A/B, in the same conditions: the harness before §19 (`662b696`, no side channel
 both against FW-V1 `eb0f07e9`, one after the other on a quiet machine. The tier-2 row is
 Compact 4.8.2.1 (`2229A0YZ7E28`, 64,783 URBs), alone.
 
-| run                            | load               | wall                                        | emulator CPU (Python) | harness CPU (Node) |
-| ------------------------------ | ------------------ | ------------------------------------------- | --------------------- | ------------------ |
-| tier-2 row, before §19         | 14 → 16            | 84.7 s                                      | 67.0 s                | 6.8 s              |
-| tier-2 row, `63f76c0`          | 16 → 10            | 83.5 s                                      | 66.3 s                | 7.8 s              |
-| tier-2 row, `63f76c0`          | 8 → 13             | 81.0 s                                      | 65.2 s                | 7.3 s              |
-| tier-2 row, this change        | 10 → 8             | 85.8 s                                      | 67.9 s                | 7.7 s              |
-| tier-2 row, this change        | 13 → 18            | 81.2 s                                      | 65.0 s                | 7.4 s              |
-| full `vitest run`, before §19  | 12 → 19 (peak 105) | 347 s; 0.6.0.4 measured **22** and failed   | —                     | —                  |
-| full `vitest run`, this change | 19 → 14 (peak 67)  | 281 s; 700 / 700; slowest 204.9 s / 139.3 s | —                     | —                  |
+| run                                  | load                | wall                                        | emulator CPU (Python) | harness CPU (Node) |
+| ------------------------------------ | ------------------- | ------------------------------------------- | --------------------- | ------------------ |
+| tier-2 row, before §19               | 14 → 16             | 84.7 s                                      | 67.0 s                | 6.8 s              |
+| tier-2 row, `63f76c0`                | 16 → 10             | 83.5 s                                      | 66.3 s                | 7.8 s              |
+| tier-2 row, `63f76c0`                | 8 → 13              | 81.0 s                                      | 65.2 s                | 7.3 s              |
+| tier-2 row, this change              | 10 → 8              | 85.8 s                                      | 67.9 s                | 7.7 s              |
+| tier-2 row, this change              | 13 → 18             | 81.2 s                                      | 65.0 s                | 7.4 s              |
+| full `vitest run`, before §19        | 12 → 19 (peak 105)  | 347 s; 0.6.0.4 measured **22** and failed   | —                     | —                  |
+| full `vitest run`, before §19, again | 13 → 176 (peak 242) | 386 s; 0.6.0.4 measured **24** and failed   | —                     | —                  |
+| full `vitest run`, this change       | 19 → 14 (peak 67)   | 281 s; 700 / 700; slowest 204.9 s / 139.3 s | —                     | —                  |
 
 - **The side channel is not where the time went.** A tier-2 row costs the same wall time with it
   and without it (81-86 s against 84.7 s). The emulator's CPU is unchanged within noise. The
@@ -3020,8 +3021,8 @@ Compact 4.8.2.1 (`2229A0YZ7E28`, 64,783 URBs), alone.
   in tier 1 and 1 of 873,049 in tier 2.
 - **Wall time on this machine is noisy.** Earlier single-row runs of both harnesses at loads
   11-40 spread from 70 to 95 s, so any one pair can suggest a 10-20% difference either way. The
-  full run of the old harness fell into a load spike, and it also recorded 22 for 0.6.0.4: the
-  race §19 removed, on the old code, at loads up to ~105.
+  full runs of the old harness both fell into load spikes, and both got 0.6.0.4 wrong (22, then
+  24): the race §19 removed, on the old code.
 - **So §19.7's 516-537 s was not reproduced.** Under the same conditions the suite takes ~281 s,
   as §18's 278-288 s did. Nothing in the side channel accounts for the difference. §19.5 records
   what else held that machine during that hour (FW-V1's self-test, another session's emulator
@@ -3039,4 +3040,35 @@ Compact 4.8.2.1 (`2229A0YZ7E28`, 64,783 URBs), alone.
 
 ### 20.5 The checks
 
-(Filled in by the next commit.)
+The source, tests and `docs/` are `f58c3e1`, against FW-V1 `eb0f07e9` (unchanged). The runs went
+one after another. A desktop session (OBS screen recording, a browser) took about three cores
+throughout, and the load climbed through the hour, independently of these runs. Load is the
+1-minute average at the start and the end, with the peak of 15 s samples.
+
+| run                                                             | load                 | exit | tests                 | wall (vitest)   | slowest row (tier 1 / tier 2) | delivered = received (t1 / t2), dropped | host give-ups / transport deadlines fired | settle reads |
+| --------------------------------------------------------------- | -------------------- | ---- | --------------------- | --------------- | ----------------------------- | --------------------------------------- | ----------------------------------------- | ------------ |
+| `node scripts/update-emulator-expectations.mjs` (both tiers)    | 176 → 62 (peak 276)  | 0    | 479                   | 390 s           | 286.7 s / 200.1 s             | 20,957 / 873,049, 0                     | 127 / 0                                   | 0 / 0        |
+| `npm run check` 1                                               | 62 → 161 (peak 216)  | 0    | 700 / 700             | 343 s (322.8 s) | 238.9 s / 164.5 s             | 20,957 / 873,049, 0                     | 127 / 0                                   | 0 / 0        |
+| `npm run check` 2                                               | 161 → 201 (peak 329) | 0    | 700 / 700             | 419 s (400.2 s) | 305.9 s / 205.0 s             | 20,957 / 873,049, 0                     | 127 / 0                                   | 0 / 0        |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run`        | —                    | 0    | 563 passed, 4 skipped | 13.0 s          | —                             | —                                       | —                                         | —            |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npm run test:coverage` | —                    | 0    | 563 passed, 4 skipped | 13.2 s          | —                             | —                                       | —                                         | —            |
+
+- **The pins are byte-identical**: regenerating both tiers left `expectations.rpc.json` and
+  `expectations.roundtrip.json` unchanged, so there is no pins commit. Tier 1 was 44 / 7 / 0 and
+  tier 2 15 / 0 / 0 in every run. The device time summed to 68.211003 s over tier 1 and
+  879.651000 s over tier 2 in every run, the same as §19.7.
+- **The two checks in a row were green**, at 343 s and 419 s under loads that peaked at 216 and
+  329, against §19.7's 516 s and 537 s. On a quieter machine (peak 67) the same tree's
+  `vitest run` took 281 s (20.4).
+- Replies held for their record: 1, 3 and 0 in tier 1; 2, 3 and 1 of 873,049 in tier 2.
+- 700 = 697 (§19.7) + 2 tests in `protocol.test.ts` + 1 in `emulator-failfast.test.ts`; 563 =
+  560 + the same 3.
+- The before-§19 harness got 0.6.0.4 wrong in both of its full runs here (22 at peak load 105, 24
+  at peak 242). That is the load race §19 removed, seen on the old code.
+
+### 20.6 Still open
+
+- The faithful 5 s host give-up is still not run (§19.8).
+- The side channel's remaining cost, about 0.5-1 s of harness CPU per 65k URBs, is within the
+  noise of a row. Removing it would take a cheaper channel (a Unix socket, say). That is a
+  protocol change in FW-V1 and would buy well under 1% of the check.
