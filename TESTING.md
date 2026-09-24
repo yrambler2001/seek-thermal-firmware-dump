@@ -2521,3 +2521,50 @@ toolkit adds ~15 µs); parsing replies synchronously in the socket's `data` even
 112 µs and was not kept. The lever this suite owns is `READ_CHUNK`: 256 or 512 bytes would
 make four to eight times fewer round trips, but it would change what tier 2 measures (the
 toolkit's 64-byte default path) and the pinned `readChunk`, so it was not touched.
+
+## 17. Re-run against the emulator whose host keeps its own time; one pin moved (2026-09-24)
+
+FW-V1 Phase 36 (`479978fe`) changed four things the suites can see (FW-V1 `docs/EMULATOR.md`
+§24): PLL1 takes the data sheet's 100 µs to lock; WWDT WARNINT resets to 0 (inert); a started
+sensor raises no PIN_INT0 before its first frame; and **every pause of the emulated host is host
+time**, by EHCI 1.0 and USB 2.0 - a transfer's end reaches the host at the next interrupt
+threshold (8 microframes, 1 ms), a NAKed token is polled every 10 µs, the bus reset takes
+100 + 50 + 10 ms and SET_ADDRESS gets its 2 ms recovery - where the host used to count them in
+emulator steps (a 16-step settle before every SETUP, 256 after SET_CONFIGURATION). Through the
+USB/IP bridge with the gated clock, the device's time between two URBs is now the host's
+threshold wait, ~1 ms, instead of that settle. The toolkit source is `e53fe6c`'s; no toolkit
+source and no harness file changed, only the pins (17.2).
+
+### 17.1 The first `npm run check`: exit 1, 686 / 687
+
+One test failed: Compact 1.3.0.8 (the `insecure-8hz` image, tier 1), "the toolkit's own first
+contact". Its first request, GetFirmwareInfo (`IN 0x4E`), was STALLed, so the toolkit refused
+(`device/version-unknown`) and sent nothing else before identity, as §11 requires. Measured in
+FW-V1, in-process on the same chimera: this firmware STALLs vendor requests for ~9 ms after
+SET_CONFIGURATION - GetFirmwareInfo at +1 ms .. +9 ms is refused, at +10 ms answered
+(`01 03 00 08 ...`, 1.3.0.8) - and with the old pacing the 256-step settle after
+SET_CONFIGURATION (~11 ms of a sleeping part) had always outlasted it. A host that asks within
+~9 ms of configuring the camera meets the same refusal; the toolkit's own message says what to do.
+
+### 17.2 The pins, re-taken
+
+`node scripts/update-emulator-expectations.mjs` (both tiers, exit 0, 466 core tests, 208 s):
+**one row, one field** (commit `0f58218`, pins only):
+
+| row                                           | field  | old                                                                                     | new                                                                                                                                                                    | why                                                                                                                                             |
+| --------------------------------------------- | ------ | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Compact 1.3.0.8 `insecure-8hz` image (tier 1) | `gate` | `firmwareVersion` "1.3.0.8", `identified` true, `profile` "legacy-auth", `refusal` null | `firmwareVersion` null, `identified` false, `profile` "generic", `refusal` "device/version-unknown: ... GetFirmwareInfo did not answer (control IN 0x4e -> stall) ..." | the firmware's ~9 ms post-configuration refusal, now reached because the emulated host no longer waits 256 steps after SET_CONFIGURATION (17.1) |
+
+`sentBeforeIdentity` stays `["IN 0x4E"]`, and the rest of the row - the selector map, the stale
+selector read, auth - measures as before (those sessions come later, after the firmware has
+started). Tier 1 44 supported / 7 known-gap / 0 failed, 20,752 replies delivered = received (was
+20,756); tier 2 15 supported, 873,049 = received (was 873,048), 0 dropped, every dump 0 differing
+bytes; 0.6.0.4 still arms 25 of 63 subcommands.
+`expectations.roundtrip.json` is byte-identical.
+
+### 17.3 The second `npm run check`
+
+On the committed pins, run alone: **exit 0, 687 / 687**, 222 s wall (vitest 206.8 s); tier 1
+44 / 7 / 0 with 20,752 replies delivered = received, slowest row 146.7 s (0.6.0.4); tier 2
+15 / 0 / 0 with 873,049 = received, 0 dropped, slowest row 94.5 s. The first run's wall was 226 s
+(vitest 210.5 s), so the host's new device-time pauses cost the suite nothing it can measure.
