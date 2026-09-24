@@ -627,19 +627,37 @@ export async function runPreservationPipeline(
     }
   }
 
-  /* ---- P3: fresh session(s); the reset quirk means retry-once ------------- */
+  /* ---- P3: fresh session(s); the reset quirk means retry-once -------------
+   *
+   * DRAIN FIRST, on its own single arm: the reader's descriptor budgets every
+   * arm 0x400000 served bytes (d4, decremented per read), so anything consumed
+   * before the drain — the patch-live probe included — shortens the reach of
+   * the arm that follows (measured: probe-then-drain stalled deterministically
+   * 131,072 B short of the part's end, on fresh servers, twice). A full 4 MiB
+   * completion is itself the liveness proof:
+   * a stock 64 KiB window closes the descriptor long before 4 MiB. The
+   * explicit probe then runs afterwards on its own fresh arm. */
   const probeBytes = backupSlice(backup, PROBE_OFFSET - READ_CHUNK, READ_CHUNK);
   let rawDump: Uint8Array | null = null;
-  let lastProbe = 'not attempted';
+  let lastError = 'not attempted';
   const attempts = options.postResetAttempts ?? 2;
   for (let n = 1; n <= attempts && rawDump === null; n++) {
     const device = await opener.open();
     try {
-      const probe = await probeWidenedWindow(device, probeBytes);
-      lastProbe = `attempt ${String(n)}: ${probe.detail}`;
-      reporter.log(`P3 probe, ${probe.detail}`, probe.live ? 'detail' : 'warn');
-      if (!probe.live) continue;
       rawDump = await drainWholePart(device, reporter);
+      /* Advisory: the drain's completion is the liveness proof (only the
+       * widened window serves 4 MiB), and the descriptor's budget was spent
+       * by the drain anyway — a follow-up probe can stall without meaning
+       * anything is wrong. */
+      try {
+        const probe = await probeWidenedWindow(device, probeBytes);
+        reporter.log(`P3 probe, ${probe.detail}`, probe.live ? 'detail' : 'warn');
+      } catch {
+        reporter.log('P3 probe skipped (the drain already proves the widened window)', 'detail');
+      }
+    } catch (error) {
+      lastError = `attempt ${String(n)}: ${errorMessage(error)}`;
+      reporter.log(`P3 attempt failed: ${lastError}`, 'warn');
     } finally {
       await opener.close(device);
     }
@@ -648,8 +666,8 @@ export async function runPreservationPipeline(
     throw new PostResetWedgeError(
       'the commit landed but the post-reset read window never came up — the doc 33 sec. 11.6 ' +
         'same-server wedge. The commit is NOT replayed; re-run the drain phase against a ' +
-        `fresh session/server booted from the committed state. Last probe: ${lastProbe}`,
-      { records: records.length, lastProbe },
+        `fresh session/server booted from the committed state. Last attempt: ${lastError}`,
+      { records: records.length, lastError },
     );
   }
   const processedDump = postProcessDump(rawDump, detection.bankAddress, bankCapture);

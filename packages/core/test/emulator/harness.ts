@@ -845,7 +845,7 @@ export class Emulator {
    * that needs it fails the audit — it did not stop, so nobody knows what it
    * delivered.
    */
-  async stop(): Promise<void> {
+  async stop(graceMs: number = STOP_GRACE_MS): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
     live.delete(this.child);
@@ -871,7 +871,7 @@ export class Emulator {
     const timer = setTimeout(() => {
       this.killed = true;
       this.child.kill('SIGKILL');
-    }, STOP_GRACE_MS);
+    }, graceMs);
     await this.closed;
     clearTimeout(timer);
   }
