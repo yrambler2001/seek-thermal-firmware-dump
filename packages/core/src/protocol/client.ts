@@ -22,6 +22,7 @@ import {
   WINDOW_SIZE,
 } from './ops.js';
 import type { UsbTransport } from './transport.js';
+import { type DeadlineClock, WALL_CLOCK } from './webusb.js';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -65,11 +66,18 @@ export class SeekDevice {
   readonly transport: UsbTransport;
   readonly reporter: Reporter;
   readonly signal: AbortSignal | undefined;
+  /**
+   * The clock this device's own deadlines are checked on: its transport's
+   * (`UsbTransport.clock`), else `WALL_CLOCK`. Real time for a real camera; the
+   * emulated camera's time under the emulator suites (TESTING.md sec.19, 20).
+   */
+  readonly clock: DeadlineClock;
 
   constructor(transport: UsbTransport, options: SeekDeviceOptions = {}) {
     this.transport = transport;
     this.reporter = options.reporter ?? silentReporter;
     this.signal = options.signal;
+    this.clock = transport.clock ?? WALL_CLOCK;
   }
 
   get cancelled(): boolean {
@@ -123,6 +131,10 @@ export class SeekDevice {
    * Leaving imaging mode is not instant either — the camera has a sensor and a
    * shutter to park — so wait for mode 0 to actually read back instead of
    * assuming a fixed delay covers it.
+   *
+   * The wait is `MODE_SETTLE_MS` on `this.clock`: real time on a real camera
+   * (`Date.now()`, as always), the camera's own time on the emulator, where a
+   * loaded machine would otherwise give the camera less of it (TESTING.md sec.20).
    */
   async ensureMode0(): Promise<void> {
     let mode: number | null;
@@ -143,7 +155,7 @@ export class SeekDevice {
       });
     }
 
-    const deadline = Date.now() + MODE_SETTLE_MS;
+    const deadline = this.clock.now() + MODE_SETTLE_MS;
     for (;;) {
       this.assertNotCancelled();
       await sleep(20);
@@ -153,7 +165,7 @@ export class SeekDevice {
         mode = null; /* still not answering; keep waiting */
       }
       if (mode === 0) return;
-      if (Date.now() > deadline) {
+      if (this.clock.now() > deadline) {
         throw new SeekError(
           'device/mode',
           `the camera did not enter operation mode 0 within ${String(MODE_SETTLE_MS / 1000)} s ` +

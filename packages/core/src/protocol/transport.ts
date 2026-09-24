@@ -8,6 +8,8 @@
  * second protocol implementation to keep in sync.
  */
 
+import type { DeadlineClock } from './webusb.js';
+
 /** USB control-transfer recipient. When the host refuses the claim on interface 0
  *  because something else holds it, the camera still answers device-recipient
  *  requests, and answers them the same way (see `isPlatformClaimRefusal`). */
@@ -42,6 +44,13 @@ export interface UsbTransport {
   readonly description: DeviceDescription;
   readonly info: TransportInfo;
   readonly isOpen: boolean;
+  /**
+   * The clock this transport times its deadlines on, when it has one
+   * (`WebUsbTransport` always does). `SeekDevice` times its own waits on the same
+   * clock, so on an emulated camera every deadline is the camera's time; absent,
+   * it is `WALL_CLOCK`. A pass-through transport must forward it.
+   */
+  readonly clock?: DeadlineClock | undefined;
 
   /**
    * Idempotent. Selects the configuration and claims the interface. The

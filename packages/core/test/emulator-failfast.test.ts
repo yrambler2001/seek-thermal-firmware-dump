@@ -32,10 +32,13 @@ import path from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
+import { SeekDevice } from '../src/protocol/client.js';
+import { withTimeout } from '../src/protocol/webusb.js';
 import { InfrastructureDefect, liveEmulatorCount, RowEmulators } from './emulator/harness.js';
 import { probeTier1 } from './emulator/probe.js';
 import { announceSkip, BOOT_TIMEOUT_MS, EMU_DIR, ENTRIES, scratchFile } from './emulator/suite.js';
 import { REOPEN_TIMEOUT_MS } from './emulator/webusb-over-usbip.js';
+import { fakeCamera } from './fake-transport.js';
 
 /** Half of one reopen timeout: a row that noticed the death only by sitting out a
  *  reopen could not fail inside it. The old path took ~615 s. */
@@ -245,13 +248,40 @@ describe('the harness fails a row the moment its emulator dies', () => {
         FAST_MS,
       );
       expect(String(error)).toContain('timed out after 2000 ms');
-      expect(emu.deviceClock.now, "the camera's clock never moved").toBe(0);
+      expect(emu.deviceClock.timeNs, "the camera's clock never moved").toBe(0);
       expect(emu.deviceClock.timersFired).toBe(0);
       const defect = await rejection(row.assertDelivery());
       expect(defect).toBeInstanceOf(InfrastructureDefect);
       expect((defect as Error).message).toContain(
         'USB/IP deadline(s) expired on the client against a live emulator',
       );
+    } finally {
+      await row.finish();
+    }
+  }, 60_000);
+
+  it('a wait timed on the wall clock fails the row, as an infrastructure defect', async () => {
+    /* THE WALL CLOCK'S TRIPWIRE (TESTING.md sec.20). A SeekDevice over a transport
+     * with no clock falls back to WALL_CLOCK - its settle deadline on real time -
+     * and so does a transport deadline raced without one. Either, while an
+     * emulator runs, is a decision load could have moved. */
+    const row = new RowEmulators('fake/serve');
+    try {
+      const emu = await row.start(fakeEmulatorDir(), {
+        entryId: 'fake/serve',
+        readyTimeoutMs: 30_000,
+      });
+      await row.guard(emu, async () => {
+        const camera = fakeCamera({ requireMode0: true, initialMode: 1, modeSettleMs: 30 });
+        await camera.open();
+        await new SeekDevice(camera).ensureMode0();
+        await withTimeout(Promise.resolve('answered'), 1000, 'a transfer');
+      });
+      const defect = await rejection(row.assertDelivery());
+      expect(defect).toBeInstanceOf(InfrastructureDefect);
+      const message = (defect as Error).message;
+      expect(message).toContain('the toolkit timed a wait on the WALL clock');
+      expect(message).toMatch(/[1-9]\d* read\(s\) of its time, 1 timer\(s\) on it/);
     } finally {
       await row.finish();
     }

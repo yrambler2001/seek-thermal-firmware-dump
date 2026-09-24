@@ -55,6 +55,34 @@ import {
   UsbIpWebUsbDevice,
   type UsbIpWebUsbOptions,
 } from './webusb-over-usbip.js';
+import { WALL_CLOCK } from '../../src/protocol/webusb.js';
+
+/**
+ * THE WALL CLOCK'S TRIPWIRE (TESTING.md sec.20). Every wait in the toolkit that
+ * can decide something is timed on a `DeadlineClock`: the transport's deadlines,
+ * and `SeekDevice.ensureMode0`'s settle deadline, both on the transport's clock.
+ * Over the emulator that clock is the camera's; `WALL_CLOCK` is what they fall
+ * back to when a transport was built without it, or a pass-through transport did
+ * not forward it. So any read of `WALL_CLOCK`'s time or any timer started on it
+ * while an emulator runs is a deadline that load could have moved, and the
+ * delivery audit fails the row on it. The count is per worker (the module is
+ * shared by the rows running side by side in one test file), so a row that ran
+ * beside the offender fails with it: fail-closed, never a pass. The wrappers call
+ * straight through; nothing about the clock changes.
+ */
+const wallClockUses = { reads: 0, timers: 0 };
+{
+  const now = WALL_CLOCK.now.bind(WALL_CLOCK);
+  const startTimer = WALL_CLOCK.startTimer.bind(WALL_CLOCK);
+  WALL_CLOCK.now = (): number => {
+    wallClockUses.reads++;
+    return now();
+  };
+  WALL_CLOCK.startTimer = (ms: number, onExpire: () => void): (() => void) => {
+    wallClockUses.timers++;
+    return startTimer(ms, onExpire);
+  };
+}
 
 /**
  * The emulated host's give-up for a transfer the firmware never completes, in ms of
@@ -257,6 +285,8 @@ export interface ClockTally {
   readonly deadlinesFired: number;
   /** Replies that arrived before their device-time record and were held for it. */
   readonly repliesHeld: number;
+  /** Reads of the camera's time by a deadline checked between requests (`ensureMode0`). */
+  readonly clockReads: number;
 }
 
 /* ---- the wire log, summarised --------------------------------------- */
@@ -433,6 +463,8 @@ export class Emulator {
   private readonly clockLink: DeviceClockLink;
   private readonly deathNotice: Promise<string>;
   private announceDeath: (reason: string) => void = () => undefined;
+  /** `wallClockUses` when this emulator came up (THE WALL CLOCK'S TRIPWIRE). */
+  private readonly wallClockAtStart = { ...wallClockUses };
 
   private constructor(
     entryId: string,
@@ -679,6 +711,18 @@ export class Emulator {
           "emulated camera's clock: a WebUsbTransport built without " +
           '`clock: device.deadlineClock` times its deadline on the wall clock, and what it ' +
           'records then depends on machine load',
+      );
+    }
+    const wallReads = wallClockUses.reads - this.wallClockAtStart.reads;
+    const wallTimers = wallClockUses.timers - this.wallClockAtStart.timers;
+    if (wallReads + wallTimers > 0) {
+      v.push(
+        `the toolkit timed a wait on the WALL clock while this emulator ran ` +
+          `(${String(wallReads)} read(s) of its time, ${String(wallTimers)} timer(s) on it, ` +
+          'counted over this test worker): a deadline on real time decided something, and ' +
+          "what it decided depends on machine load. Every wait must be on the emulated camera's " +
+          'clock, which `SeekDevice` takes from its transport (`clock: device.deadlineClock`; a ' +
+          'pass-through transport must forward `clock`)',
       );
     }
     if (clock.failure !== null) v.push(`device-time side channel: ${clock.failure}`);
@@ -1070,6 +1114,7 @@ export class RowEmulators {
         hostGiveUps: audits.reduce((n, a) => n + (a.server?.clock?.deadline_expiries ?? 0), 0),
         deadlinesFired: audits.reduce((n, a) => n + a.clock.deadlinesFired, 0),
         repliesHeld: audits.reduce((n, a) => n + a.clock.repliesHeld, 0),
+        clockReads: audits.reduce((n, a) => n + a.clock.clockReads, 0),
       },
     };
   }

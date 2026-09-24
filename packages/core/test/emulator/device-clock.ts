@@ -70,9 +70,19 @@ export class EmulatedDeviceClock implements DeadlineClock {
   timersStarted = 0;
   /** Timers that expired (a deadline passed on the camera's clock). */
   timersFired = 0;
+  /** Reads of the time by a deadline checked between requests (`SeekDevice.ensureMode0`). */
+  reads = 0;
 
-  get now(): number {
+  /** The camera's time, in ns of the emulator's host clock. */
+  get timeNs(): number {
     return this.nowNs;
+  }
+
+  /** The camera's time in ms, for a deadline checked between requests. Between two
+   *  URBs the gated clock does not move, so a host pause ages the camera by nothing. */
+  now(): number {
+    this.reads++;
+    return this.nowNs / NS_PER_MS;
   }
 
   /** Timers started and neither fired nor cancelled. */
@@ -143,6 +153,8 @@ export interface ClockLinkSnapshot {
   readonly deadlinesFired: number;
   /** The camera's time at the last record, in ns. */
   readonly nowNs: number;
+  /** Reads of the camera's time by a deadline checked between requests. */
+  readonly clockReads: number;
   /** What went wrong on the channel itself, if anything. */
   readonly failure: string | null;
 }
@@ -307,7 +319,8 @@ export class DeviceClockLink {
       repliesWaiting: this.waiting.size,
       deadlinesSet: this.deadlinesSet,
       deadlinesFired: this.clock.timersFired,
-      nowNs: this.clock.now,
+      nowNs: this.clock.timeNs,
+      clockReads: this.clock.reads,
       failure: this.failure,
     };
   }

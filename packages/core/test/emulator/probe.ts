@@ -21,7 +21,7 @@ import type {
   TransportInfo,
   UsbTransport,
 } from '../../src/protocol/transport.js';
-import { WebUsbTransport } from '../../src/protocol/webusb.js';
+import { type DeadlineClock, WebUsbTransport } from '../../src/protocol/webusb.js';
 import { authPayload } from '../../src/profiles/legacy-auth.js';
 import { buildModernWindowMap, FLASH_BASE } from '../../src/profiles/modern-4x.js';
 import { detectProfile } from '../../src/profiles/registry.js';
@@ -415,6 +415,11 @@ class IdentityRecorder implements UsbTransport {
     return this.inner.isOpen;
   }
 
+  /** The camera's clock, forwarded: `SeekDevice` times its waits on it (TESTING.md sec.20). */
+  get clock(): DeadlineClock | undefined {
+    return this.inner.clock;
+  }
+
   open(): Promise<void> {
     return this.inner.open();
   }
@@ -473,6 +478,11 @@ class InfoAnswers implements UsbTransport {
 
   get isOpen(): boolean {
     return this.inner.isOpen;
+  }
+
+  /** The camera's clock, forwarded: `SeekDevice` times its waits on it (TESTING.md sec.20). */
+  get clock(): DeadlineClock | undefined {
+    return this.inner.clock;
   }
 
   open(): Promise<void> {

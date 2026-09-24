@@ -126,6 +126,12 @@ export interface DeadlineClock {
    * call. The returned function cancels it; calling it after expiry is harmless.
    */
   startTimer(ms: number, onExpire: () => void): () => void;
+  /**
+   * This clock's time, in ms, for a deadline that is checked between requests
+   * rather than raced against one (`SeekDevice.ensureMode0`). Only differences
+   * mean anything; `WALL_CLOCK`'s is `Date.now()`.
+   */
+  now(): number;
 }
 
 /** Real time. The default clock, and the one every real camera is timed on. */
@@ -135,6 +141,9 @@ export const WALL_CLOCK: DeadlineClock = {
     return () => {
       clearTimeout(timer);
     };
+  },
+  now(): number {
+    return Date.now();
   },
 };
 
@@ -208,7 +217,8 @@ export class WebUsbTransport implements UsbTransport {
   private readonly api: string;
   private readonly host: string | null;
   private readonly onWarning: ((message: string) => void) | undefined;
-  private readonly clock: DeadlineClock;
+  /** The clock this transport's deadlines run on; `SeekDevice` times its own waits on it too. */
+  readonly clock: DeadlineClock;
 
   private recipient: Recipient;
   private claimed = false;

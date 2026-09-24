@@ -16,6 +16,7 @@ import {
   WINDOW_SIZE,
 } from '../src/protocol/ops.js';
 import type { WindowEntry } from '../src/profiles/types.js';
+import type { UsbTransport } from '../src/protocol/transport.js';
 import {
   WALL_CLOCK,
   WebUsbTransport,
@@ -190,6 +191,78 @@ describe('ensureMode0', () => {
     expect((error as SeekError).code).toBe('device/mode');
     expect((error as SeekError).message).toMatch(/did not enter operation mode 0/);
   }, 10_000);
+
+  /* TESTING.md sec.20: the settle deadline on the transport's clock. */
+  const NS_PER_MS = 1_000_000;
+
+  /** A camera on an injected clock that, like the gated emulator, ages only while a
+   *  request is outstanding: `msPerRequest` of its time per control transfer. */
+  class OnClock implements UsbTransport {
+    readonly clock = new EmulatedDeviceClock();
+    private readonly inner: FakeCamera;
+    private readonly msPerRequest: number;
+    constructor(inner: FakeCamera, msPerRequest: number) {
+      this.inner = inner;
+      this.msPerRequest = msPerRequest;
+    }
+    get description(): UsbTransport['description'] {
+      return this.inner.description;
+    }
+    get info(): UsbTransport['info'] {
+      return this.inner.info;
+    }
+    get isOpen(): boolean {
+      return this.inner.isOpen;
+    }
+    open(): Promise<void> {
+      return this.inner.open();
+    }
+    close(): Promise<void> {
+      return this.inner.close();
+    }
+    controlIn(request: number, length: number, timeoutMs: number): Promise<Uint8Array> {
+      this.age();
+      return this.inner.controlIn(request, length, timeoutMs);
+    }
+    controlOut(request: number, data: Uint8Array, timeoutMs: number): Promise<void> {
+      this.age();
+      return this.inner.controlOut(request, data, timeoutMs);
+    }
+    private age(): void {
+      this.clock.advance(this.clock.timeNs + this.msPerRequest * NS_PER_MS);
+    }
+  }
+
+  it("times the settle deadline on the transport's clock, so real time decides nothing", async () => {
+    /* The camera never settles in real time (10 s), and ages 100 ms per request. */
+    const camera = fakeCamera({ requireMode0: true, initialMode: 1, modeSettleMs: 10_000 });
+    const transport = new OnClock(camera, 100);
+    await transport.open();
+    const dev = new SeekDevice(transport);
+    expect(dev.clock).toBe(transport.clock);
+
+    const error = await dev.ensureMode0().catch((e: unknown) => e);
+    expect((error as SeekError).code).toBe('device/mode');
+    /* The read, SetOperationMode (t = 200 ms, deadline 3,200 ms), then a poll per 100 ms
+     * until the clock is past it: the 31st poll, at 3,300 ms. On the wall clock this was
+     * however many polls fit in 3 real seconds (~150 at 20 ms apart). */
+    const polls = camera.calls.filter((c) => c.op === OP.GET_OPERATION_MODE).length;
+    expect(polls).toBe(1 + 31);
+    expect(transport.clock.reads).toBe(1 + 31);
+    expect(transport.clock.timeNs).toBe(3300 * NS_PER_MS);
+  });
+
+  it('takes the clock from the transport, and the wall clock without one', () => {
+    const clock = new EmulatedDeviceClock();
+    const webusb = new WebUsbTransport(stubDevice(), { clock });
+    expect(new SeekDevice(webusb).clock).toBe(clock);
+    expect(new SeekDevice(new WebUsbTransport(stubDevice())).clock).toBe(WALL_CLOCK);
+    expect(new SeekDevice(fakeCamera()).clock).toBe(WALL_CLOCK);
+    const before = Date.now();
+    const read = WALL_CLOCK.now();
+    expect(read).toBeGreaterThanOrEqual(before);
+    expect(read).toBeLessThanOrEqual(Date.now());
+  });
 });
 
 describe('authenticated banks', () => {
@@ -574,7 +647,7 @@ describe('WebUsbTransport deadlines on an injected clock', () => {
     cancel();
     clock.advance(30 * NS_PER_MS);
     clock.advance(1 * NS_PER_MS);
-    expect(clock.now).toBe(30 * NS_PER_MS);
+    expect(clock.timeNs).toBe(30 * NS_PER_MS);
     expect(fired).toEqual(['5 ms', '20 ms']);
     cancel();
     expect(clock.armed).toBe(0);

@@ -327,14 +327,16 @@ export function printMatrix(title: string): void {
       hostGiveUps: c.hostGiveUps + r.delivery.clock.hostGiveUps,
       deadlinesFired: c.deadlinesFired + r.delivery.clock.deadlinesFired,
       repliesHeld: c.repliesHeld + r.delivery.clock.repliesHeld,
+      clockReads: c.clockReads + r.delivery.clock.clockReads,
     }),
-    { deviceSeconds: 0, hostGiveUps: 0, deadlinesFired: 0, repliesHeld: 0 },
+    { deviceSeconds: 0, hostGiveUps: 0, deadlinesFired: 0, repliesHeld: 0, clockReads: 0 },
   );
   out.push(
     `clock: deadlines on the emulated camera's clock; ${clock.deviceSeconds.toFixed(6)} s of ` +
       `device time; ${String(clock.hostGiveUps)} transfer(s) given up by the emulated host ` +
       `(-110), ${String(clock.deadlinesFired)} transport deadline(s) fired; ` +
-      `${String(clock.repliesHeld)} repl(ies) held for their record`,
+      `${String(clock.repliesHeld)} repl(ies) held for their record; ` +
+      `${String(clock.clockReads)} mode-settle read(s) of the camera's time`,
   );
   out.push('');
   for (const row of [...rows].sort((a, b) => b.seconds - a.seconds)) {

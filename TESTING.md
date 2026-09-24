@@ -2912,7 +2912,7 @@ machine is 10 cores with a desktop session (screen recording, a browser) beside 
 - **The faithful give-up is not run.** `SEEK_EMU_HOST_GIVE_UP_MS=Infinity` works (the FW-V1
   self-test checks the mechanism at 50 ms), but at 5 s a single unanswered 0.6.0.4 request did
   not finish in 9.5 minutes, so no row has been measured that way.
-- **`ensureMode0` still waits on the wall clock.** `SeekDevice.ensureMode0` polls
+- ~~**`ensureMode0` still waits on the wall clock.**~~ Closed in §20.1. `SeekDevice.ensureMode0` polls
   `GetOperationMode` every 20 ms until `MODE_SETTLE_MS` (3 s) of real time has passed
   (`client.ts`). That is a second deadline outside the transport, with the same shape as §19.1:
   on the emulator, a camera that needed more of its own time to reach mode 0 than a loaded
@@ -2922,3 +2922,121 @@ machine is 10 cores with a desktop session (screen recording, a browser) beside 
 - The adapter's re-import retry (`REOPEN_TIMEOUT_MS`) and the READY / `OP_REQ_DEVLIST` waits
   are wall-clock too. They decide only whether the instrument is up - a device on the gated
   clock does not age while they wait - and a failure there fails the row.
+
+## 20. The settle deadline on the camera's clock, the wall clock's tripwire, and the check's time (2026-09-24)
+
+§19.8 left a second wall-clock deadline (`ensureMode0`) and a check that seemed to have gone from
+~300 s to 520-540 s. This section moves the deadline, adds a guard that fails a row when any wait
+is timed on real time, and measures the slowdown. The toolkit source changed (`webusb.ts`,
+`transport.ts`, `client.ts`); FW-V1 did not.
+
+### 20.1 The settle deadline on the transport's clock
+
+- `DeadlineClock` gained `now()`, the clock's time in ms, for a deadline checked between
+  requests rather than raced against one. `WALL_CLOCK.now()` is `Date.now()`.
+- `UsbTransport` gained an optional `clock`. `WebUsbTransport` exposes the one it was built with
+  (`WALL_CLOCK` by default), and a pass-through transport forwards it (`probe.ts`'s
+  `IdentityRecorder` and `InfoAnswers` do).
+- `SeekDevice.clock` is `transport.clock ?? WALL_CLOCK`, and `ensureMode0` computes and checks
+  its `MODE_SETTLE_MS` deadline with `this.clock.now()`.
+
+**In production nothing changes.** The browser app and the CLI build their transports without a
+clock, so the deadline is `Date.now() + 3000` checked with `Date.now()`, the same expression as
+before. Over the emulator it is 3 s of the camera's time. Between URBs the gated clock does not
+move, so the 20 ms pauses age the camera by nothing and each `GetOperationMode` poll ages it by
+about one interrupt threshold (~1 ms). A camera that never reached mode 0 would therefore be
+polled ~3,000 times, where a real camera gets ~150, which is about a minute of wall time. No row
+gets that far. The `clock:` summary line now counts the settle loop's reads of the camera's time,
+and it was **0 in both tiers** in every run below: every emulated camera already reports mode 0
+at the first read.
+
+New tests in `protocol.test.ts`. One uses a camera that never settles and ages 100 ms per request
+on an injected clock: exactly 1 + 31 `GetOperationMode` reads, ending at 3,300 ms of its time,
+after about 0.7 s of real time. On the old code that loop ran for 3 real seconds, about 150
+polls, so the test fails there. The other checks that the device takes its transport's clock and
+falls back to `WALL_CLOCK`.
+
+### 20.2 The other real-time waits in the toolkit
+
+A grep of `packages/*/src` for `setTimeout`, `Date.now`, `performance.now`, `sleep` and `delay`
+found these. Only the first two decide anything, and both are on the transport's clock now.
+
+| wait                                                                              | decides                                       | treatment                                                                                                                        |
+| --------------------------------------------------------------------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `withTimeout` (`webusb.ts`)                                                       | whether a transfer timed out                  | the transport's clock (§19)                                                                                                      |
+| `ensureMode0`'s `MODE_SETTLE_MS`                                                  | whether mode 0 came in time                   | the transport's clock (20.1)                                                                                                     |
+| `client.ts` pauses (20 ms after an arm, 10 ms after a selector, 50 ms on a retry) | nothing: the next request always follows      | left alone. On the gated clock a pause ages the camera by nothing however long it takes, so the URB sequence cannot depend on it |
+| `capability.ts` start-up pauses (20 ms)                                           | nothing: the window is a count of reads (§18) | left alone                                                                                                                       |
+| `dump.ts` `retryDelayMs`, `flash.ts` 200 ms after the commit                      | nothing                                       | left alone                                                                                                                       |
+| `flash.ts` `Date.now()`                                                           | the throughput text in a log line             | left alone: reporting, and no pin records it                                                                                     |
+| CLI `interrupt.ts`, `reporter.ts`; web `useReporter`, `yield-to-ui`, `download`   | UI and Ctrl-C only                            | left alone: no emulator suite runs them                                                                                          |
+
+The harness's own wall-clock waits (the READY line, `OP_REQ_DEVLIST`, the re-import retry, the
+30 s per-URB watchdog) are unchanged. They decide only whether the instrument is up, and each one
+fails the row when it runs out (§19.4, §19.8).
+
+### 20.3 The guard: the wall clock's tripwire
+
+`harness.ts` wraps `WALL_CLOCK.now` and `WALL_CLOCK.startTimer` with counters. The wrappers call
+straight through, so the clock itself does not change. Every emulator notes the counts when it
+comes up, and the delivery audit fails the row as an `InfrastructureDefect` if either moved while
+it ran ("the toolkit timed a wait on the WALL clock ..."). Within the toolkit, `WALL_CLOCK` is
+only ever the fallback: a transport built without `clock: device.deadlineClock`, a `SeekDevice`
+over a transport that has no clock, or a pass-through transport that did not forward one. A use
+of it during a row is therefore a deadline that load could have moved. The count is per test
+worker, so a row that ran beside the offender fails with it. That is deliberate: it fails closed
+and never lets a row pass. The existing `wallClockTransfers` guard (§19.2) stays.
+
+New test in `emulator-failfast.test.ts`: against the stand-in emulator, a `SeekDevice` over a
+clockless transport settles mode 0 and a transfer is raced without a clock, and the audit throws
+the defect. With the check disabled, the test fails.
+
+### 20.4 Where the check's time went
+
+A/B, in the same conditions: the harness before §19 (`662b696`, no side channel) against this one,
+both against FW-V1 `eb0f07e9`, one after the other on a quiet machine. The tier-2 row is
+Compact 4.8.2.1 (`2229A0YZ7E28`, 64,783 URBs), alone.
+
+| run                            | load               | wall                                        | emulator CPU (Python) | harness CPU (Node) |
+| ------------------------------ | ------------------ | ------------------------------------------- | --------------------- | ------------------ |
+| tier-2 row, before §19         | 14 → 16            | 84.7 s                                      | 67.0 s                | 6.8 s              |
+| tier-2 row, `63f76c0`          | 16 → 10            | 83.5 s                                      | 66.3 s                | 7.8 s              |
+| tier-2 row, `63f76c0`          | 8 → 13             | 81.0 s                                      | 65.2 s                | 7.3 s              |
+| tier-2 row, this change        | 10 → 8             | 85.8 s                                      | 67.9 s                | 7.7 s              |
+| tier-2 row, this change        | 13 → 18            | 81.2 s                                      | 65.0 s                | 7.4 s              |
+| full `vitest run`, before §19  | 12 → 19 (peak 105) | 347 s; 0.6.0.4 measured **22** and failed   | —                     | —                  |
+| full `vitest run`, this change | 19 → 14 (peak 67)  | 281 s; 700 / 700; slowest 204.9 s / 139.3 s | —                     | —                  |
+
+- **The side channel is not where the time went.** A tier-2 row costs the same wall time with it
+  and without it (81-86 s against 84.7 s). The emulator's CPU is unchanged within noise. The
+  harness spends about 0.5-1 s more CPU per 65k URBs (~15 µs a URB), for a second socket read per
+  URB.
+- **Its parts, measured in place** (temporary instrumentation, not committed). The emulator's
+  `publish` took 2.28 s per 64,783 records, 35 µs each, of which json formatting is ~2 µs and the
+  `send` ~10 µs. The harness's record handler took 0.62 s, 9.5 µs each. 24% of replies were read
+  in a later event-loop turn than their record, which costs one extra wake-up. The rest shared a
+  turn with it.
+- **Holding replies costs nothing.** A reply waits only when its record is late, and that was 0
+  in tier 1 and 1 of 873,049 in tier 2.
+- **Wall time on this machine is noisy.** Earlier single-row runs of both harnesses at loads
+  11-40 spread from 70 to 95 s, so any one pair can suggest a 10-20% difference either way. The
+  full run of the old harness fell into a load spike, and it also recorded 22 for 0.6.0.4: the
+  race §19 removed, on the old code, at loads up to ~105.
+- **So §19.7's 516-537 s was not reproduced.** Under the same conditions the suite takes ~281 s,
+  as §18's 278-288 s did. Nothing in the side channel accounts for the difference. §19.5 records
+  what else held that machine during that hour (FW-V1's self-test, another session's emulator
+  suite, a desktop session).
+- **What bounds the check** is emulation, not plumbing. Tier 1 waits on 0.6.0.4 (~205 s for 313
+  URBs, most of it emulating 25.4 s of device time with the firmware spinning). Tier 2 is 873k
+  URBs at 6 rows at a time, and the emulator uses ~9 times the harness's CPU per row.
+- **Tried and dropped: two micro-optimisations.** In the emulator, the record formatted as bytes
+  directly (the same bytes) and sent first through a non-blocking twin of the socket, which skips
+  the poll a timeout socket makes before each send: `publish` went from 20.3 to 10.5 µs in
+  isolation. In the harness, the channel read through `onread` into one reused buffer, with
+  numeric pairing keys. Neither moved a row's wall time or the harness's CPU outside the noise
+  (83.0 / 89.7 s against 82.2 / 87.5 s; 7.7 / 7.4 s against 7.3 / 7.8 s), so neither is committed
+  and FW-V1 is unchanged. Each would save well under 1% of the check.
+
+### 20.5 The checks
+
+(Filled in by the next commit.)
