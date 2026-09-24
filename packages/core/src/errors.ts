@@ -23,6 +23,15 @@ export type SeekErrorCode =
   | 'flash/refused'
   | 'flash/commit'
   | 'profile/unsupported'
+  /**
+   * The v1 full-flash preservation pipeline refused to proceed — a gate that
+   * exists to keep a write from landing somewhere other than the slot the
+   * camera boots (a bank capture that is not the factory image, a boot-config
+   * word that names no slot, a build the patch was not derived from). The
+   * general flash workflow reports `flash/refused`; this code marks the
+   * preservation pipeline's own gates. See `src/preservation/`.
+   */
+  | 'pipeline/refused'
   | 'cancelled';
 
 export interface SeekErrorOptions extends ErrorOptions {

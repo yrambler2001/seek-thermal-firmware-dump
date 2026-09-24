@@ -1,0 +1,183 @@
+/**
+ * The wire geometry of the v1 preservation pipeline: which BeginFirmwareUpgrade
+ * windows it arms, which one is the boot-config block, which are the image
+ * banks, and how the active slot is read out of the boot config.
+ *
+ * All of this is measured on the v1 locked line (Compact 1.0.0.0 / 1.2.0.0 /
+ * 1.3.0.0 on the 2016-donor bootloader generation; FW-V1 docs 33 sec. 11.7 and
+ * 34 sec. 34.11), and it is the same table every build of the line decodes to
+ * (`legacy-auth.ts`'s 0.9.0.2..1.3.0.0 rows): modes 3..9 answer only the
+ * 18-byte token form, 0x0A..0x21 arm on the plain 2-byte form, and each mode
+ * exposes exactly one 64 KiB block.
+ *
+ * READ/WRITE ASYMMETRY, AND WHY IT SHAPES THE PIPELINE. Over this wire the
+ * reachable part is the lower 2 MiB: 0x14010000..0x141FFFFF (modes 3..0x21 —
+ * 31 windows), and `mode > 0x21` is refused outright. The upper 2 MiB is
+ * unreachable to a stock camera. The in-place patch WIDENS the mode-2 window
+ * to the whole part (`dc = 0x400000`), which is what phase P3's full-4-MiB
+ * drain reads through — and why the stock window set is the backup's unit and
+ * the widened window is the dump's.
+ */
+
+import { bytesToHex, hexUp } from '../bytes.js';
+import { SeekError } from '../errors.js';
+import { authPayload, OLD_FW_UNLOCK_TOKEN } from '../profiles/legacy-auth.js';
+import { WINDOW_SIZE } from '../profiles/modern-4x.js';
+import type { WindowEntry } from '../profiles/types.js';
+
+/** The boot-config block, armed by mode 3. */
+export const BOOT_CONFIG_ADDRESS = 0x14010000;
+export const CFG_MODE = 3;
+
+/** The image-select record the bootloader keeps in the boot-config block. */
+export const BOOT_CONFIG_BYTES = 28;
+
+/** The three app-image banks, in the bootloader's A/B/recovery order. */
+export const BANKS = [
+  { key: 'a', mode: 7, address: 0x14050000 },
+  { key: 'b', mode: 8, address: 0x14060000 },
+  { key: 'r', mode: 9, address: 0x14070000 },
+] as const;
+
+export type BankKey = (typeof BANKS)[number]['key'];
+
+/** The bank the donor bootloader's fixed validate order boots when the record
+ *  is blank: A (disassembly of the dump at 0x14000334..0x1400035e — validate
+ *  A, then B, then recovery). */
+export const BLANK_CFG_BANK: BankKey = 'a';
+
+/** The widened window the PATCHED image serves (mode 2, window length 0x400000). */
+export const WIDENED_MODE = 2;
+
+/** One window's length (64 KiB) — re-exported under the pipeline's name. */
+export const WINDOW_BYTES = WINDOW_SIZE;
+
+/** The stock backup: modes 3..9 (7) plus 0x0A..0x21 (24). */
+export const BACKUP_WINDOW_COUNT = 31;
+
+/** The boot-config window entry (mode 3, token form). */
+export function cfgWindow(): WindowEntry {
+  return {
+    subcmd: CFG_MODE,
+    address: BOOT_CONFIG_ADDRESS,
+    note: 'boot-config block (the image-select record)',
+    payload: authPayload(CFG_MODE, OLD_FW_UNLOCK_TOKEN),
+  };
+}
+
+/** The 31 windows a stock v1 camera can read: modes 3..9 (token form) and
+ *  0x0A..0x21 (plain form) — 0x14010000..0x141FFFFF, one 64 KiB block each. */
+export function preservationWindows(): readonly WindowEntry[] {
+  const windows: WindowEntry[] = [];
+  for (let mode = 3; mode <= 9; mode++) {
+    windows.push({
+      subcmd: mode,
+      address: 0x14010000 + (mode - 3) * WINDOW_SIZE,
+      note: `protected window (auth): ${hexUp(0x14010000 + (mode - 3) * WINDOW_SIZE, 8)}`,
+      payload: authPayload(mode, OLD_FW_UNLOCK_TOKEN),
+    });
+  }
+  for (let mode = 0x0a; mode <= 0x21; mode++) {
+    windows.push({
+      subcmd: mode,
+      address: 0x14080000 + (mode - 0x0a) * WINDOW_SIZE,
+      note: `linear window: ${hexUp(0x14080000 + (mode - 0x0a) * WINDOW_SIZE, 8)}`,
+    });
+  }
+  return windows;
+}
+
+/** The window entry for one bank, armed for a WRITE phase (P2/P4). */
+export function bankWindow(key: BankKey): WindowEntry {
+  const bank = BANKS.find((b) => b.key === key);
+  if (bank === undefined) throw new SeekError('pipeline/refused', `no bank ${key}`);
+  return {
+    subcmd: bank.mode,
+    address: bank.address,
+    note: `app image bank ${key} (${hexUp(bank.address, 8)}), write-capable window`,
+    payload: authPayload(bank.mode, OLD_FW_UNLOCK_TOKEN),
+  };
+}
+
+/** The widened mode-2 window entry (P3's drain). */
+export function widenedWindow(): WindowEntry {
+  return {
+    subcmd: WIDENED_MODE,
+    address: 0x14000000,
+    note: "bootloader block through the patched image's widened window",
+    payload: authPayload(WIDENED_MODE, OLD_FW_UNLOCK_TOKEN),
+  };
+}
+
+export interface SlotDetection {
+  /** The 28 bytes as served. */
+  readonly cfgHex: string;
+  /** cfg[0], the selector word. */
+  readonly cfg0: number;
+  /** True when cfg[0] is 0xFFFFFFFF or 0 — no record written, the bootloader's
+   *  fixed A -> B -> recovery validate order decides, and that order boots A. */
+  readonly blank: boolean;
+  /** The bank key the bootloader boots. */
+  readonly bank: BankKey;
+  /** The bank's flash address. */
+  readonly bankAddress: number;
+  /** The BeginFirmwareUpgrade mode that arms the active bank for a write. */
+  readonly bankMode: number;
+  readonly verdict: string;
+}
+
+/**
+ * Parse the 28-byte boot-config record into the active-slot verdict.
+ *
+ * cfg[0] 0xFFFFFFFF or 0 -> blank -> slot A; 1 -> B; 2 -> recovery. Anything
+ * else names no slot this bootloader generation validates, and the pipeline
+ * refuses rather than guess — the whole point of the preservation route is
+ * that the write lands ONLY in the slot the camera actually boots.
+ */
+export function parseBootConfig(block: Uint8Array): SlotDetection {
+  if (block.length < BOOT_CONFIG_BYTES) {
+    throw new SeekError(
+      'pipeline/refused',
+      `boot-config read is ${String(block.length)} B, want ${String(BOOT_CONFIG_BYTES)}`,
+    );
+  }
+  const cfg0 = new DataView(block.buffer, block.byteOffset, block.byteLength).getUint32(0, true);
+  const byKey = (k: BankKey): { mode: number; address: number } => {
+    const bank = BANKS.find((b) => b.key === k);
+    if (bank === undefined) throw new SeekError('pipeline/refused', `no bank ${k}`);
+    return { mode: bank.mode, address: bank.address };
+  };
+  if (cfg0 === 0 || cfg0 === 0xffffffff) {
+    const { mode, address } = byKey(BLANK_CFG_BANK);
+    return {
+      cfgHex: bytesToHex(block),
+      cfg0: cfg0 >>> 0,
+      blank: true,
+      bank: BLANK_CFG_BANK,
+      bankAddress: address,
+      bankMode: mode,
+      verdict:
+        `cfg[0]=${hexUp(cfg0)} is blank -> the bootloader's fixed A->B->recovery validate ` +
+        `order boots bank A (${hexUp(address)})`,
+    };
+  }
+  if (cfg0 === 1 || cfg0 === 2) {
+    const key: BankKey = cfg0 === 1 ? 'b' : 'r';
+    const { mode, address } = byKey(key);
+    return {
+      cfgHex: bytesToHex(block),
+      cfg0,
+      blank: false,
+      bank: key,
+      bankAddress: address,
+      bankMode: mode,
+      verdict: `cfg[0]=${String(cfg0)} names bank ${key} (${hexUp(address)})`,
+    };
+  }
+  throw new SeekError(
+    'pipeline/refused',
+    `cfg[0]=${hexUp(cfg0)} names no slot this bootloader validates (0, 1, 2 or blank) — ` +
+      'refusing to pick a write target on a guess',
+    { detail: { cfg0: cfg0 >>> 0 } },
+  );
+}
