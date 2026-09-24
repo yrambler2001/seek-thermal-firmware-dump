@@ -23,6 +23,7 @@ import {
   PROBE_OPEN_SUBCMD,
   PROBE_PROTECTED_SUBCMD,
   probeSelectorChannel,
+  VERSION_READ_STARTUP_READS,
 } from '../src/workflows/capability.js';
 import { fakeCamera, type FakeCameraOptions } from './fake-transport.js';
 
@@ -162,8 +163,12 @@ describe('probeSelectorChannel', () => {
     expect(probe.skippedForSafety).toBe(true);
     expect(probe.plainAccepted).toBe(false);
     expect(probe.notes.some((n) => n.includes('GetFirmwareInfo did not answer'))).toBe(true);
-    /* The version read is two unarmed reads (readRunningFirmware); nothing else. */
-    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
+    /* A STALL before any answer may be the firmware still starting up, so the
+     * version read asks again for its whole start-up window
+     * (VERSION_READ_STARTUP_READS); nothing but GetFirmwareInfo goes out. */
+    expect(camera.calls.map((c) => c.op)).toEqual(
+      Array.from({ length: VERSION_READ_STARTUP_READS }, () => OP.GET_FIRMWARE_INFO),
+    );
   });
 
   it('records a window that arms but serves nothing', async () => {

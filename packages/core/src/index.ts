@@ -338,6 +338,9 @@ export {
   versionUnknownReason,
   writeFirmware,
   VERSION_READ_ATTEMPTS,
+  VERSION_READ_STARTUP_READS,
+  VERSION_READ_STARTUP_SPACING_MS,
+  VERSION_READ_STARTUP_WINDOW_MS,
 } from './workflows/index.js';
 export type {
   CameraIdentification,

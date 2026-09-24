@@ -1867,13 +1867,15 @@ some other record. The emulator showed it: 2.0.2.3, the bootloader's version, on
 that directly follows another answered one. The first answer is never the version; it only
 proves the selector is now 0. A failed read proves nothing (a stall may be the dispatcher, a
 timeout may be a SETUP never taken), so it does not count. At most
-`VERSION_READ_ATTEMPTS = 4` reads, and two failures in a row end it. Only GetFirmwareInfo is
-sent, as a control IN, so the read stays inside `SAFE_BEFORE_IDENTITY`. When the first
+`VERSION_READ_ATTEMPTS = 4` reads, and two failures in a row end it _(§18: a STALL before any
+answer is now read again for a start-up window of 26 reads 20 ms apart, and those reads do not
+count here)_. Only GetFirmwareInfo is sent, as a control IN, so the read stays inside `SAFE_BEFORE_IDENTITY`. When the first
 answer differs from the second, the note says so ("the first read answered a different record
 (2.0.2.3), which an earlier command had left the firmware-info selector on").
 
 The cost: every version read is two transfers instead of one. A camera that never answers is
-refused after two reads instead of one.
+refused after two reads instead of one. _(§18: one that STALLs every read is now refused after
+the 26 reads of the start-up window; one that times out, still after two.)_
 
 **Tests** (`identity-gate.test.ts`, "a camera an earlier command left with the firmware-info
 selector set"). The fake camera keeps the selector across close and open, as the firmware
@@ -2545,6 +2547,8 @@ SET_CONFIGURATION - GetFirmwareInfo at +1 ms .. +9 ms is refused, at +10 ms answ
 (`01 03 00 08 ...`, 1.3.0.8) - and with the old pacing the 256-step settle after
 SET_CONFIGURATION (~11 ms of a sleeping part) had always outlasted it. A host that asks within
 ~9 ms of configuring the camera meets the same refusal; the toolkit's own message says what to do.
+_(§18: no longer. The version read now waits out a bounded start-up window, and 1.3.0.8 is
+identified again.)_
 
 ### 17.2 The pins, re-taken
 
@@ -2568,3 +2572,116 @@ On the committed pins, run alone: **exit 0, 687 / 687**, 222 s wall (vitest 206.
 44 / 7 / 0 with 20,752 replies delivered = received, slowest row 146.7 s (0.6.0.4); tier 2
 15 / 0 / 0 with 873,049 = received, 0 dropped, slowest row 94.5 s. The first run's wall was 226 s
 (vitest 210.5 s), so the host's new device-time pauses cost the suite nothing it can measure.
+
+## 18. The version read waits out a camera that is still starting up (2026-09-24)
+
+§17 left Compact 1.3.0.8 refused: its firmware STALLs every request for ~9 ms after
+SET_CONFIGURATION, the emulated host now asks within that time, and the version read gave up
+after two STALLs, in under 9 ms. A real host meets the same gate when it opens a camera right
+after a reset or a replug. The toolkit source changed (`capability.ts`); FW-V1 did not (still
+`526acf8f`, `emu-corpus`).
+
+### 18.1 The rule
+
+`readRunningFirmware` treats a **STALL before any read has been answered** as the firmware's
+"Request sent during FW init" refusal, and reads again, 20 ms later, up to 26 reads
+(`VERSION_READ_STARTUP_READS`, `VERSION_READ_STARTUP_SPACING_MS`). The first answer ends the
+waiting at once; the ordinary rule (two answered reads in a row, §12.3) then settles the version.
+If all 26 reads are refused, the version is unknown and the run is refused with
+`device/version-unknown`, as before, and the note says so ("... on any of 26 reads 20 ms apart,
+a start-up window of 500 ms ..."). Every retry is logged at `warn` ("GetFirmwareInfo was refused
+(...), read 3 of up to 26: the camera may still be starting up; asking again in 20 ms"), and an
+identification that needed retries says so in its note ("it answered after refusing 9 read(s)
+while starting up"). Only GetFirmwareInfo is sent during the window, so the read stays inside
+`SAFE_BEFORE_IDENTITY`. A **timeout** is not retried this way: it already held the request out
+for the whole transfer deadline, longer than any start-up, and the ordinary rule (one more read)
+is what Compact 0.6.0.4's silent refusal needs. After any answer the ordinary rule applies.
+
+**The length.** From the firmware:
+
+| firmware        | gate                                                           | measured                                     |
+| --------------- | -------------------------------------------------------------- | -------------------------------------------- |
+| Compact 1.3.0.8 | `g_systick_state <= 7`, STALL (the completed images: the same) | ~9 ms after SET_CONFIGURATION (FW-V1 Ph. 36) |
+| Compact 0.6.0.4 | FSM `<= 8`, no STALL: the transfer times out                   | ~50-60k cycles, under one SysTick            |
+| Compact 0.5.1.x | FSM `<= 11`, STALL, held by the sensor watchdog (10 restarts)  | ~58 ms of its own time with no sensor        |
+
+The longest bounded init step inside the gate is 1.3.0.8's sensor poll (FSM state 2,
+`fsm_poll_step`): it tries again every 50 ms and gives up after the fifth time, ~250 ms from
+boot. The window is 500 ms on the camera's own clock: twice that, and 50 times the 9 ms measured.
+
+**Why a count of reads, not a deadline.** A real camera starts on its own clock: 25 pauses of at
+least 20 ms (a timer never fires early) are at least 500 ms. The emulator's clock is gated: the
+device runs only while a request is outstanding, so a sleeping host ages it by nothing, and each
+refused read ages it by one EHCI interrupt threshold (~1 ms, FW-V1 `docs/EMULATOR.md` §24.3). A
+deadline alone would give the emulated device as many reads as fit into 500 ms of a loaded
+machine; a count gives it 26 whatever the load, and makes the record the same on every run.
+Measured on the emulator: the `insecure-8hz` 1.3.0.8 answered after **5** refused reads (the
+retries logged "read 1" .. "read 5"), the FF image after none.
+
+**Cancellation.** The wait does not consult the caller's signal, as the rest of the version read
+does not: it is bounded, and a cancel lands at the caller's next check. The tier-1 first-contact
+instrument relies on that (§11.1: it runs the dump with its signal already aborted). A first
+version of this change checked the signal after each pause, and both 0.5.1.x rows then recorded
+`cancelled` instead of the refusal; a test now pins the behaviour.
+
+### 18.2 The tests, and what each did on the old code
+
+`identity-gate.test.ts`, "a camera still starting up, which refuses every request for a while".
+The fake camera STALLs every request while it starts, on either clock: after `n` requests (the
+emulator's gated clock) or `t` ms after it was plugged in (a camera's own clock). The tests run
+on vitest's fake timers, so the window's times are exact. Run against the old `readRunningFirmware`
+(only the three constants added so the file loads), every one fails:
+
+| test                                                                                       | on the old code                                                                     |
+| ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| is identified when it answers inside the window on the gated clock (nine refusals)         | `expected { permitsArming: false, … } to deeply equal { permitsArming: true, … }`   |
+| is identified when it answers inside the window on its own clock (300 ms: 15 refusals)     | the same                                                                            |
+| is refused after the window when it never answers, having waited it out (26 reads, 500 ms) | `expected 'the camera did not report its firmwar…' to contain 'on any of 26 reads'` |
+| sends nothing but GetFirmwareInfo during the window, from every entry point                | `probe: expected [ …(2) ] to deeply equal [ …(26) ]`                                |
+| reads through the window even when the run was cancelled before it began                   | `expected [ …(2) ] to have a length of 26 but got 2`                                |
+
+The first three also check the warnings, one per retry (9, 15 and 25), and the first that the
+second read follows the first answer at once. The fourth runs the probe, `runDump`,
+`runSweep` and `readDeviceInfo` and asserts each sent exactly 26 control INs of GetFirmwareInfo
+and nothing else.
+
+Two existing tests pinned "two GetFirmwareInfo, then nothing" on a camera that STALLs every
+read. They now pin exactly `VERSION_READ_STARTUP_READS` GetFirmwareInfo and nothing else
+(`capability.test.ts` "sends nothing more to a camera that will not answer GetFirmwareInfo",
+`identity-gate.test.ts` "is probed with GetFirmwareInfo only"); both fail on the old code with
+`expected [ 78, 78 ] to deeply equal [ 78, 78, 78, 78, 78, 78, 78, …(19) ]`. The tests with a timing-out camera
+("gives up after two failures in a row, and after the attempt budget") are unchanged and pass:
+a timeout is not a start-up refusal. The block "a camera whose firmware version cannot be read"
+now waits the real 500 ms per version read (four profiles in one test: ~2.4 s), so it has a
+20 s timeout; no assertion in it changed.
+
+### 18.3 Pinned results that changed
+
+`node scripts/update-emulator-expectations.mjs` (both tiers): exit 0, 312 s, 471 tests. Tier 1
+44 supported / 7 known-gap / 0 failed, 20,957 replies delivered = received (was 20,752); tier 2
+15 / 0 / 0, 873,049 = received, 0 dropped, every dump 0 differing bytes.
+**`expectations.roundtrip.json` is byte-identical.** In `expectations.rpc.json`:
+
+| row                                  | field                   | old                                                                                                                                     | new                                                                                                                                                                              | why                                                                                                                   |
+| ------------------------------------ | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Compact 1.3.0.8 `insecure-8hz` image | `gate`                  | `firmwareVersion` null, `identified` false, `profile` "generic", `refusal` "device/version-unknown: ... (control IN 0x4e -> stall) ..." | `firmwareVersion` "1.3.0.8", `identified` true, `profile` "legacy-auth", `refusal` null                                                                                          | the version read waited out the ~9 ms gate (5 refused reads, then two answers); exactly the values `0f58218` replaced |
+| Compact 0.5.1.0 and 0.5.1.3          | `gate.refusal`          | "... (GetFirmwareInfo did not answer (control IN 0x4e -> stall)); ..."                                                                  | "... (GetFirmwareInfo did not answer (control IN 0x4e -> stall) on any of 26 reads 20 ms apart, a start-up window of 500 ms; a camera still starting up answers within it); ..." | the new note: every read of the window was refused; the rest of the message is unchanged                              |
+| Compact 0.5.1.0 and 0.5.1.3          | `staleSelector.answers` | `["stall", "stall"]`                                                                                                                    | 26 × `"stall"`                                                                                                                                                                   | the same read at the end of the row, now 26 reads                                                                     |
+
+`sentBeforeIdentity` stays `["IN 0x4E"]` on all 51 rows, and nothing else in any row moved. The
+extra replies come from the same two changes: each of the three version reads in a 0.5.1.x row
+(the probe's, the dump's, the stale-selector read) is 24 reads longer, and 1.3.0.8's first
+contact now identifies the camera, so its probe goes on to its arms and its read, and the dump
+plans, where both used to stop after the version read.
+
+### 18.4 How 0.6.0.4 and 0.5.1.x behave now
+
+- **0.6.0.4** is unchanged: its refusal is silence, so its first read times out and is not a
+  start-up retry; the second read answers, the third too, and compact-2014 refuses the dump as a
+  pre-0.8 build (`gate` pin unchanged, 25 of 63 subcommands armed).
+- **0.5.1.0 and 0.5.1.3** are still refused, now after 26 reads each time the version is read. On
+  the emulator their gate is held by a sensor watchdog waiting for a sensor the emulator does not
+  model, for millions of cycles (FW-V1 `docs/EMULATOR_CORPUS.md` §15-16), far beyond ~26 ms of
+  device time; no bounded window a real host would accept reaches it. A real camera with a sensor
+  passes that watchdog at once, and one without passes it in ~58 ms of its own time (FW-V1's
+  estimate, TIMER0 at 10 kHz), inside the 500 ms window.

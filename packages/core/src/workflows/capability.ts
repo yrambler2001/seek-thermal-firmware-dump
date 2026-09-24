@@ -34,7 +34,7 @@
  * ==================================================================== */
 
 import { asciiz, hex } from '../bytes.js';
-import { CancelledError, errorMessage, type SeekErrorCode } from '../errors.js';
+import { CancelledError, errorMessage, SeekError, type SeekErrorCode } from '../errors.js';
 import type { SeekDevice } from '../protocol/client.js';
 import { DEFAULT_READ_CHUNK, OP } from '../protocol/ops.js';
 import { OLD_FW_UNLOCK_TOKEN, authPayload } from '../profiles/legacy-auth.js';
@@ -172,7 +172,8 @@ export type IdentityGate =
  * 0.3.0.1's `EnterBootloaderMode`; so no version is a refusal too. On the
  * emulator Compact 0.5.1.0 and 0.5.1.3 stall every request for a while after
  * enumeration, `GetFirmwareInfo` included, which is exactly this case — and a
- * real camera that is slow to start is refused rather than guessed at, and
+ * real camera that is slow to start is waited on for a bounded start-up window
+ * (`VERSION_READ_STARTUP_READS`), then refused rather than guessed at, and
  * reads fine once it answers.
  */
 export function identityGate(firmware: RunningFirmware): IdentityGate {
@@ -202,6 +203,72 @@ export function identityGate(firmware: RunningFirmware): IdentityGate {
  * costs one more — and two failures in a row end it early.
  */
 export const VERSION_READ_ATTEMPTS = 4;
+
+/**
+ * THE START-UP WINDOW: how many refused `GetFirmwareInfo` reads the version
+ * read sends before it gives up on a camera that is still starting, and how
+ * far apart. 26 reads, 20 ms apart: 500 ms from the first to the last.
+ *
+ * WHY THERE IS ONE. Seek firmware refuses every request on purpose while it
+ * starts. The RPC dispatcher logs "Request sent during FW init" and returns
+ * ERR_USBD_STALL while the SysTick state machine is still in an init state:
+ * `g_systick_state <= 7` on the completed images and on 1.3.0.8
+ * (FW-V1 `codegen/fn/rpc_dispatch_get_byid.c`,
+ * `targets/compact_32k_1_3_0_8/src/rpc_cmds.c`), `<= 11` on 0.5.1.x and
+ * `<= 8` on 0.6.0.4 (FW-V1 `docs/EMULATOR_CORPUS.md` sec.15). Measured:
+ *
+ *   Compact 1.3.0.8   STALL for ~9 ms after SET_CONFIGURATION (refused at
+ *                     +1..+9 ms, answered at +10 ms; FW-V1 Phase 36)
+ *   Compact 0.6.0.4   ~50-60k cycles, under one SysTick, and SILENT: no
+ *                     STALL, the transfer times out
+ *   Compact 0.5.1.x   STALL while its sensor watchdog restarts a sensor that
+ *                     does not answer, ten times: ~58 ms of its own time. The
+ *                     emulator has no sensor front end and stretches this to
+ *                     millions of cycles; a camera with a sensor passes it at
+ *                     once.
+ *
+ * The longest BOUNDED init step in the code sits inside the gate too:
+ * 1.3.0.8's sensor poll (FSM state 2, `fsm_poll_step`) tries again every 50 ms
+ * and gives up after the fifth time, ~250 ms from boot. 500 ms is twice that,
+ * and 50 times the 9 ms measured. A camera that still refuses after it is
+ * not starting up, and is refused as before.
+ *
+ * WHY A COUNT OF READS, NOT A DEADLINE. A real camera starts on its own clock,
+ * so there the window is wall time: 25 pauses of at least 20 ms each (a timer
+ * never fires early), so at least 500 ms. The emulator's clock is gated: its
+ * device runs only while a request is outstanding, so a host that sleeps ages
+ * it by nothing, and each refused read ages it by one EHCI interrupt threshold,
+ * ~1 ms (FW-V1 `docs/EMULATOR.md` sec.24.3). There the 26 reads give the
+ * device ~26 ms of its own time, 2.6 times the 10 ms 1.3.0.8 needs. A deadline
+ * alone would give the emulated device as many reads as fit in 500 ms of a
+ * loaded machine, which may be fewer than ten; a count gives both clocks what
+ * they need, and gives the emulator's record the same number of reads on every
+ * run.
+ *
+ * ONLY A STALL, AND ONLY BEFORE ANY ANSWER. A STALL is the gate's refusal. A
+ * timeout already held the request out for the whole transfer deadline, far
+ * longer than any start-up, and on the gated emulator the device ran all that
+ * time; the ordinary rule (one more read) is what 0.6.0.4's silent refusal
+ * needs. Once any read has been answered the dispatcher is running, and the
+ * ordinary rule applies to what follows.
+ */
+export const VERSION_READ_STARTUP_READS = 26;
+
+/** The pause between two refused reads of the start-up window. */
+export const VERSION_READ_STARTUP_SPACING_MS = 20;
+
+/** The start-up window on a camera's own clock: at least this long from the first read to the last. */
+export const VERSION_READ_STARTUP_WINDOW_MS =
+  (VERSION_READ_STARTUP_READS - 1) * VERSION_READ_STARTUP_SPACING_MS;
+
+function pause(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A STALL: what a firmware's "sent during FW init" gate answers with. */
+function isStall(error: unknown): boolean {
+  return error instanceof SeekError && error.code === 'usb/stalled';
+}
 
 /** One unarmed GetFirmwareInfo, as it came back. */
 type InfoRead =
@@ -253,13 +320,27 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
  * it. A stale first answer is named in the note, because it is worth knowing
  * that something left the camera in that state.
  *
+ * A CAMERA STILL STARTING UP. A STALL before any read has been answered may be
+ * the firmware's own "sent during FW init" refusal. Such a read is sent again,
+ * `VERSION_READ_STARTUP_SPACING_MS` later, up to `VERSION_READ_STARTUP_READS`
+ * reads; each retry is logged as a warning, and the first answer ends the
+ * waiting at once. Only GetFirmwareInfo is sent in the meantime. The refused
+ * reads do not count against `VERSION_READ_ATTEMPTS`. When the window is used
+ * up the version is unknown, as it was before. The wait does not consult the
+ * caller's signal, as the rest of the version read does not: it is bounded,
+ * and a cancel lands at the caller's next check, which on a dump is the head
+ * of its window loop, before the first arm. (The emulator's first-contact
+ * instrument relies on exactly that: it runs the dump with its signal already
+ * aborted, TESTING.md sec.11.1.)
+ *
  * Never throws for a refusal or a timeout — a camera that does not say is a
  * camera whose version is unknown, and `identityGate` says what that means:
  * nothing more is sent — but a cancellation propagates.
  */
 export async function readRunningFirmware(device: SeekDevice): Promise<RunningFirmware> {
   const reads: InfoRead[] = [];
-  for (let attempt = 0; attempt < VERSION_READ_ATTEMPTS; attempt++) {
+  let startupRefusals = 0;
+  while (reads.length < VERSION_READ_ATTEMPTS) {
     let read: InfoRead;
     try {
       read = { answered: true, bytes: await device.rpcIn(OP.GET_FIRMWARE_INFO, 36) };
@@ -267,10 +348,35 @@ export async function readRunningFirmware(device: SeekDevice): Promise<RunningFi
       if (error instanceof CancelledError) throw error;
       read = { answered: false, error };
     }
+
+    if (!read.answered && isStall(read.error) && !reads.some((r) => r.answered)) {
+      startupRefusals += 1;
+      if (startupRefusals >= VERSION_READ_STARTUP_READS) {
+        return {
+          version: null,
+          buildString: null,
+          note:
+            `GetFirmwareInfo did not answer (${errorMessage(read.error)}) on any of ` +
+            `${String(startupRefusals)} reads ${String(VERSION_READ_STARTUP_SPACING_MS)} ms ` +
+            `apart, a start-up window of ${String(VERSION_READ_STARTUP_WINDOW_MS)} ms; a camera ` +
+            'still starting up answers within it',
+        };
+      }
+      device.reporter.log(
+        `GetFirmwareInfo was refused (${errorMessage(read.error)}), read ` +
+          `${String(startupRefusals)} of up to ${String(VERSION_READ_STARTUP_READS)}: the ` +
+          'camera may still be starting up; asking again in ' +
+          `${String(VERSION_READ_STARTUP_SPACING_MS)} ms`,
+        'warn',
+      );
+      await pause(VERSION_READ_STARTUP_SPACING_MS);
+      continue;
+    }
+
     const previous = reads.at(-1);
     reads.push(read);
     if (read.answered && previous?.answered === true) {
-      return firmwareFrom(read.bytes, previous.bytes);
+      return firmwareFrom(read.bytes, previous.bytes, startupRefusals);
     }
     if (!read.answered && previous?.answered === false) break;
   }
@@ -292,17 +398,24 @@ export async function readRunningFirmware(device: SeekDevice): Promise<RunningFi
 }
 
 /** The version the second of two answered reads carries, and what the first one said. */
-function firmwareFrom(bytes: Uint8Array, first: Uint8Array): RunningFirmware {
-  const stale =
-    sameBytes(first, bytes) || first.length < 4
+function firmwareFrom(
+  bytes: Uint8Array,
+  first: Uint8Array,
+  startupRefusals: number,
+): RunningFirmware {
+  const context =
+    (sameBytes(first, bytes) || first.length < 4
       ? ''
       : `; the first read answered a different record (${versionOf(first)}), which an ` +
-        'earlier command had left the firmware-info selector on — that read cleared it';
+        'earlier command had left the firmware-info selector on — that read cleared it') +
+    (startupRefusals === 0
+      ? ''
+      : `; it answered after refusing ${String(startupRefusals)} read(s) while starting up`);
   if (bytes.length < 4) {
     return {
       version: null,
       buildString: null,
-      note: `GetFirmwareInfo answered ${String(bytes.length)} byte(s), too few for a version${stale}`,
+      note: `GetFirmwareInfo answered ${String(bytes.length)} byte(s), too few for a version${context}`,
     };
   }
   const version = versionOf(bytes);
@@ -312,7 +425,7 @@ function firmwareFrom(bytes: Uint8Array, first: Uint8Array): RunningFirmware {
     buildString,
     note:
       `the camera reports firmware ${version}${buildString === null ? '' : ` (${buildString})`}` +
-      stale,
+      context,
   };
 }
 

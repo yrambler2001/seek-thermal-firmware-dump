@@ -19,11 +19,11 @@
  * this is a path the toolkit really takes.
  * ==================================================================== */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { hex } from '../src/bytes.js';
 import { SeekError } from '../src/errors.js';
-import { silentReporter } from '../src/events.js';
+import { collectingReporter, silentReporter } from '../src/events.js';
 import { SeekDevice } from '../src/protocol/client.js';
 import { OP, OP_DIRECTION, SAFE_BEFORE_IDENTITY, type Opcode } from '../src/protocol/ops.js';
 import type { DeviceDescription, TransportInfo, UsbTransport } from '../src/protocol/transport.js';
@@ -35,9 +35,13 @@ import { detectProfile } from '../src/profiles/registry.js';
 import type { FirmwareProfile } from '../src/profiles/types.js';
 import {
   evidenceFromChannelProbe,
+  identifyCamera,
   probeSelectorChannel,
   readRunningFirmware,
   VERSION_READ_ATTEMPTS,
+  VERSION_READ_STARTUP_READS,
+  VERSION_READ_STARTUP_SPACING_MS,
+  VERSION_READ_STARTUP_WINDOW_MS,
 } from '../src/workflows/capability.js';
 import { readDeviceInfo } from '../src/workflows/device-info.js';
 import { runDump } from '../src/workflows/dump.js';
@@ -240,7 +244,10 @@ function expectVersionRefusal(error: SeekError, operation: string): void {
   expect(error.message).toContain('EnterBootloaderMode');
 }
 
-describe('a camera whose firmware version cannot be read', () => {
+/* Each camera here STALLs every GetFirmwareInfo, so each version read waits out
+ * the whole start-up window on the real clock (VERSION_READ_STARTUP_WINDOW_MS,
+ * 500 ms), and a test that tries four profiles waits four times. */
+describe('a camera whose firmware version cannot be read', { timeout: 20_000 }, () => {
   it('is probed with GetFirmwareInfo only: no arm, no mode change', async () => {
     const camera = versionless();
     await camera.open();
@@ -250,8 +257,12 @@ describe('a camera whose firmware version cannot be read', () => {
     expect(probe.skippedForSafety).toBe(true);
     expect(probe.plainAccepted).toBe(false);
     expect(probe.notes.join(' ')).toContain('did not report its firmware version');
-    /* Two reads: two failures in a row end the version read (readRunningFirmware). */
-    expect(camera.calls.map((c) => c.op)).toEqual([OP.GET_FIRMWARE_INFO, OP.GET_FIRMWARE_INFO]);
+    /* Every read STALLs, which is what a camera still starting up answers, so
+     * the version read uses its whole start-up window: exactly
+     * VERSION_READ_STARTUP_READS reads of GetFirmwareInfo, and nothing else. */
+    expect(camera.calls.map((c) => c.op)).toEqual(
+      Array.from({ length: VERSION_READ_STARTUP_READS }, () => OP.GET_FIRMWARE_INFO),
+    );
   });
 
   it('cannot hand legacy-auth a "refused plain arm" it never observed', async () => {
@@ -519,5 +530,230 @@ describe('a camera an earlier command left with the firmware-info selector set',
     expect(alternating.version).toBeNull();
     expect(alternating.note).toContain('never two in a row');
     expect(flaky.calls).toHaveLength(VERSION_READ_ATTEMPTS / 2);
+  });
+});
+
+/* ---- a camera that is still starting up ------------------------------- */
+
+/** One request as the starting camera saw it, and whether it was refused. */
+interface StartupCall {
+  readonly direction: 'in' | 'out';
+  readonly op: number;
+  readonly refused: boolean;
+  /** `Date.now()` when the request arrived: the fake clock in these tests. */
+  readonly at: number;
+}
+
+/**
+ * A camera whose firmware is still in its init states: the dispatcher STALLs
+ * every request, whatever it is ("Request sent during FW init"), and then
+ * serves them all. Two clocks, as in TESTING.md sec.18:
+ *
+ * - `refusedRequests: n`: the emulator's gated clock. The device moves on only
+ *   while a request is outstanding, so its start-up ends after n requests,
+ *   however long the host sleeps between them. Compact 1.3.0.8 on the
+ *   emulator refuses at +1..+9 ms and answers at +10 ms, one interrupt
+ *   threshold (~1 ms) a request: nine refused requests.
+ * - `startsAfterMs: t`: a real camera's own clock. Its start-up ends t ms after
+ *   it was plugged in, whatever the host sends.
+ */
+class StartingCamera implements UsbTransport {
+  readonly calls: StartupCall[] = [];
+  private readonly inner: UsbTransport;
+  private readonly startsAt: number;
+  private refusalsLeft: number;
+  constructor(
+    inner: UsbTransport,
+    start: { readonly refusedRequests: number } | { readonly startsAfterMs: number },
+  ) {
+    this.inner = inner;
+    this.startsAt = 'startsAfterMs' in start ? Date.now() + start.startsAfterMs : -Infinity;
+    this.refusalsLeft = 'refusedRequests' in start ? start.refusedRequests : 0;
+  }
+  get description(): DeviceDescription {
+    return this.inner.description;
+  }
+  get info(): TransportInfo {
+    return this.inner.info;
+  }
+  get isOpen(): boolean {
+    return this.inner.isOpen;
+  }
+  open(): Promise<void> {
+    return this.inner.open();
+  }
+  close(): Promise<void> {
+    return this.inner.close();
+  }
+  controlIn(request: number, length: number, timeoutMs: number): Promise<Uint8Array> {
+    if (this.starting('in', request)) {
+      return Promise.reject(new SeekError('usb/stalled', `control IN ${hex(request)} -> stall`));
+    }
+    return this.inner.controlIn(request, length, timeoutMs);
+  }
+  controlOut(request: number, data: Uint8Array, timeoutMs: number): Promise<void> {
+    if (this.starting('out', request)) {
+      return Promise.reject(new SeekError('usb/stalled', `control OUT ${hex(request)} -> stall`));
+    }
+    return this.inner.controlOut(request, data, timeoutMs);
+  }
+  /** The requests sent before the first one the camera served. */
+  get sentWhileStarting(): readonly StartupCall[] {
+    const served = this.calls.findIndex((call) => !call.refused);
+    return served === -1 ? this.calls : this.calls.slice(0, served);
+  }
+  private starting(direction: 'in' | 'out', op: number): boolean {
+    const at = Date.now();
+    const refused = this.refusalsLeft > 0 || at < this.startsAt;
+    if (this.refusalsLeft > 0) this.refusalsLeft -= 1;
+    this.calls.push({ direction, op, refused, at });
+    return refused;
+  }
+}
+
+/** The warnings the version read logged, one per retry of its start-up window. */
+function startupWarnings(reporter: ReturnType<typeof collectingReporter>): string[] {
+  return reporter.events.flatMap((event) =>
+    event.type === 'log' && event.level === 'warn' && event.message.includes('starting up')
+      ? [event.message]
+      : [],
+  );
+}
+
+/** Runs `run` to completion on the fake clock, whatever it waits for. */
+async function onFakeClock<T>(run: () => Promise<T>): Promise<T> {
+  const settled = run().then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+  await vi.runAllTimersAsync();
+  const outcome = await settled;
+  if (!outcome.ok) throw outcome.error;
+  return outcome.value;
+}
+
+describe('a camera still starting up, which refuses every request for a while', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('is identified when it answers inside the window on the gated clock (Compact 1.3.0.8 on the emulator)', async () => {
+    const camera = new StartingCamera(compact4817(), { refusedRequests: 9 });
+    await camera.open();
+    const reporter = collectingReporter();
+    const identification = await onFakeClock(() =>
+      identifyCamera(new SeekDevice(camera, { reporter })),
+    );
+
+    expect(identification.gate).toEqual({ permitsArming: true, version: '4.8.1.7' });
+    expect(identification.probe.notes[0]).toContain(
+      'it answered after refusing 9 read(s) while starting up',
+    );
+    /* Nine refused GetFirmwareInfo, then the two answered ones, then the probe's arms. */
+    expect(camera.sentWhileStarting.map((c) => c.op)).toEqual(
+      Array.from({ length: 9 }, () => OP.GET_FIRMWARE_INFO),
+    );
+    expect(camera.calls.slice(9, 11).map((c) => [c.op, c.refused])).toEqual([
+      [OP.GET_FIRMWARE_INFO, false],
+      [OP.GET_FIRMWARE_INFO, false],
+    ]);
+    /* Every retry was reported, and the first answer ended the waiting at once. */
+    expect(startupWarnings(reporter)).toHaveLength(9);
+    expect(startupWarnings(reporter)[0]).toContain(
+      `read 1 of up to ${String(VERSION_READ_STARTUP_READS)}`,
+    );
+    expect(camera.calls[10]?.at).toBe(camera.calls[9]?.at);
+  });
+
+  it('is identified when it answers inside the window on its own clock', async () => {
+    const camera = new StartingCamera(compact4817(), { startsAfterMs: 300 });
+    await camera.open();
+    const reporter = collectingReporter();
+    const identification = await onFakeClock(() =>
+      identifyCamera(new SeekDevice(camera, { reporter })),
+    );
+
+    expect(identification.gate).toEqual({ permitsArming: true, version: '4.8.1.7' });
+    /* Refused at 0, 20, ..., 280 ms; answered at 300 ms. */
+    expect(camera.sentWhileStarting.map((c) => c.at - (camera.calls[0]?.at ?? 0))).toEqual(
+      Array.from({ length: 15 }, (_, i) => i * VERSION_READ_STARTUP_SPACING_MS),
+    );
+    expect(startupWarnings(reporter)).toHaveLength(15);
+  });
+
+  it('is refused after the window when it never answers, having waited it out', async () => {
+    const camera = new StartingCamera(compact4817(), { refusedRequests: Infinity });
+    await camera.open();
+    const reporter = collectingReporter();
+    const identification = await onFakeClock(() =>
+      identifyCamera(new SeekDevice(camera, { reporter })),
+    );
+
+    expect(identification.gate.permitsArming).toBe(false);
+    if (identification.gate.permitsArming) return;
+    expect(identification.gate.code).toBe('device/version-unknown');
+    expect(identification.gate.reason).toContain(
+      `on any of ${String(VERSION_READ_STARTUP_READS)} reads`,
+    );
+    expect(camera.calls).toHaveLength(VERSION_READ_STARTUP_READS);
+    /* 500 ms on the camera's clock from the first read to the last. */
+    expect(VERSION_READ_STARTUP_WINDOW_MS).toBe(500);
+    expect((camera.calls.at(-1)?.at ?? 0) - (camera.calls[0]?.at ?? 0)).toBe(
+      VERSION_READ_STARTUP_WINDOW_MS,
+    );
+    expect(startupWarnings(reporter)).toHaveLength(VERSION_READ_STARTUP_READS - 1);
+  });
+
+  it('sends nothing but GetFirmwareInfo during the window, from every entry point', async () => {
+    const window = Array.from({ length: VERSION_READ_STARTUP_READS }, () => ({
+      direction: 'in',
+      op: OP.GET_FIRMWARE_INFO,
+    }));
+    const sent = (camera: StartingCamera): { direction: string; op: number }[] =>
+      camera.calls.map(({ direction, op }) => ({ direction, op }));
+
+    const probe = new StartingCamera(compact4817(), { refusedRequests: Infinity });
+    await probe.open();
+    await onFakeClock(() => probeSelectorChannel(new SeekDevice(probe)));
+    expect(sent(probe), 'probe').toEqual(window);
+
+    const entryPoints: readonly (readonly [string, (ctx: WorkflowContext) => Promise<unknown>])[] =
+      [
+        ['dump', (ctx) => runDump(ctx, { chunk: 4096, decrypt: false })],
+        ['sweep', (ctx) => runSweep(ctx, { chunk: 4096, decrypt: false })],
+        ['read the device info', (ctx) => readDeviceInfo(ctx, { chunk: 4096 })],
+      ];
+    for (const [what, run] of entryPoints) {
+      const camera = new StartingCamera(compact4817(), { refusedRequests: Infinity });
+      const ctx = await contextFor(modern4x, camera);
+      const error = await refusal(() => onFakeClock(() => run(ctx)));
+      expectVersionRefusal(error, what);
+      expect(sent(camera), what).toEqual(window);
+    }
+  });
+
+  it('reads through the window even when the run was cancelled before it began', async () => {
+    /* The emulator's first-contact instrument runs the dump with its signal
+     * already aborted, so that a dump that plans stops before its first arm
+     * (TESTING.md sec.11.1). The version read must still give its own answer
+     * there: the wait is bounded and does not consult the signal. */
+    const camera = new StartingCamera(compact4817(), { refusedRequests: Infinity });
+    await camera.open();
+    const abort = new AbortController();
+    abort.abort();
+    const ctx: WorkflowContext = {
+      device: new SeekDevice(camera, { reporter: silentReporter, signal: abort.signal }),
+      profile: modern4x,
+      detection: null,
+      reporter: silentReporter,
+    };
+    const error = await refusal(() =>
+      onFakeClock(() => runDump(ctx, { chunk: 4096, decrypt: false })),
+    );
+    expectVersionRefusal(error, 'dump');
+    expect(camera.calls).toHaveLength(VERSION_READ_STARTUP_READS);
   });
 });
