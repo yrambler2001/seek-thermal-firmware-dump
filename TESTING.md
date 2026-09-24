@@ -2708,3 +2708,217 @@ The suite is ~75 s slower than §17.3's 222 s, and nearly all of it is the slowe
 version reads are as before), and the 5-minute load average was 40-66 during these runs, so the
 difference is the machine's load, not this change. The window itself costs a 0.5.1.x row about
 3 x 25 x 20 ms = 1.5 s of pauses.
+
+## 19. The transport's deadlines on the emulated camera's clock (2026-09-24)
+
+FW-V1 recorded Compact 0.6.0.4 twice with 22 and 23 armed subcommands where the pin says 25
+(its campaign log, open item 12, Phases 32 and 37), both times in an `npm run check` on a loaded
+machine, and the row alone measured the pin again. This section finds the race, removes it, and
+proves it gone under deliberate load. The toolkit source changed (`webusb.ts`: an injected clock
+for the transport's deadlines, defaulting to the wall clock); FW-V1 gained a device-time side
+channel (`c8a93b37`, its `docs/EMULATOR.md` §26).
+
+### 19.1 The race
+
+0.6.0.4's tier-1 row sends **127 requests its firmware never completes**: its FW-init refusal is
+silent (the vendor handler returns "handled" without a data stage, FW-V1 Phase 29), and it never
+serves a read of the windows it arms. Two clocks decided what each one became:
+
+| who gives up      | after                                                          | on which clock                |
+| ----------------- | -------------------------------------------------------------- | ----------------------------- |
+| the emulated host | 20,000 NAK polls of 10 µs (~200 ms), then `-110` (`ETIMEDOUT`) | the camera's (emulated)       |
+| `WebUsbTransport` | `USB_TIMEOUT_MS`, 5 s, then `usb/timeout`                      | the wall clock (`setTimeout`) |
+
+On an idle machine 200 ms of the camera's time is ~1.5 s of real time, so the `-110` always came
+first. On a loaded one the emulator runs slower, the transport's 5 real seconds could run out
+first, and then the transport abandoned a transfer the emulator was still polling: the next
+request queued behind it, the device's history diverged, and the row's count moved. No reply was
+lost - the late one was still read and matched - so the delivery audit (§9.8) could not see it:
+the transport's timer is not the USB/IP client's deadline.
+
+### 19.2 The design
+
+**In the toolkit: an injected clock.** `WebUsbTransportOptions.clock` takes a `DeadlineClock`,
+one method: `startTimer(ms, onExpire)`, returning a cancel function. `withTimeout(promise, ms,
+what, clock)` races the transfer against it. The default, `WALL_CLOCK`, is `setTimeout` /
+`clearTimeout` with the same delay and the same callback as before, so **no production path
+changed**: the browser app and the CLI construct their transports without a clock. The CLI glue
+(`packages/cli/src/node-usb.ts`) is untouched: it hands the deadline to nusb, which times it on
+the host's real clock - the right clock for a real camera, and the CLI never drives the emulator.
+
+**In FW-V1: the camera's time, beside the wire.** `seek_emu.py --usbip --usbip-clock` opens a TCP
+side channel (`clock_port` in the READY line). Before every RET_SUBMIT, that session's writer
+thread writes one JSON line `{"urb": [peer_port, seqnum, status, t0_ns, t1_ns]}`: the URB's start
+and end on the emulated host's clock. Nothing on the USB/IP wire changed - a real kernel reads
+every field of RET_SUBMIT. The client can also declare its per-transfer deadline
+(`{"op": "deadline", "ms": D}`, acknowledged once it holds); the emulated host then gives a
+never-completed control transfer up at exactly `t0 + D` of its clock (FW-V1 `usb_host.py` THE
+HOST'S DEADLINE), which is what a real host does with its software's timeout.
+
+**In the harness: the reply waits for its time.** `emulator/device-clock.ts`:
+`DeviceClockLink` reads the side channel, `EmulatedDeviceClock` is a `DeadlineClock` whose time
+moves only when a record arrives, and it fires every timer the record's `t1` has reached,
+earliest first, synchronously. `UsbIpSession` delivers each RET_SUBMIT only after its record has
+arrived (the emulator writes it first; the `clock:` summary line counts the few that arrived
+ahead of it and waited: 0-1 per run in tier 1, 1-19 of 873,049 in tier 2), so the transport's timer has already fired if the completion came at or after its
+deadline - as a real host's would have. Every transport over an emulator is built with
+`clock: device.deadlineClock`. The emulator's clock is gated, so between a completion and the
+next URB the camera's time does not move, and "now" is the last record's `t1`: every decision
+is a function of the URB sequence alone, never of how long anything took in real time.
+
+**Guards.** The adapter counts a vendor transfer whose transport started no timer on the
+emulated clock (`wallClockTransfers`: a transport built without the clock), and the delivery
+audit fails the row on it, as it does on a side channel that lost a record, wrote one with no
+client listening, or left a reply without its record. The harness refuses an emulator without
+`clock_port`.
+
+### 19.3 The emulated host's give-up: fidelity against cost
+
+A real host polls an unanswered transfer for the transport's whole deadline, 5 s, and then
+cancels it. The faithful setting is therefore "the emulated host gives up at the transport's own
+deadline", after which the transport reports its own `usb/timeout`. It is available
+(`SEEK_EMU_HOST_GIVE_UP_MS=Infinity`). It is not affordable:
+
+| emulated host's give-up                  | device time  | wall time per never-completed request (load average) |
+| ---------------------------------------- | ------------ | ---------------------------------------------------- |
+| 200 ms                                   | 200.000 ms   | 1.3-1.7 s (20-70)                                    |
+| 1 s                                      | 1,000.000 ms | 6.1-7.0 s (20-30), 8.5 s (70)                        |
+| 1 s, the first request after enumeration | —            | unfinished after 6 min (30-45), stopped              |
+| 2 s, from 1.82 s of device time          | —            | unfinished after 16 min (250-350), stopped           |
+| 5 s, the first request after enumeration | —            | unfinished after 9.5 min (20), stopped               |
+
+About a second into an unanswered request the firmware stops sleeping (every stack sample is
+inside Unicorn running guest code), so each further second of the camera's time is emulated
+instruction by instruction. 0.6.0.4's row has 127 such requests: 25.4 s of its 26.2 s of device
+time at 200 ms, 635 s at 5 s - many hours of wall time.
+
+**The choice: 200 ms** (`DEFAULT_HOST_GIVE_UP_MS`, the poll budget the emulator always used, now
+declared by the harness and exact on the camera's clock; `SEEK_EMU_HOST_GIVE_UP_MS` overrides it,
+`Infinity` for the faithful setting). Every transfer the firmware never completes ends with the
+emulator's `-110` after 200 ms of the camera's time, long before the transport's own 5 s (or
+1.5 s) on the same clock, so the transport's deadline never fires in the suites (the `clock:`
+line: 0) - and nothing depends on load. **How this differs from a real host**, for each such
+request:
+
+- the camera is polled for 200 ms of its time, not 5 s, and then sees the next SETUP: 4.8 s less
+  of its own time passes (127 × 4.8 s = 610 s over 0.6.0.4's row). Firmware state that moves
+  with elapsed time (timers, a watchdog, a FW-init gate) sees less of it;
+- the transport reports `usb/transfer-failed` ("… failed, status -110") where a real host
+  reports `usb/timeout` ("… did not answer within 5000 ms"). No decision in the toolkit tells the
+  two apart - only a STALL is special (`capability.ts`, `isStall`) - so only the message text
+  differs, and it is what every pin recorded before this section too.
+
+### 19.4 The safety net
+
+A stuck emulator reports no time, so no deadline on the camera's clock can fire. The USB/IP
+client's per-URB **wall-clock** deadline stays (`SEEK_EMU_URB_TIMEOUT_MS`, 30 s): at a 200 ms
+give-up it never fired in any run below (at load ~470 the whole 0.6.0.4 row, 313 URBs, took
+1,152 s - under 4 s a URB on average - and its audit found no expired deadline). When it fires, the client unlinks the URB and counts it, and the delivery audit fails
+the row as an `InfrastructureDefect` ("USB/IP deadline(s) expired on the client against a live
+emulator") before anything is recorded or compared - never as a measurement. New test in
+`emulator-failfast.test.ts`: a stand-in emulator that accepts an import and never answers is
+caught by a 2 s watchdog, the camera's clock never moves, and the audit throws the defect. With
+`SEEK_EMU_HOST_GIVE_UP_MS=Infinity`, raise `SEEK_EMU_URB_TIMEOUT_MS` too. The per-row vitest
+timeouts (§9.8) remain the outermost net.
+
+### 19.5 The load test: 0.6.0.4, idle and under deliberate load
+
+The tier-1 row alone (`npx vitest run packages/core/test/emulator-rpc.test.ts -t 0.6.0.4`),
+against FW-V1 `c8a93b37`. "Loaded" is twelve `yes > /dev/null` loops started before the run and
+killed after it, beside FW-V1's full self-test, another session's emulator suite and a desktop
+session, which together held the machine (10 cores) at load averages of 150-470 for most of the
+hour. "Quiet" is no added load
+(the self-test still running). Load is `uptime`'s 1-minute average at the start and the end.
+
+| run        | added load    | load      | wall    | armed    | replies delivered = received | host give-ups | device time at the end | transport deadlines fired          |
+| ---------- | ------------- | --------- | ------- | -------- | ---------------------------- | ------------- | ---------------------- | ---------------------------------- |
+| loaded 1   | 12 busy loops | 177 → 303 | 845 s   | 25 of 63 | 313 = 313                    | 127           | 26.206000 s            | 0                                  |
+| loaded 2   | 12 busy loops | 303 → 420 | 905 s   | —        | —                            | —             | —                      | — (the row's 900 s vitest timeout) |
+| loaded 3 ¹ | 12 busy loops | 387 → 332 | 1,152 s | 25 of 63 | 313 = 313                    | 127           | 26.206000 s            | 0                                  |
+| loaded 4 ¹ | 12 busy loops | 332 → 472 | 719 s   | 25 of 63 | 313 = 313                    | 127           | 26.206000 s            | 0                                  |
+| loaded 5 ¹ | 12 busy loops | 472 → 154 | 789 s   | 25 of 63 | 313 = 313                    | 127           | 26.206000 s            | 0                                  |
+| quiet 1    | none          | 142 → 58  | 172 s   | 25 of 63 | 313 = 313                    | 127           | 26.206000 s            | 0                                  |
+| quiet 2    | none          | 58 → 14   | 173 s   | 25 of 63 | 313 = 313                    | 127           | 26.206000 s            | 0                                  |
+| quiet 3    | none          | 14 → 15   | 170 s   | 25 of 63 | 313 = 313                    | 127           | 26.206000 s            | 0                                  |
+
+¹ With `SEEK_EMU_TIER1_TIMEOUT_MS=3600000` for these three runs only, after loaded 2 hit the
+row's 900 s vitest timeout at load 420: that timeout can abort a row, never change what it
+records, and the `npm run check` runs below use the default.
+
+**Every completed run is identical, down to the camera's final time to the microsecond**, over
+a 7× spread of wall time: the same 127 give-ups at 200 ms of the camera's time, the same 313
+replies, the pinned 25 of 63. The pin regeneration (19.6) ran through the same loads and agrees.
+One run did not complete: at load 420 the row outlasted its vitest timeout, a failure of the row
+and not a measurement. Before this section, a run at load ~100 recorded 23 and one at 33-97
+recorded 22 (FW-V1 Phases 32, 37).
+
+### 19.6 Pinned results that changed: none
+
+`node scripts/update-emulator-expectations.mjs` (both tiers) against FW-V1 `c8a93b37`, run while
+the machine went from load 53 to 340: exit 0, 893 s, 476 tests. **`expectations.rpc.json` and
+`expectations.roundtrip.json` are byte-identical to the committed pins**, so there is no pins
+commit. Tier 1: 44 supported / 7 known-gap / 0 failed, 20,957 replies delivered = received (as in
+§18.3), 127 transfers given up by the emulated host - all of them 0.6.0.4's - and 0 transport
+deadlines fired; tier 2: 15 / 0 / 0, 873,049 = received, 0 dropped, every dump 0 differing bytes.
+The pins were always taken on runs where the emulator's `-110` came first, and that is now the
+only possible order.
+
+One thing did move under the pins, by design: a never-completed transfer now ends exactly 200 ms
+of the camera's time after it started, where the poll budget ended it ~205.7 ms after (20,000
+polls, each landing on the first basic block at or past its 10 µs; FW-V1 self-test). No pinned
+field depends on those 5.7 ms.
+
+### 19.7 The checks
+
+The source, tests and `docs/` are `a469978`; no pins commit (19.6). FW-V1 `c8a93b37`. The
+machine is 10 cores with a desktop session (screen recording, a browser) beside the suite;
+"busy loops" are `yes > /dev/null`, started before the run and killed after it. Load is the
+1-minute average at the start and the end.
+
+| run                                                             | added load    | load     | exit  | tests                 | wall (vitest)       | slowest row (tier 1 / tier 2)        | delivered = received (t1 / t2), dropped | host give-ups / transport deadlines fired |
+| --------------------------------------------------------------- | ------------- | -------- | ----- | --------------------- | ------------------- | ------------------------------------ | --------------------------------------- | ----------------------------------------- |
+| `npm run check` 1                                               | none          | 17 → 88  | 0     | 697 / 697             | 516 s (492.5 s)     | 347.6 s / 225.2 s                    | 20,957 / 873,049, 0                     | 127 / 0                                   |
+| `npm run check` 2                                               | 12 busy loops | 16 → 127 | **1** | 696 / 697             | 1,079 s (1,018.6 s) | 0.6.0.4 timed out at 900 s / 447.9 s | — / 873,049, 0                          | —                                         |
+| `npm run check` 3                                               | 6 busy loops  | 64 → 179 | 0     | 697 / 697             | 766 s (735.6 s)     | 602.2 s / 286.7 s                    | 20,957 / 873,049, 0                     | 127 / 0                                   |
+| `npm run check` 4, right after                                  | none          | 152 → 63 | 0     | 697 / 697             | 537 s (510.9 s)     | 363.5 s / 259.3 s                    | 20,957 / 873,049, 0                     | 127 / 0                                   |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npx vitest run`        | —             | —        | 0     | 560 passed, 4 skipped | 13.0 s              | —                                    | —                                       | —                                         |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npm run test:coverage` | —             | 17       | 0     | 560 passed, 4 skipped | —                   | —                                    | —                                       | —                                         |
+
+- **Runs 3 and 4 are the two green runs in a row, run 3 under deliberate load.** In run 2, with
+  twelve busy loops, 0.6.0.4's row did not finish inside its 900 s vitest timeout: a row that
+  timed out, not one that measured something else (every completed 0.6.0.4 run in 19.5, at loads
+  up to 472, measured the pin). The row costs ~170 s alone on a quiet machine, and the check runs
+  it beside about fifteen other emulators, so under twelve extra CPU hogs it needs more than 900 s
+  of real time. No timeout was raised to make a run pass.
+- 697 = 692 (§18.5) + 4 transport-clock tests in `protocol.test.ts` + the hung-emulator test.
+  Tier 1 was 44 / 7 / 0 and tier 2 15 / 0 / 0 in every completed run; the device time summed
+  over tier 1 was 68.211003 s and over tier 2 879.651000 s in every run.
+- An earlier coverage run at load ~350 failed on `packages/cli/test/camera.test.ts` "reads the
+  whole flash…", which timed out at vitest's default 5 s (9.3 s under that load, coverage on);
+  it uses the wall clock, as every non-emulator test does, and passed at load 17.
+- **The new tests, and what they did on the old code.** The four transport-clock tests (a hung
+  transfer ends at exactly the injected clock's deadline and no real timer is started; each
+  deadline is measured from the clock at the transfer, in and out, and cancelled on an answer;
+  earliest-first firing; the default is `setTimeout`) - the first two fail on the old code, which
+  has no `clock` option and ignores it (a real timer is started, 60 s of fake time end the hung
+  transfer, and the injected clock starts no timer); the last passes on the old code, as it must:
+  it is the production path. The hung-emulator test passes on the old harness too (the watchdog was
+  already there); it pins that the camera's clock does not replace it. The existing
+  `protocol.test.ts` fake-timer tests of the wall-clock path (5 s, and the 20 s commit firing at
+  exactly 20,000 ms) pass unchanged.
+
+### 19.8 Still open
+
+- **The faithful give-up is not run.** `SEEK_EMU_HOST_GIVE_UP_MS=Infinity` works (the FW-V1
+  self-test checks the mechanism at 50 ms), but at 5 s a single unanswered 0.6.0.4 request did
+  not finish in 9.5 minutes, so no row has been measured that way.
+- **`ensureMode0` still waits on the wall clock.** `SeekDevice.ensureMode0` polls
+  `GetOperationMode` every 20 ms until `MODE_SETTLE_MS` (3 s) of real time has passed
+  (`client.ts`). That is a second deadline outside the transport, with the same shape as §19.1:
+  on the emulator, a camera that needed more of its own time to reach mode 0 than a loaded
+  machine gives it in 3 real seconds would be refused under load and pass when idle. No row is
+  known to depend on it (the pins agree at loads 14-472), and it was left alone because this
+  change was the transport's deadline; putting it on the same `DeadlineClock` is the fix.
+- The adapter's re-import retry (`REOPEN_TIMEOUT_MS`) and the READY / `OP_REQ_DEVLIST` waits
+  are wall-clock too. They decide only whether the instrument is up - a device on the gated
+  clock does not age while they wait - and a failure there fails the row.
