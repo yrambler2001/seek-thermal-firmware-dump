@@ -15,6 +15,7 @@ import path from 'node:path';
 
 import {
   addWire,
+  type ClockTally,
   emulatorDir,
   loadManifest,
   type ManifestEntry,
@@ -249,6 +250,8 @@ export interface SummaryRow {
     readonly dropped: number;
     /** What this row put on the wire (see `WireTally`). */
     readonly wire: WireTally;
+    /** What the emulated camera's clock did (see `ClockTally`). */
+    readonly clock: ClockTally;
   };
 }
 
@@ -314,6 +317,24 @@ export function printMatrix(title: string): void {
       `${String(wire.setInterfaceSent)}, stalled ${String(wire.setInterfaceStalled)} ` +
       `(emulator log: ${String(wire.setInterfaceStallsLogged)} 'bRequest=11' stall(s)); ` +
       `standard requests stalled: ${stalled === '' ? 'none' : stalled}`,
+  );
+  /* THE CLOCK LINE. Every deadline of every transport ran on the emulated camera's
+   * clock (the audit fails a row where one did not), so none of these numbers can
+   * move with machine load (TESTING.md sec.19). */
+  const clock = rows.reduce(
+    (c, r) => ({
+      deviceSeconds: c.deviceSeconds + r.delivery.clock.deviceSeconds,
+      hostGiveUps: c.hostGiveUps + r.delivery.clock.hostGiveUps,
+      deadlinesFired: c.deadlinesFired + r.delivery.clock.deadlinesFired,
+      repliesHeld: c.repliesHeld + r.delivery.clock.repliesHeld,
+    }),
+    { deviceSeconds: 0, hostGiveUps: 0, deadlinesFired: 0, repliesHeld: 0 },
+  );
+  out.push(
+    `clock: deadlines on the emulated camera's clock; ${clock.deviceSeconds.toFixed(6)} s of ` +
+      `device time; ${String(clock.hostGiveUps)} transfer(s) given up by the emulated host ` +
+      `(-110), ${String(clock.deadlinesFired)} transport deadline(s) fired; ` +
+      `${String(clock.repliesHeld)} repl(ies) held for their record`,
   );
   out.push('');
   for (const row of [...rows].sort((a, b) => b.seconds - a.seconds)) {

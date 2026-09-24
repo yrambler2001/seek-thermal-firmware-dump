@@ -45,7 +45,25 @@ import {
   devlist,
   type WireCount,
 } from './usbip-client.js';
-import { UsbIpWebUsbDevice, type UsbIpWebUsbOptions } from './webusb-over-usbip.js';
+import {
+  type ClockLinkSnapshot,
+  DeviceClockLink,
+  type EmulatedDeviceClock,
+} from './device-clock.js';
+import {
+  DEFAULT_HOST_GIVE_UP_MS,
+  UsbIpWebUsbDevice,
+  type UsbIpWebUsbOptions,
+} from './webusb-over-usbip.js';
+
+/**
+ * The emulated host's give-up for a transfer the firmware never completes, in ms of
+ * the camera's time (`DEFAULT_HOST_GIVE_UP_MS`, TESTING.md sec.19.3). `Infinity`
+ * gives the transport's own deadline, as a real host does.
+ */
+export const HOST_GIVE_UP_MS = Number(
+  process.env.SEEK_EMU_HOST_GIVE_UP_MS ?? String(DEFAULT_HOST_GIVE_UP_MS),
+);
 
 /* ---- locating the emulator ----------------------------------------- */
 
@@ -167,6 +185,20 @@ export interface ReadyLine {
   readonly flash_sha256: string;
   readonly source: string;
   readonly fill: FillReport | null;
+  /** The device-time side channel (`--usbip-clock`); null or absent without it. */
+  readonly clock_port?: number | null;
+  readonly clock_protocol?: number | null;
+}
+
+/** The emulator's side of the device-time side channel, from its summary line. */
+export interface ClockSummary {
+  readonly records: number;
+  readonly unheard: number;
+  readonly failed: number;
+  readonly hellos: number;
+  readonly deadlines_set: number;
+  readonly deadline_ms: number | null;
+  readonly deadline_expiries: number;
 }
 
 /** The emulator's own delivery ledger: `seek_emu.py --usbip`'s `---USBIP-SUMMARY---`
@@ -192,6 +224,8 @@ export interface DeliverySummary {
   };
   readonly writers_alive: number;
   readonly writers_stuck: number;
+  /** Null (or absent, from an emulator older than the side channel) without `--usbip-clock`. */
+  readonly clock?: ClockSummary | null;
 }
 
 /** One emulator process's delivery, audited. `violations` empty means every reply
@@ -201,6 +235,8 @@ export interface DeliveryAudit {
   readonly violations: readonly string[];
   readonly server: DeliverySummary | null;
   readonly client: DeliveryLedgerSnapshot;
+  /** The client's side of the device-time side channel. */
+  readonly clock: ClockLinkSnapshot;
   /** True when the emulator's run ended on its own before the harness stopped it.
    *  That is itself a violation (`death`); it only keeps the transfers it left
    *  unanswered from being listed as separate ones. */
@@ -209,6 +245,18 @@ export interface DeliveryAudit {
   readonly death: string | null;
   /** What went on the wire, and the emulator's own count of SET_INTERFACE stalls. */
   readonly wire: WireTally;
+}
+
+/** What the emulated camera's clock did over a row (device-clock.ts, TESTING.md sec.19). */
+export interface ClockTally {
+  /** The camera's time at the end, summed over the row's emulators. */
+  readonly deviceSeconds: number;
+  /** Transfers the emulated host gave up at its deadline (-110). */
+  readonly hostGiveUps: number;
+  /** Transport deadlines that passed on the camera's clock. */
+  readonly deadlinesFired: number;
+  /** Replies that arrived before their device-time record and were held for it. */
+  readonly repliesHeld: number;
 }
 
 /* ---- the wire log, summarised --------------------------------------- */
@@ -380,6 +428,9 @@ export class Emulator {
   private stopAnnounced = false;
   private deathReason: string | null = null;
   private readonly deathController = new AbortController();
+  /** The device-time side channel: every transport over this emulator times its
+   *  deadlines on `deviceClock` (device-clock.ts, TESTING.md sec.19). */
+  private readonly clockLink: DeviceClockLink;
   private readonly deathNotice: Promise<string>;
   private announceDeath: (reason: string) => void = () => undefined;
 
@@ -390,8 +441,10 @@ export class Emulator {
     log: string[],
     closed: Promise<void>,
     watch: ChildWatch,
+    clockLink: DeviceClockLink,
   ) {
     this.entryId = entryId;
+    this.clockLink = clockLink;
     this.child = child;
     this.ready = ready;
     this.logLines = log;
@@ -564,6 +617,7 @@ export class Emulator {
   auditDelivery(): DeliveryAudit {
     const server = this.deliverySummary();
     const client = this.ledger.snapshot();
+    const clock = this.clockLink.snapshot();
     const v: string[] = [];
     if (this.deathReason !== null) {
       const said = this.stopReason();
@@ -617,6 +671,42 @@ export class Emulator {
         );
       }
     }
+    /* THE CAMERA'S CLOCK (device-clock.ts, TESTING.md sec.19). Every vendor transfer
+     * must have been timed on it, and every reply must have come with its record. */
+    if (client.wallClockTransfers > 0) {
+      v.push(
+        `${String(client.wallClockTransfers)} vendor transfer(s) were not timed on the ` +
+          "emulated camera's clock: a WebUsbTransport built without " +
+          '`clock: device.deadlineClock` times its deadline on the wall clock, and what it ' +
+          'records then depends on machine load',
+      );
+    }
+    if (clock.failure !== null) v.push(`device-time side channel: ${clock.failure}`);
+    if (clock.repliesWaiting > 0) {
+      v.push(
+        `${String(clock.repliesWaiting)} repl(ies) never got their device-time record ` +
+          '(the emulator writes it before the reply)',
+      );
+    }
+    if (server !== null) {
+      const sc = server.clock ?? null;
+      if (sc === null) {
+        v.push('the emulator ran without its device-time side channel (--usbip-clock)');
+      } else {
+        if (sc.records !== clock.records) {
+          v.push(
+            `the emulator wrote ${String(sc.records)} device-time record(s) and the client ` +
+              `read ${String(clock.records)}`,
+          );
+        }
+        if (sc.unheard > 0 || sc.failed > 0) {
+          v.push(
+            `the device-time side channel lost its client: ${String(sc.unheard)} repl(ies) ` +
+              `went out with no record, ${String(sc.failed)} connection(s) failed`,
+          );
+        }
+      }
+    }
     if (client.repliesUnmatched > 0) {
       v.push(
         `${String(client.repliesUnmatched)} repl(ies) arrived after the client had stopped ` +
@@ -642,6 +732,7 @@ export class Emulator {
       violations: v,
       server,
       client,
+      clock,
       diedOnItsOwn: this.diedOnItsOwn,
       death: this.deathReason,
       wire: tallyWire(client.requests, this.setInterfaceStallsLogged()),
@@ -687,6 +778,10 @@ export class Emulator {
        * and the emulator's own frame-path limits are recorded in FW-V1's
        * docs/EMULATOR_CORPUS.md rather than papered over here. */
       '--no-sensor',
+      /* THE CAMERA'S CLOCK. The device-time side channel: every reply comes with the
+       * emulated camera's time, and the emulated host gives a transfer up where the
+       * transport's own deadline says (device-clock.ts, TESTING.md sec.19). */
+      '--usbip-clock',
     ];
     if (options.fillSeed !== undefined) {
       argv.push('--fill-erased', String(options.fillSeed));
@@ -782,7 +877,19 @@ export class Emulator {
     for (;;) {
       try {
         await devlist('127.0.0.1', ready.port, 15_000);
-        return new Emulator(options.entryId, child, ready, lines, closed, watch);
+        /* THE CAMERA'S CLOCK, OR NO ROW. Without the side channel a transport can only
+         * time its deadlines on the wall clock, and on a loaded machine that gives up
+         * after less of the camera's time than on an idle one (TESTING.md sec.19). */
+        if (typeof ready.clock_port !== 'number') {
+          lastError = new Error(
+            `the emulator printed no clock_port: it has no device-time side channel ` +
+              `(seek_emu.py --usbip-clock, FW-V1 seekemu/usbip.py), and without it the ` +
+              `transport's deadlines would run on the wall clock`,
+          );
+          break;
+        }
+        const link = await DeviceClockLink.connect('127.0.0.1', ready.clock_port);
+        return new Emulator(options.entryId, child, ready, lines, closed, watch, link);
       } catch (error) {
         if (Date.now() >= deadline || child.exitCode !== null) {
           lastError = error;
@@ -800,13 +907,24 @@ export class Emulator {
     );
   }
 
-  /** A `WebUsbDevice` over this emulator, for `new WebUsbTransport(...)`. */
+  /**
+   * A `WebUsbDevice` over this emulator, for
+   * `new WebUsbTransport(device, { clock: device.deadlineClock })`.
+   */
   attach(options: UsbIpWebUsbOptions = {}): Promise<UsbIpWebUsbDevice> {
     return UsbIpWebUsbDevice.attach('127.0.0.1', this.ready.port, this.ready.busid, {
       ...options,
       ledger: this.ledger,
       gone: this.deathController.signal,
+      clockLink: this.clockLink,
+      hostGiveUpMs: HOST_GIVE_UP_MS,
     });
+  }
+
+  /** The emulated camera's clock (device-clock.ts): what a transport over it times its
+   *  deadlines on. `UsbIpWebUsbDevice.deadlineClock` is the same object. */
+  get deviceClock(): EmulatedDeviceClock {
+    return this.clockLink.clock;
   }
 
   /**
@@ -838,6 +956,7 @@ export class Emulator {
         true,
       );
       await Promise.race([this.closed, new Promise((resolve) => setTimeout(resolve, 15_000))]);
+      this.clockLink.close();
       return;
     }
     this.child.kill('SIGTERM');
@@ -847,6 +966,7 @@ export class Emulator {
     }, STOP_GRACE_MS);
     await this.closed;
     clearTimeout(timer);
+    this.clockLink.close();
   }
 }
 
@@ -936,6 +1056,7 @@ export class RowEmulators {
     received: number;
     dropped: number;
     wire: WireTally;
+    clock: ClockTally;
   } {
     const audits = this.audits ?? [];
     return {
@@ -944,6 +1065,12 @@ export class RowEmulators {
       received: audits.reduce((n, a) => n + a.client.repliesReceived, 0),
       dropped: audits.reduce((n, a) => n + (a.server?.completions.dropped ?? 0), 0),
       wire: audits.reduce((w, a) => addWire(w, a.wire), NO_WIRE),
+      clock: {
+        deviceSeconds: audits.reduce((n, a) => n + a.clock.nowNs / 1e9, 0),
+        hostGiveUps: audits.reduce((n, a) => n + (a.server?.clock?.deadline_expiries ?? 0), 0),
+        deadlinesFired: audits.reduce((n, a) => n + a.clock.deadlinesFired, 0),
+        repliesHeld: audits.reduce((n, a) => n + a.clock.repliesHeld, 0),
+      },
     };
   }
 }

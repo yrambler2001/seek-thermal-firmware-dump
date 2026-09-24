@@ -55,14 +55,17 @@
  *    hung emulator cannot leak a pending transfer.
  * ==================================================================== */
 
+import { USB_TIMEOUT_MS } from '../../src/protocol/ops.js';
 import type { TransportInfo } from '../../src/protocol/transport.js';
 import type {
+  DeadlineClock,
   WebUsbConfiguration,
   WebUsbControlSetup,
   WebUsbDevice,
   WebUsbInTransferResult,
   WebUsbOutTransferResult,
 } from '../../src/protocol/webusb.js';
+import type { DeviceClockLink } from './device-clock.js';
 import { DeliveryLedger, UsbIpError, UsbIpSession, UsbIpStall } from './usbip-client.js';
 
 /* USB 2.0 sec.9.3.1, Table 9-2: bmRequestType is D7 direction, D6..5 type, D4..0
@@ -85,9 +88,46 @@ const RECIPIENT_BITS: Readonly<Record<string, number>> = {
   other: 0x03,
 };
 
-/** Per control transfer on the wire. Generous: the emulator is ~1000x slower
- *  than silicon, and a 2 s default is exactly what defeated an earlier tool. */
+/** Per control transfer on the wire, on the WALL clock. Generous: the emulator is
+ *  ~1000x slower than silicon, and a 2 s default is exactly what defeated an earlier
+ *  tool. With a device-time side channel this is only the hung-emulator watchdog
+ *  (device-clock.ts); the transfer's real deadline is on the camera's clock. */
 export const DEFAULT_URB_TIMEOUT_MS = 30_000;
+
+/**
+ * The emulated host's deadline for the adapter's OWN standard requests (the
+ * descriptor reads of `readIdentity`): Linux's `USB_CTRL_GET_TIMEOUT` and
+ * `USB_CTRL_SET_TIMEOUT`, 5000 ms (include/linux/usb.h), which is also the
+ * toolkit's `USB_TIMEOUT_MS`. Vendor transfers use the deadline the transport
+ * passes with each one.
+ */
+const STANDARD_REQUEST_DEADLINE_MS = USB_TIMEOUT_MS;
+
+/**
+ * How much of the camera's time the EMULATED host polls a transfer the firmware
+ * never completes before it gives the transfer up (-110), when that is less than
+ * the transport's own deadline. TESTING.md sec.19.3 has the measurement and the
+ * choice; in short:
+ *
+ *  - A real host polls until the transport's deadline (5 s) and then cancels, so
+ *    `Infinity` here - the emulated host giving up exactly at the transport's own
+ *    deadline, which the transport then reports as its `usb/timeout` - is the
+ *    faithful setting.
+ *  - It is not affordable: on Compact 0.6.0.4 one never-answered request costs
+ *    ~1.5 s of wall time at 200 ms, ~7 s at 1 s and more than ten minutes at 5 s
+ *    (the firmware stops sleeping about a second in, and every instruction after
+ *    that is emulated), and the row sends dozens of them.
+ *  - So the default is 200 ms: the poll budget the emulator has always used
+ *    (FW-V1 `UsbHost.wait_budget`, 20,000 polls of 10 us), now declared by the
+ *    harness in the camera's time. Every transfer the firmware never completes then
+ *    ends with the emulator's -110 after 200 ms of the camera's time, long before
+ *    the transport's 5 s (or 1.5 s) on the same clock, and the transport reports
+ *    `usb/transfer-failed` where a real host would report `usb/timeout` after 5 s.
+ *
+ * Either way the result is a function of the URB sequence alone, never of machine
+ * load. `SEEK_EMU_HOST_GIVE_UP_MS` overrides it (`Infinity` for full fidelity).
+ */
+export const DEFAULT_HOST_GIVE_UP_MS = 200;
 
 /** How long `open()` keeps trying to re-import after a `close()`. */
 export const REOPEN_TIMEOUT_MS = 20_000;
@@ -176,6 +216,15 @@ export interface UsbIpWebUsbOptions {
    * transfer and every reopen throws immediately with the reason.
    */
   readonly gone?: AbortSignal;
+  /**
+   * The emulator's device-time side channel (device-clock.ts). With it, every reply
+   * is held until the camera's clock has reached its completion, every transfer's
+   * deadline is handed to the emulator's host before the transfer goes out, and
+   * `deadlineClock` is the clock the transport must time its deadlines on.
+   */
+  readonly clockLink?: DeviceClockLink;
+  /** With `clockLink`: `DEFAULT_HOST_GIVE_UP_MS`'s value for this device. */
+  readonly hostGiveUpMs?: number;
 }
 
 /** Throws at once when `gone` has been aborted, carrying its reason. */
@@ -201,6 +250,8 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
   private readonly where: { host: string; port: number; busid: string };
   private readonly ledger: DeliveryLedger;
   private readonly gone: AbortSignal | undefined;
+  private readonly clockLink: DeviceClockLink | undefined;
+  private readonly hostGiveUpMs: number;
   /** bNumInterfaces of the active configuration, from the import record. USB 2.0
    *  sec.9.6.5: bInterfaceNumber is the zero-based index into that array, so the
    *  interfaces that exist are exactly 0 .. interfaceCount-1. */
@@ -225,12 +276,16 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     where: { host: string; port: number; busid: string },
     ledger: DeliveryLedger,
     gone: AbortSignal | undefined,
+    clockLink: DeviceClockLink | undefined,
+    hostGiveUpMs: number,
   ) {
     this.session = session;
     this.timeoutMs = timeoutMs;
     this.where = where;
     this.ledger = ledger;
     this.gone = gone;
+    this.clockLink = clockLink;
+    this.hostGiveUpMs = hostGiveUpMs;
     gone?.addEventListener(
       'abort',
       () => {
@@ -265,13 +320,22 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
   ): Promise<UsbIpWebUsbDevice> {
     const ledger = options.ledger ?? new DeliveryLedger();
     throwIfGone(options.gone, 'attach');
-    const session = await UsbIpSession.attach(host, port, busid, undefined, ledger);
+    const session = await UsbIpSession.attach(
+      host,
+      port,
+      busid,
+      undefined,
+      ledger,
+      options.clockLink,
+    );
     const device = new UsbIpWebUsbDevice(
       session,
       options.urbTimeoutMs ?? DEFAULT_URB_TIMEOUT_MS,
       { host, port, busid },
       ledger,
       options.gone,
+      options.clockLink,
+      options.hostGiveUpMs ?? DEFAULT_HOST_GIVE_UP_MS,
     );
     if (options.gone?.aborted === true) {
       session.close();
@@ -282,12 +346,28 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     return device;
   }
 
+  /**
+   * The clock a transport over this device must time its deadlines on: the
+   * emulated camera's, when the emulator has a device-time side channel. Pass it
+   * as `new WebUsbTransport(device, { clock: device.deadlineClock })`.
+   */
+  get deadlineClock(): DeadlineClock {
+    if (!this.clockLink) {
+      throw new HarnessFidelityError(
+        "this device has no device-time side channel, so there is no emulated camera's " +
+          'clock to time a deadline on (Emulator.attach always passes one)',
+      );
+    }
+    return this.clockLink.clock;
+  }
+
   private async standardIn(
     bRequest: number,
     wValue: number,
     wIndex: number,
     length: number,
   ): Promise<Uint8Array> {
+    await this.clockLink?.useDeadline(this.hostDeadline(STANDARD_REQUEST_DEADLINE_MS));
     return this.session.controlTransfer(
       { bmRequestType: STANDARD_IN_DEVICE, bRequest, wValue, wIndex },
       null,
@@ -302,6 +382,7 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     wValue: number,
     wIndex: number,
   ): Promise<void> {
+    await this.clockLink?.useDeadline(this.hostDeadline(STANDARD_REQUEST_DEADLINE_MS));
     await this.session.controlTransfer(
       { bmRequestType, bRequest, wValue, wIndex },
       null,
@@ -451,6 +532,7 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
           this.where.busid,
           undefined,
           this.ledger,
+          this.clockLink,
         );
         if (this.gone?.aborted === true) {
           this.session.close();
@@ -561,12 +643,43 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     );
   }
 
+  /** The emulated host's deadline for a transfer the transport gives `timeoutMs`. */
+  private hostDeadline(timeoutMs: number): number {
+    return Math.min(timeoutMs, this.hostGiveUpMs);
+  }
+
+  /**
+   * Before a vendor transfer: note the clock's timer count (the transport starts its
+   * deadline timer right after this call's synchronous part), and hand the
+   * transport's deadline to the emulator's host. Returns the check to run after.
+   */
+  private async beginTransfer(timeoutMs: number | undefined): Promise<() => void> {
+    const clock = this.clockLink?.clock;
+    const before = clock?.timersStarted ?? 0;
+    if (this.clockLink) {
+      if (timeoutMs === undefined) {
+        throw new HarnessFidelityError(
+          'a vendor transfer came without its deadline: WebUsbTransport passes one with every ' +
+            'call, and the emulated host must give the transfer up where it does',
+        );
+      }
+      await this.clockLink.useDeadline(this.hostDeadline(timeoutMs));
+    }
+    return () => {
+      /* A transport built without `clock: device.deadlineClock` started its timer on
+       * the wall clock; the ledger counts it and the audit fails the row. */
+      if (clock?.timersStarted === before) this.ledger.wallClockTransfers++;
+    };
+  }
+
   async controlTransferIn(
     setup: WebUsbControlSetup,
     length: number,
+    timeoutMs?: number,
   ): Promise<WebUsbInTransferResult> {
     throwIfGone(this.gone, 'controlTransferIn');
     this.assertTransferAllowed(setup, 'controlTransferIn');
+    const done = await this.beginTransfer(timeoutMs);
     try {
       const data = await this.session.controlTransfer(
         {
@@ -583,16 +696,20 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     } catch (error) {
       if (error instanceof UsbIpStall) return { status: 'stall' };
       throw error;
+    } finally {
+      done();
     }
   }
 
   async controlTransferOut(
     setup: WebUsbControlSetup,
     data: ArrayBufferView,
+    timeoutMs?: number,
   ): Promise<WebUsbOutTransferResult> {
     throwIfGone(this.gone, 'controlTransferOut');
     this.assertTransferAllowed(setup, 'controlTransferOut');
     const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    const done = await this.beginTransfer(timeoutMs);
     try {
       await this.session.controlTransfer(
         {
@@ -609,6 +726,8 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     } catch (error) {
       if (error instanceof UsbIpStall) return { status: 'stall' };
       throw error;
+    } finally {
+      done();
     }
   }
 }

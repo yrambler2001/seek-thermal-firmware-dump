@@ -12,15 +12,18 @@ import {
   OP,
   READ_ONLY_OPS,
   USB_COMMIT_TIMEOUT_MS,
+  USB_TIMEOUT_MS,
   WINDOW_SIZE,
 } from '../src/protocol/ops.js';
 import type { WindowEntry } from '../src/profiles/types.js';
 import {
+  WALL_CLOCK,
   WebUsbTransport,
   type WebUsbDevice,
   type WebUsbInTransferResult,
   type WebUsbOutTransferResult,
 } from '../src/protocol/webusb.js';
+import { EmulatedDeviceClock } from './emulator/device-clock.js';
 import { fakeCamera, FAKE_ERR, type FakeCamera } from './fake-transport.js';
 
 const TOKEN = new Uint8Array([
@@ -501,5 +504,103 @@ describe('WebUsbTransport', () => {
     const transport = new WebUsbTransport(stubDevice());
     const error = await transport.controlIn(OP.GET_ERROR_CODE, 4, 1000).catch((e: unknown) => e);
     expect((error as SeekError).code).toBe('usb/not-open');
+  });
+});
+
+/* ---- the deadline's clock (TESTING.md sec.19) --------------------------- */
+
+describe('WebUsbTransport deadlines on an injected clock', () => {
+  const NS_PER_MS = 1_000_000;
+
+  it('times its deadline on the given clock, and no real time can end it', async () => {
+    vi.useFakeTimers();
+    try {
+      const clock = new EmulatedDeviceClock();
+      const transport = new WebUsbTransport(stubDevice({ hang: true }), { clock });
+      await transport.open();
+      let settled: unknown = 'pending';
+      void transport.controlIn(OP.GET_ERROR_CODE, 4).then(
+        () => (settled = 'answered'),
+        (e: unknown) => (settled = e),
+      );
+      /* A minute of real time: nothing. No real timer was even started. */
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(settled).toBe('pending');
+      expect(clock.armed).toBe(1);
+      /* The camera's clock: one nanosecond short of the deadline, then on it. */
+      clock.advance(USB_TIMEOUT_MS * NS_PER_MS - 1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe('pending');
+      clock.advance(USB_TIMEOUT_MS * NS_PER_MS);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBeInstanceOf(SeekError);
+      expect((settled as SeekError).code).toBe('usb/timeout');
+      expect((settled as SeekError).message).toContain(`${String(USB_TIMEOUT_MS)} ms`);
+      expect(clock.armed).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('measures each deadline from the clock at the transfer, in and out, and cancels it on an answer', async () => {
+    const clock = new EmulatedDeviceClock();
+    clock.advance(7 * 1000 * NS_PER_MS); /* the camera has been up 7 s */
+    const transport = new WebUsbTransport(stubDevice(), { clock });
+    await transport.open();
+    await transport.controlIn(OP.GET_ERROR_CODE, 4, 1500);
+    await transport.controlOut(OP.SET_OPERATION_MODE, new Uint8Array(2), 20_000);
+    expect(clock.timersStarted).toBe(2);
+    expect(clock.armed).toBe(0);
+    expect(clock.timersFired).toBe(0);
+
+    const hung = new WebUsbTransport(stubDevice({ hang: true }), { clock });
+    await hung.open();
+    const out = hung
+      .controlOut(OP.SET_OPERATION_MODE, new Uint8Array(2), 1500)
+      .catch((e: unknown) => e);
+    clock.advance((7000 + 1499) * NS_PER_MS);
+    expect(clock.timersFired).toBe(0);
+    clock.advance((7000 + 1500) * NS_PER_MS);
+    expect(((await out) as SeekError).code).toBe('usb/timeout');
+  });
+
+  it('fires the earliest deadline first, and time never runs backwards', () => {
+    const clock = new EmulatedDeviceClock();
+    const fired: string[] = [];
+    clock.startTimer(20, () => fired.push('20 ms'));
+    clock.startTimer(5, () => fired.push('5 ms'));
+    const cancel = clock.startTimer(10, () => fired.push('10 ms, cancelled'));
+    cancel();
+    clock.advance(30 * NS_PER_MS);
+    clock.advance(1 * NS_PER_MS);
+    expect(clock.now).toBe(30 * NS_PER_MS);
+    expect(fired).toEqual(['5 ms', '20 ms']);
+    cancel();
+    expect(clock.armed).toBe(0);
+  });
+
+  it('defaults to the wall clock, which is setTimeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new WebUsbTransport(stubDevice({ hang: true }));
+      await transport.open();
+      let settled: unknown = 'pending';
+      void transport.controlIn(OP.GET_ERROR_CODE, 4).catch((e: unknown) => (settled = e));
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(USB_TIMEOUT_MS - 1);
+      expect(settled).toBe('pending');
+      await vi.advanceTimersByTimeAsync(1);
+      expect((settled as SeekError).code).toBe('usb/timeout');
+
+      let expired = false;
+      const cancel = WALL_CLOCK.startTimer(100, () => (expired = true));
+      cancel();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(expired).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

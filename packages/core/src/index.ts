@@ -152,6 +152,7 @@ export {
   USB_COMMIT_TIMEOUT_MS,
   USB_PROBE_TIMEOUT_MS,
   USB_TIMEOUT_MS,
+  WALL_CLOCK,
   WINDOW_SIZE,
   WebUsbTransport,
   assertOpSetsDisjoint,
@@ -163,6 +164,7 @@ export {
 } from './protocol/index.js';
 export type {
   ChunkListener,
+  DeadlineClock,
   DeviceDescription,
   OpName,
   Opcode,

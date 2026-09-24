@@ -29,6 +29,8 @@
 import { Buffer } from 'node:buffer';
 import { connect, type Socket } from 'node:net';
 
+import type { DeviceClockLink } from './device-clock.js';
+
 const USBIP_VERSION = 0x0111;
 const OP_REQ_DEVLIST = 0x8005;
 const OP_REP_DEVLIST = 0x0005;
@@ -86,6 +88,8 @@ export interface DeliveryLedgerSnapshot {
   readonly repliesUnmatched: number;
   readonly deadlinesExpired: number;
   readonly urbsAbandoned: number;
+  /** Vendor transfers whose transport timed its deadline on the wall clock. */
+  readonly wallClockTransfers: number;
   /** The wire log: every control transfer put on the wire, keyed `bmRequestType/bRequest`. */
   readonly requests: Readonly<Record<string, WireCount>>;
 }
@@ -117,6 +121,12 @@ export class DeliveryLedger {
   deadlinesExpired = 0;
   /** Transfers still unanswered when their session was closed. */
   urbsAbandoned = 0;
+  /**
+   * Vendor transfers whose transport started no timer on the emulated camera's clock
+   * (`UsbIpWebUsbDevice.beginTransfer`): their deadline ran on the wall clock, which
+   * makes the result depend on machine load (TESTING.md sec.19). Must stay 0.
+   */
+  wallClockTransfers = 0;
   /**
    * THE WIRE LOG, by setup. It exists because a request a real host would never
    * send went out on every import for a whole campaign and nothing here could
@@ -157,6 +167,7 @@ export class DeliveryLedger {
       repliesUnmatched: this.repliesUnmatched,
       deadlinesExpired: this.deadlinesExpired,
       urbsAbandoned: this.urbsAbandoned,
+      wallClockTransfers: this.wallClockTransfers,
       requests,
     };
   }
@@ -261,6 +272,11 @@ class Framed {
     this.socket.write(b);
   }
 
+  /** This end's port: what the emulator's device-time side channel keys a reply by. */
+  get localPort(): number {
+    return this.socket.localPort ?? 0;
+  }
+
   destroy(): void {
     this.closed = true;
     this.socket.destroy();
@@ -327,11 +343,21 @@ export class UsbIpSession {
   private seq = 0;
   private stopped = false;
   private readonly ledger: DeliveryLedger;
+  private readonly clockLink: DeviceClockLink | undefined;
+  private readonly port: number;
 
-  private constructor(f: Framed, device: UsbIpDevice, ledger: DeliveryLedger) {
+  private constructor(
+    f: Framed,
+    device: UsbIpDevice,
+    ledger: DeliveryLedger,
+    clockLink: DeviceClockLink | undefined,
+  ) {
     this.f = f;
     this.device = device;
     this.ledger = ledger;
+    this.clockLink = clockLink;
+    this.port = f.localPort;
+    clockLink?.openPeer(this.port);
     ledger.sessions++;
     this.devid = (device.busnum << 16) | device.devnum;
     void this.pump().catch(() => {
@@ -345,6 +371,7 @@ export class UsbIpSession {
     busid: string,
     timeoutMs = 5000,
     ledger: DeliveryLedger = new DeliveryLedger(),
+    clockLink?: DeviceClockLink,
   ): Promise<UsbIpSession> {
     const f = await open(host, port, timeoutMs);
     const b = Buffer.alloc(32);
@@ -355,7 +382,7 @@ export class UsbIpSession {
       f.destroy();
       throw new UsbIpError(`OP_REQ_IMPORT ${busid} refused`);
     }
-    return new UsbIpSession(f, parseDevice(await f.read(DEVICE_RECORD)), ledger);
+    return new UsbIpSession(f, parseDevice(await f.read(DEVICE_RECORD)), ledger, clockLink);
   }
 
   private async pump(): Promise<void> {
@@ -375,12 +402,25 @@ export class UsbIpSession {
         status = head.readInt32BE(20);
       }
       this.ledger.repliesReceived++;
-      const w = this.waiting.get(seqnum);
-      if (w) {
-        this.waiting.delete(seqnum);
-        w({ status, payload });
+      const deliver = (): void => {
+        if (this.stopped) return; /* closed while it waited: counted as abandoned */
+        const w = this.waiting.get(seqnum);
+        if (w) {
+          this.waiting.delete(seqnum);
+          w({ status, payload });
+        } else {
+          this.ledger.repliesUnmatched++;
+        }
+      };
+      /* THE CAMERA'S CLOCK FIRST. With a device-time side channel, a RET_SUBMIT is
+       * delivered only once its record has arrived (the emulator writes it just
+       * before the reply), so the emulated clock - and every deadline timed on it -
+       * has reached the completion's time before anybody learns of the completion
+       * (device-clock.ts). A RET_UNLINK has no record and is not held. */
+      if (command === USBIP_RET_SUBMIT && this.clockLink) {
+        this.clockLink.onReply(this.port, seqnum, deliver);
       } else {
-        this.ledger.repliesUnmatched++;
+        deliver();
       }
     }
   }
@@ -489,6 +529,7 @@ export class UsbIpSession {
     this.ledger.urbsAbandoned += this.waiting.size;
     for (const [, resolve] of this.waiting) resolve({ status: -108, payload: Buffer.alloc(0) });
     this.waiting.clear();
+    this.clockLink?.closePeer(this.port);
     this.f.destroy();
   }
 }

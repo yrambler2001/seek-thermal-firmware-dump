@@ -61,23 +61,72 @@ SUMMARY = {'reason': 'host script complete', 'sessions': 0, 'balanced': True,
            'dropped_by_reason': {},
            'urbs': {'submitted': 0, 'answered': 0, 'unlinked': 0, 'dropped': 0,
                     'outstanding': 0},
-           'writers_alive': 0, 'writers_stuck': 0}
+           'writers_alive': 0, 'writers_stuck': 0,
+           'clock': {'records': 0, 'unheard': 0, 'failed': 0, 'hellos': 0,
+                     'deadlines_set': 0, 'deadline_ms': None, 'deadline_expiries': 0}}
 
 srv = socket.socket()
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(('127.0.0.1', port))
 srv.listen(8)
 
+DEVICE = (b'/sys/devices/fake'.ljust(256, b'\0') + b'1-1'.ljust(32, b'\0')
+          + struct.pack('>IIIHHHBBBBBB', 1, 2, 3, 0x289D, 0x0011, 0x0100, 0, 0, 0, 1, 1, 1))
+
+def hang(conn):
+    # 'hang': an import is accepted and every URB after it is read and never answered -
+    # an emulator that is alive and stuck, which only the wall-clock watchdog can catch.
+    SUMMARY['sessions'] += 1
+    conn.sendall(struct.pack('>HHI', 0x0111, 0x0003, 0) + DEVICE)
+    while conn.recv(4096):
+        pass
+
 def serve():
     while True:
         conn, _ = srv.accept()
         try:
-            conn.recv(8)
+            code = struct.unpack('>HHI', conn.recv(8))[1]
+            if code == 0x8003 and mode == 'hang':
+                conn.recv(32)
+                threading.Thread(target=hang, args=(conn,), daemon=True).start()
+                continue
             conn.sendall(struct.pack('>HHI', 0x0111, 0x0005, 0) + struct.pack('>I', 0))
-        finally:
+            conn.close()
+        except OSError:
             conn.close()
 
 threading.Thread(target=serve, daemon=True).start()
+
+# The device-time side channel (seekemu/usbip.py DeviceClockChannel): hello only - this
+# device answers no URB, so it never has a record to write.
+clk = socket.socket()
+clk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+clk.bind(('127.0.0.1', 0))
+clk.listen(8)
+
+def clock_serve():
+    while True:
+        conn, _ = clk.accept()
+        def one(conn=conn):
+            buf = b''
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+                while b'\n' in buf:
+                    line, buf = buf.split(b'\n', 1)
+                    msg = json.loads(line)
+                    if msg.get('op') == 'hello':
+                        SUMMARY['clock']['hellos'] += 1
+                        conn.sendall(b'{"hello":1,"now_ns":0,"deadline_ms":null}\n')
+                    elif msg.get('op') == 'deadline':
+                        SUMMARY['clock']['deadlines_set'] += 1
+                        conn.sendall((json.dumps({'ack': msg['id'], 'deadline_ms': msg['ms']})
+                                      + '\n').encode())
+        threading.Thread(target=one, daemon=True).start()
+
+threading.Thread(target=clock_serve, daemon=True).start()
 
 def orderly_stop(sig, frame):
     print('\nstopping (SIGTERM) - the host script will finish its current URB', flush=True)
@@ -87,7 +136,8 @@ def orderly_stop(sig, frame):
 
 signal.signal(signal.SIGTERM, orderly_stop)
 print('---USBIP-READY--- ' + json.dumps({'port': port, 'busid': '1-1', 'bind': '127.0.0.1',
-      'flash_out': None, 'flash_sha256': '0' * 64, 'source': 'stand-in', 'fill': None}),
+      'flash_out': None, 'flash_sha256': '0' * 64, 'source': 'stand-in', 'fill': None,
+      'clock_port': clk.getsockname()[1], 'clock_protocol': 1}),
       flush=True)
 
 if mode == 'fault':
@@ -173,6 +223,35 @@ describe('the harness fails a row the moment its emulator dies', () => {
       const [audit] = await row.finish();
       expect(audit?.death).toBeNull();
       expect(audit?.violations).toEqual([]);
+    } finally {
+      await row.finish();
+    }
+  }, 60_000);
+
+  it('a hung emulator is caught by the wall-clock watchdog, as an infrastructure defect', async () => {
+    /* THE SAFETY NET (TESTING.md sec.19.4). Every deadline a transport sets runs on
+     * the emulated camera's clock, and a stuck emulator reports no time, so none of
+     * them can fire. The USB/IP client's per-URB wall-clock deadline still does -
+     * and what it yields is a failed audit, never a measurement. */
+    const row = new RowEmulators('fake/hang');
+    try {
+      const emu = await row.start(fakeEmulatorDir(), {
+        entryId: 'fake/hang',
+        readyTimeoutMs: 30_000,
+      });
+      const started = Date.now();
+      const error = await rejection(row.guard(emu, () => emu.attach({ urbTimeoutMs: 2000 })));
+      expect(Date.now() - started, 'ms until the watchdog ended the stuck transfer').toBeLessThan(
+        FAST_MS,
+      );
+      expect(String(error)).toContain('timed out after 2000 ms');
+      expect(emu.deviceClock.now, "the camera's clock never moved").toBe(0);
+      expect(emu.deviceClock.timersFired).toBe(0);
+      const defect = await rejection(row.assertDelivery());
+      expect(defect).toBeInstanceOf(InfrastructureDefect);
+      expect((defect as Error).message).toContain(
+        'USB/IP deadline(s) expired on the client against a live emulator',
+      );
     } finally {
       await row.finish();
     }

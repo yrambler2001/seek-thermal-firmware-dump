@@ -96,7 +96,47 @@ export interface WebUsbTransportOptions {
   readonly host?: string | null;
   /** Called once, when the platform refused the claim and 'auto' fell back to device recipient. */
   readonly onWarning?: (message: string) => void;
+  /**
+   * The clock the per-transfer deadlines are timed on. Omitted: `WALL_CLOCK`,
+   * real time, which is what a real camera runs on and what every production
+   * caller uses. See `DeadlineClock`.
+   */
+  readonly clock?: DeadlineClock;
 }
+
+/**
+ * The clock a transport times its per-transfer deadlines on.
+ *
+ * A deadline means "the camera has had this long to answer". On a real camera
+ * that is real time — the camera's clock and the host's run together — so the
+ * default, `WALL_CLOCK`, is `setTimeout`, and nothing about production changes
+ * with this interface.
+ *
+ * An EMULATED camera has no real time: its clock is the work the emulator has
+ * retired, and on a loaded machine five seconds of real time are a fraction of a
+ * second of the camera's. A deadline timed on the wall clock would then give up
+ * after a load-dependent amount of the camera's time, and what the tool recorded
+ * would depend on how busy the machine was (TESTING.md sec.19). The emulator
+ * tests therefore pass a clock that moves only with the emulated camera's own
+ * time, so "5 s" means five seconds of the camera's time on any machine.
+ */
+export interface DeadlineClock {
+  /**
+   * Calls `onExpire` once, when `ms` of this clock's time have passed since the
+   * call. The returned function cancels it; calling it after expiry is harmless.
+   */
+  startTimer(ms: number, onExpire: () => void): () => void;
+}
+
+/** Real time. The default clock, and the one every real camera is timed on. */
+export const WALL_CLOCK: DeadlineClock = {
+  startTimer(ms: number, onExpire: () => void): () => void {
+    const timer = setTimeout(onExpire, ms);
+    return () => {
+      clearTimeout(timer);
+    };
+  },
+};
 
 /**
  * True when claimInterface() failed because the PLATFORM would not give this
@@ -133,17 +173,23 @@ export function isPlatformClaimRefusal(error: unknown): boolean {
  * WebUSB has no timeout of its own: a camera that simply does not answer leaves
  * the transfer pending forever, which shows up as a frozen dump with no error
  * and no retry. Racing a timer turns that into an ordinary failure the retry
- * path can reopen and recover from.
+ * path can reopen and recover from. The timer runs on `clock` (real time
+ * unless a caller says otherwise; see `DeadlineClock`).
  */
-export function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
+export function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  what: string,
+  clock: DeadlineClock = WALL_CLOCK,
+): Promise<T> {
+  let cancel: (() => void) | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
+    cancel = clock.startTimer(ms, () => {
       reject(new SeekError('usb/timeout', `${what} did not answer within ${String(ms)} ms`));
-    }, ms);
+    });
   });
   return Promise.race([promise, timeout]).finally(() => {
-    clearTimeout(timer);
+    cancel?.();
   });
 }
 
@@ -162,6 +208,7 @@ export class WebUsbTransport implements UsbTransport {
   private readonly api: string;
   private readonly host: string | null;
   private readonly onWarning: ((message: string) => void) | undefined;
+  private readonly clock: DeadlineClock;
 
   private recipient: Recipient;
   private claimed = false;
@@ -183,6 +230,7 @@ export class WebUsbTransport implements UsbTransport {
     this.api = options.api ?? 'WebUSB';
     this.host = options.host ?? null;
     this.onWarning = options.onWarning;
+    this.clock = options.clock ?? WALL_CLOCK;
     this.recipient = this.preference === 'device' ? 'device' : 'interface';
   }
 
@@ -316,6 +364,7 @@ export class WebUsbTransport implements UsbTransport {
       this.transferIn(request, length, timeoutMs, what),
       timeoutMs,
       what,
+      this.clock,
     );
     /* WebUSB resolves on a stall instead of rejecting, so status must be checked
      * explicitly — otherwise a stalled read silently becomes a zero-length one,
@@ -337,6 +386,7 @@ export class WebUsbTransport implements UsbTransport {
       this.transferOut(request, data, timeoutMs, what),
       timeoutMs,
       what,
+      this.clock,
     );
     if (result.status !== 'ok') throw statusError(what, result.status);
   }

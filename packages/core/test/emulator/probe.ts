@@ -512,6 +512,8 @@ async function probeGate(device: UsbIpWebUsbDevice, entryId: string): Promise<Ga
     recipient: 'auto',
     api: 'usbip (emulator)',
     host: 'vitest',
+    /* The emulated camera's clock, not the wall clock (TESTING.md sec.19). */
+    clock: device.deadlineClock,
   });
   await transport.open();
   assertRealHostPath(device, transport.info, `${entryId}: toolkit first contact`);
@@ -569,6 +571,8 @@ export async function probeTier1(emu: Emulator, options: ProbeOptions): Promise<
     recipient: 'auto',
     api: 'usbip (emulator)',
     host: 'vitest',
+    /* The emulated camera's clock, not the wall clock (TESTING.md sec.19). */
+    clock: device.deadlineClock,
   });
   const seek = new SeekDevice(transport);
 

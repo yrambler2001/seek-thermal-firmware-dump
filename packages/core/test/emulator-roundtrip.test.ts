@@ -221,6 +221,8 @@ async function measureRow(
         recipient: 'auto',
         api: 'usbip (emulator)',
         host: 'vitest',
+        /* The emulated camera's clock, not the wall clock (TESTING.md sec.19). */
+        clock: device.deadlineClock,
       });
       await transport.open();
       /* The real-host path (TESTING.md sec.9.9): interface 0 claimed without a packet,
