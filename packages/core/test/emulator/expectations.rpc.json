@@ -1250,10 +1250,10 @@
         "gaps": ["0x14000000", "0x14200000"]
       },
       "gate": {
-        "firmwareVersion": "1.3.0.8",
-        "identified": true,
-        "profile": "legacy-auth",
-        "refusal": null,
+        "firmwareVersion": null,
+        "identified": false,
+        "profile": "generic",
+        "refusal": "device/version-unknown: refusing to dump: the camera did not report its firmware version (GetFirmwareInfo did not answer (control IN 0x4e -> stall)); a command number does not mean the same thing on every Seek firmware — on Compact 0.3.0.1 wire id 0x52, the id that arms a read window, is EnterBootloaderMode — so until the version is known nothing is sent but GetErrorCode, GetOperationMode and GetFirmwareInfo, the reads every build answers the same way. Nothing was armed. Unplug the camera, let it finish starting up, plug it back in and try again.",
         "sentBeforeIdentity": ["IN 0x4E"]
       },
       "staleSelector": {
