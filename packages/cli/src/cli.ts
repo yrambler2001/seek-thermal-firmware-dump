@@ -36,6 +36,7 @@ import { dumpCommand } from './commands/dump.js';
 import { sweepCommand } from './commands/sweep.js';
 import { decryptCommand } from './commands/decrypt.js';
 import { flashCommand } from './commands/flash.js';
+import { preserveCommand } from './commands/preserve.js';
 
 /* ==================================================================== *
  * Options
@@ -89,7 +90,11 @@ export type ParsedCli =
 const RECIPIENTS: readonly RecipientPreference[] = ['interface', 'device', 'auto'];
 
 /** Commands that take exactly one file argument. */
-const FILE_COMMANDS: ReadonlySet<CommandName> = new Set<CommandName>(['decrypt', 'flash']);
+const FILE_COMMANDS: ReadonlySet<CommandName> = new Set<CommandName>([
+  'decrypt',
+  'flash',
+  'preserve',
+]);
 
 function parseInteger(name: string, text: string): number {
   if (!/^(0[xX][0-9a-fA-F]+|[0-9]+)$/.test(text.trim())) {
@@ -290,6 +295,7 @@ const COMMANDS: Record<CommandName, Command> = {
   sweep: sweepCommand,
   decrypt: decryptCommand,
   flash: flashCommand,
+  preserve: preserveCommand,
 };
 
 /**
