@@ -7,6 +7,25 @@
   },
   "readChunk": 64,
   "firmwares": {
+    "compact/2014.10.21-14.58.29-1.3.0.0/101310HSNEA2/dump": {
+      "kind": "full-dump",
+      "family": "compact",
+      "product": "Compact",
+      "version": "1.3.0.0",
+      "windowsRead": 31,
+      "windowsExpected": 31,
+      "bytesComparable": 2031616,
+      "diffBytesComparable": 0,
+      "diffRangesComparable": [],
+      "bytesUnreachable": 2162688,
+      "bytesStillErased": 605049,
+      "decryptedSha256": [
+        "862717a8a605021def7858ac0c04ad4aa1abe23d357d6c2417699939137f481c",
+        "862717a8a605021def7858ac0c04ad4aa1abe23d357d6c2417699939137f481c"
+      ],
+      "profile": "legacy-auth",
+      "gap": null
+    },
     "compact/2020.02.26-11.23.26-4.8.2.1/2229A0YZ7E28/dump": {
       "kind": "full-dump",
       "family": "compact",

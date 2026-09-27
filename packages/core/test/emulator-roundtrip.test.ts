@@ -78,7 +78,7 @@ const FLASH_SIZE = 4 * 1024 * 1024;
  * default chunk and takes three to five minutes. Fifteen of them at five
  * concurrent emulators is ~10 minutes, which is what `npm test` costs on a
  * machine that has the emulator beside it. `SEEK_EMU_TIER2=none` is there for
- * when that is not what you wanted; the 51-firmware tier 1 still runs.
+ * when that is not what you wanted; the 52-firmware tier 1 still runs.
  */
 const TIER2_SELECTION = process.env.SEEK_EMU_TIER2 ?? 'dumps';
 

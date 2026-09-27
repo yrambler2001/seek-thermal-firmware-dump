@@ -1,5 +1,5 @@
 /* ==================================================================== *
- * Tier 1 — the RPC surface of all 51 vendored firmwares, over a real
+ * Tier 1 — the RPC surface of all 52 vendored firmwares, over a real
  * transport, against firmware that is really executing.
  *
  * WHAT THIS CLOSES.
