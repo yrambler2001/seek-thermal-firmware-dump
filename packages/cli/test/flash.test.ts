@@ -132,6 +132,38 @@ describe('seek-fw flash refusals', () => {
     expect(sent.has(OP.COMPLETE_MEMORY_UPGRADE)).toBe(false);
   });
 
+  it('refuses a camera whose running application does not carry its keys, before staging anything', async () => {
+    /* FW-V1 Phase 51, Mosaic 10.9.1.31: the bootloader holds one pair, the running
+     * application embeds another and decrypts every upload with ITS Key A, so the
+     * commit answers OK and the camera boots the old slot. The flash must say so
+     * up front (TESTING.md sec.21.2). Here slot A's application carries a foreign
+     * pair while the bootloader's table holds KEY_A / KEY_B; then only Key B. */
+    for (const [appKeys, why] of [
+      [{ keyA: FOREIGN_KEY_A, keyB: FOREIGN_KEY_B }, "does not carry this camera's Key A"],
+      [{ keyA: KEY_A, keyB: FOREIGN_KEY_B }, "carries this camera's Key A but not its Key B"],
+    ] as const) {
+      const camera = cameraWithFlash(buildSyntheticFlash({ appKeys }).flash);
+      const image = await writeImage({ keyA: KEY_A, keyB: KEY_B });
+      const before = camera.flash.slice(slotOffsetOf('b'), slotOffsetOf('b') + IMAGE_LENGTH);
+      const { io, stderr } = testIo({ backend: fixedBackend([camera]), stdinIsTty: true });
+      const code = await run(
+        ['flash', image, '--yes', '--no-rescue-dump', '--chunk', '65536'],
+        io,
+        signal(),
+      );
+
+      expect(code, why).toBe(EXIT_FAILED);
+      expect(stderr.text, why).toContain('cannot be flashed from here');
+      expect(stderr.text, why).toContain(why);
+      const sent = new Set(camera.calls.map((call) => call.op));
+      expect(sent.has(OP.SET_FEATURED_FIRMWARE_DATA), why).toBe(false);
+      expect(sent.has(OP.COMPLETE_MEMORY_UPGRADE), why).toBe(false);
+      expect(camera.flash.slice(slotOffsetOf('b'), slotOffsetOf('b') + IMAGE_LENGTH), why).toEqual(
+        before,
+      );
+    }
+  });
+
   it('writes nothing when the prompt is answered no', async () => {
     const image = await writeImage({ keyA: KEY_A, keyB: KEY_B });
     const camera = cameraWithFlash(synthetic.flash);

@@ -103,10 +103,13 @@ export function prepareImage(
   requireCapability(state.profile, 'flash');
 
   if (!state.canFlash) {
+    /* Said as what it is: a read that found a reason not to write is not a
+     * read that has yet to happen. */
     throw new SeekError(
       'flash/refused',
-      "read the device info first — the camera's Key A and target slot come from it" +
-        (state.flashBlockedBy.length > 0 ? ` (${state.flashBlockedBy.join('; ')})` : ''),
+      state.flashBlockedBy.length > 0
+        ? `this camera cannot be flashed from here: ${state.flashBlockedBy.join('; ')}`
+        : "read the device info first — the camera's Key A and target slot come from it",
       { detail: { blockedBy: state.flashBlockedBy } },
     );
   }

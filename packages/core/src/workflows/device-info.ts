@@ -16,7 +16,7 @@
  * keeps those apart, and nothing here re-conflates them.
  * ==================================================================== */
 
-import { asciiz, bytesToHex, hex, hexUp, sha256hex, viewOf } from '../bytes.js';
+import { asciiz, bytesToHex, findAll, hex, hexUp, sha256hex, viewOf } from '../bytes.js';
 import { CancelledError, errorMessage, SeekError } from '../errors.js';
 import { decryptImage } from '../crypto/cipher.js';
 import {
@@ -627,6 +627,17 @@ export async function readDeviceInfo(
     }
   }
 
+  /* ---- the running application's own keys ---------------------------- */
+  const keysBlock = runningApplicationKeyBlock(
+    prediction === null ? null : (byKey.get(prediction.booted) ?? null),
+    keyTable,
+    storeKey,
+  );
+  if (keysBlock !== null) {
+    reporter.log('');
+    reporter.log(keysBlock, 'error');
+  }
+
   /* ---- family check and detection ------------------------------------ */
   const familyOk = slots.some((slot) => slot.accepts);
   if (!familyOk) {
@@ -686,6 +697,7 @@ export async function readDeviceInfo(
     );
   }
   if (prediction === null) blocked.push('the slot an upgrade would write could not be determined');
+  if (keysBlock !== null) blocked.push(keysBlock);
   /* The original threw out of readDeviceInfo the moment any slot's window
    * refused to arm, so a partial picture could never reach the write path at
    * all. Reporting the rest of the read is more useful than throwing it away,
@@ -793,6 +805,57 @@ export async function readDeviceInfo(
       : 'Read, but this camera cannot be flashed from here — see the log.',
   );
   return state;
+}
+
+/**
+ * Why the RUNNING application cannot take an upload for this camera, or null.
+ *
+ * THE UPLOAD IS DECRYPTED BY THE APPLICATION, NOT BY THE BOOTLOADER. The flash
+ * path encrypts the image under this camera's Key A - the bootloader's, from its
+ * key table, confirmed against a slot - and `CompleteMemoryUpgrade` in the
+ * running application decrypts it with the `g_keyA` built into THAT image and
+ * re-encrypts it under the per-device key, or its own `g_keyB` when none is
+ * programmed (`fw_validate_decrypt_program`, FW-V1 `targets/compact_pro_ff/src/
+ * update.c`). Its checksum is over the staged bytes, so a wrong key is not
+ * noticed: the commit answers OK, the new slot fails the bootloader's acceptance
+ * test under both of its keys, and the camera boots the old slot again.
+ *
+ * That is not hypothetical. The Mosaic 10.9.1.31 dump's bootloader holds
+ * 874dfcf6... / b23b0d20..., its application embeds f32ad771... / 997ed6e5...
+ * (the Compact PRO FF 4.18.2.0 pilot's pair) and its per-device key slot is
+ * erased; the emulated upload of a retargeted image committed and booted slot A
+ * (FW-V1 Phase 51). Nothing here reads an address: the booted slot is already
+ * decrypted, and the keys are looked for BY VALUE, the way `prepareImage` finds
+ * the pair it retargets (`findEmbeddedKeyTable`, which explains why an anchor is
+ * not trusted). Only an ABSENT key refuses - that is the case the firmware
+ * cannot survive, and it needs no guess about which copy the code loads.
+ */
+export function runningApplicationKeyBlock(
+  running: SlotState | null,
+  keyTable: PickedKeyTable | null,
+  storeKey: StoreKey,
+): string | null {
+  const plain = running?.plain ?? null;
+  if (running === null || plain === null || keyTable === null) return null;
+  const what =
+    `the running application (${running.name}, firmware ` +
+    `${running.plainHeader?.versionStr ?? '?'})`;
+  if (findAll(plain, keyTable.keyA).length === 0) {
+    return (
+      `${what} does not carry this camera's Key A ${bytesToHex(keyTable.keyA)}: it decrypts ` +
+      "an upload with the Key A built into it, not with the bootloader's, so a flash would " +
+      'commit, the bootloader would refuse the new slot, and the camera would keep running ' +
+      'its old firmware'
+    );
+  }
+  if (!storeKey.programmed && findAll(plain, keyTable.keyB).length === 0) {
+    return (
+      `${what} carries this camera's Key A but not its Key B ${bytesToHex(keyTable.keyB)}: ` +
+      'with no per-device key programmed it re-encrypts an upload under the Key B built ' +
+      'into it, which this bootloader does not try, so the new slot would never boot'
+    );
+  }
+  return null;
 }
 
 /** The slot the camera booted from, when the boot policy could name one. */

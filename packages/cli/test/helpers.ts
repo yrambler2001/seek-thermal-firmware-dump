@@ -121,13 +121,18 @@ function footerTemplate(): Uint8Array {
  * key-table identification and filename stamping to all have something real to
  * work on.
  */
-export function buildSyntheticFlash(): SyntheticFlash {
+export function buildSyntheticFlash(
+  options: {
+    /** The pair slot A's application embeds. Default: the bootloader's own. */
+    readonly appKeys?: { readonly keyA: Uint8Array; readonly keyB: Uint8Array };
+  } = {},
+): SyntheticFlash {
   const flash = new Uint8Array(FLASH_SIZE).fill(0xff);
   /* The bank is built by core's own packaging, so slot A is byte-for-byte
    * what this tool would have written — footer included, which is what makes
    * the slot bootable rather than merely decryptable. */
   const bank = buildBankPayload(
-    buildPlainImage(),
+    buildPlainImage(options.appKeys),
     KEY_A,
     footerTemplate(),
     modern4x.cipher,
