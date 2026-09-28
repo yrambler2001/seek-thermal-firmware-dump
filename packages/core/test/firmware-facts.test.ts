@@ -137,6 +137,30 @@ describe('firmware facts — the corpus is present and plausible', () => {
       expect(f.rpcMethods?.length ?? 0, id).toBeLessThanOrEqual(41);
     }
   });
+
+  it("ends every table where its records end: each row's fourth word is a u8 flags byte", () => {
+    /* `rpc_method_t` is {name, get, set, u8 flags, u8 reserved[3]} (FW-V1
+     * fw_types.h). A row whose fourth word has bits above the byte is not a
+     * record: until 2026-09-28 the recovery ran one row past the end of
+     * Compact 4.8.1.7 and 4.16.1.7 onto the next table of function pointers,
+     * "HpGi6" / "HpGm6" with flags 0x10004905 (FW-V1 Phase 46, TESTING.md 21.4). */
+    for (const [id, f] of IMAGES) {
+      for (const [index, row] of (f.rpcHandlers ?? []).entries()) {
+        expect(row.flags >>> 8, `${id}: wire id ${String(53 + index)} (${row.name})`).toBe(0);
+      }
+    }
+  });
+
+  it('gives 4.8.1.7 and 4.16.1.7 the 38 rows their dispatchers accept (ids 53..90)', () => {
+    /* Read off the images: `SUB.W Rd, Rn, #0x35` then `CMP Rd, #0x25` in each
+     * dispatcher (4.8.1.7 at 0x37B2 / 0x5D10 / 0x5E16). */
+    const builds = IMAGES.filter(([, f]) => ['4.8.1.7', '4.16.1.7'].includes(f.version));
+    expect(builds).toHaveLength(4);
+    for (const [id, f] of builds) {
+      expect(f.rpcMethods?.length, id).toBe(38);
+      expect(f.rpcMethods?.at(-1), id).toBe('SetRamDataFeatures');
+    }
+  });
 });
 
 describe('the opcodes this toolkit sends are the commands the firmware has', () => {

@@ -9181,8 +9181,7 @@
         "SetFeaturedFlashData",
         "GetFeaturedData",
         "ResetDevice",
-        "SetRamDataFeatures",
-        "HpGi6"
+        "SetRamDataFeatures"
       ],
       "rpcHandlers": [
         {
@@ -9412,12 +9411,6 @@
           "getter": null,
           "setter": "0x10005445",
           "flags": 3
-        },
-        {
-          "name": "HpGi6",
-          "getter": "0x1000497D",
-          "setter": "0x10004725",
-          "flags": 268454149
         }
       ],
       "rpcTableAt": "0x98A0",
@@ -9712,8 +9705,7 @@
         "SetFeaturedFlashData",
         "GetFeaturedData",
         "ResetDevice",
-        "SetRamDataFeatures",
-        "HpGi6"
+        "SetRamDataFeatures"
       ],
       "rpcHandlers": [
         {
@@ -9943,12 +9935,6 @@
           "getter": null,
           "setter": "0x10005445",
           "flags": 3
-        },
-        {
-          "name": "HpGi6",
-          "getter": "0x1000497D",
-          "setter": "0x10004725",
-          "flags": 268454149
         }
       ],
       "rpcTableAt": "0x98A0",
@@ -10243,8 +10229,7 @@
         "SetFeaturedFlashData",
         "GetFeaturedData",
         "ResetDevice",
-        "SetRamDataFeatures",
-        "HpGm6"
+        "SetRamDataFeatures"
       ],
       "rpcHandlers": [
         {
@@ -10474,12 +10459,6 @@
           "getter": null,
           "setter": "0x10005449",
           "flags": 3
-        },
-        {
-          "name": "HpGm6",
-          "getter": "0x10004981",
-          "setter": "0x10004729",
-          "flags": 268454153
         }
       ],
       "rpcTableAt": "0x98A8",
@@ -10774,8 +10753,7 @@
         "SetFeaturedFlashData",
         "GetFeaturedData",
         "ResetDevice",
-        "SetRamDataFeatures",
-        "HpGm6"
+        "SetRamDataFeatures"
       ],
       "rpcHandlers": [
         {
@@ -11005,12 +10983,6 @@
           "getter": null,
           "setter": "0x10005449",
           "flags": 3
-        },
-        {
-          "name": "HpGm6",
-          "getter": "0x10004981",
-          "setter": "0x10004729",
-          "flags": 268454153
         }
       ],
       "rpcTableAt": "0x98A8",

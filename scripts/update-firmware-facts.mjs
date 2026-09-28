@@ -114,6 +114,24 @@ function nameOffsets(buf) {
  * once, or nearly so: the Compact PRO FF reuses one name for three rows
  * (`SetFeaturedFlashData`, methods 17/20/34), which is the worst case seen.
  */
+/**
+ * THE FOURTH WORD IS `u8 flags; u8 reserved[3]`, AND THAT ENDS THE TABLE.
+ *
+ * FW-V1's reconstruction declares the record as {name, get_handler,
+ * set_handler, u8 flags, u8 reserved[3]} (`targets/compact_pro_ff/include/
+ * fw_types.h` `rpc_method_t`, with `_Static_assert`s on offset 12 and size 16),
+ * and every row of every recovered table carries flags 0..3 with the reserved
+ * bytes zero. Walking on name pointers alone ran one row past the end of
+ * Compact 4.8.1.7 and 4.16.1.7 (both files each): the 39th slot is the first
+ * record of the next table of function pointers, whose first word happens to
+ * land on "HpGi6" / "HpGm6" in code and whose fourth word is a code address
+ * (0x10004905 / 0x10004909), not a flags byte. The images' own dispatchers agree
+ * that it is not a command: `SUB.W Rd, Rn, #0x35` then `CMP Rd, #0x25` - ids
+ * 53..90, 38 rows - at 0x37B2 / 0x5D10 / 0x5E16 (4.8.1.7) and 0x37B6 / 0x5D14 /
+ * 0x5E1A (4.16.1.7). FW-V1 Phase 46 found the row; TESTING.md sec.21.4.
+ */
+const isFlagsWord = (word) => word >>> 8 === 0;
+
 function findMethodTable(buf) {
   const names = nameOffsets(buf);
   const anchors = [...names].filter(([, n]) => n === 'GetErrorCode').map(([o]) => o);
@@ -123,10 +141,11 @@ function findMethodTable(buf) {
     for (let p = 0; p + 4 <= buf.length; p += 4) {
       const base = (buf.readUInt32LE(p) - anchor) >>> 0;
       const entries = [];
-      for (let q = p; q + 4 <= buf.length; q += 16) {
+      for (let q = p; q + 16 <= buf.length; q += 16) {
         const off = (buf.readUInt32LE(q) - base) >>> 0;
         const name = names.get(off);
         if (name === undefined) break;
+        if (!isFlagsWord(buf.readUInt32LE(q + 12))) break;
         entries.push(name);
       }
       if (entries.length < 25) continue;
