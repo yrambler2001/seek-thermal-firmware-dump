@@ -3072,3 +3072,189 @@ throughout, and the load climbed through the hour, independently of these runs. 
 - The side channel's remaining cost, about 0.5-1 s of harness CPU per 65k URBs, is within the
   noise of a row. Removing it would take a cheaper channel (a Unix socket, say). That is a
   protocol change in FW-V1 and would buy well under 1% of the check.
+
+## 21. The bench Compact's serial string, the running application's keys, one-packet reads, and two notes (2026-09-28)
+
+FW-V1's RPC sweep (Phases 44, 46, 47, 51) and its bench run on a real Compact 1.3.0.0 (Phase 53,
+`101310HSNEA2`) reported five problems here. Each is fixed below with a test that fails on the
+code before it (checked by putting the old source back and running the test). FW-V1 was not
+changed; its bench data for the run in 21.7 is committed there.
+
+### 21.1 A serial string the device cannot produce
+
+**What happened.** The camera's device descriptor names iSerialNumber 5, and its string table
+ends at 4, so GET_DESCRIPTOR(STRING, 5) returns the configuration descriptor's first 9 bytes
+(`09 02 40 00 02 01 00 80 32`). A byte scan finds the same index in 12 builds, 0.6.0.4 ..
+1.3.0.0. The OS keeps no such string (Linux's `usb_get_string` answers -ENODATA; macOS shows
+none). node-usb 3.1.0's `serialNumber` getter then asks the device itself (node-usb-rs v3.1.0
+`src/webusb_device.rs`: the OS copy, else nusb's `get_string_descriptor` with wIndex 0x0409,
+wLength 4096, 100 ms). nusb 0.2.7 rejects a reply unless bLength equals its length and
+bDescriptorType is 3 (`validate_string_descriptor`), and the getter throws `getString error:
+invalid descriptor`. `fromNodeUsb` passed that through, so `devices`, `info` and `dump` exited 1
+before any vendor request.
+
+**What Chrome does.** WebUSB's string attributes never throw. On macOS (`UsbServiceImpl`) and
+Windows (`UsbDeviceWin`) Chrome reads the strings itself (`ReadUsbStringDescriptors`,
+services/device/usb/usb_descriptors.cc). `ParseUsbStringDescriptor` refuses a reply whose byte 1
+is not 3, and the empty string the map started with is stored because the index is non-zero:
+`serialNumber` is `""`. On Linux (`UsbServiceLinux`) the string comes from sysfs, and there is no
+`serial` attribute: `null`. (Chromium `main`, `usb_descriptors.cc` last changed in 1d93261,
+2026-07-16.)
+
+**The fix.**
+
+- CLI (`node-usb.ts`, correction 5): each string getter is read once. node-usb-rs's two string
+  failures (`getString error: ...`, `open error: ...`) read as null; any other error still
+  throws. Reading once also stops node-usb from sending a GET_DESCRIPTOR every time the
+  transport's description is read.
+- Core (`WebUsbTransport.description`): `""` reads as null, so Chrome's two answers and the
+  CLI's give the same manifest, label and `--serial` match. The web path is
+  `asWebUsbDevice` → `WebUsbTransport`, so this is where it becomes consistent.
+- The harness: `UsbIpWebUsbDevice` still reports the OS view (null). That is right for Chrome on
+  Linux, but it is why no emulator row saw the bug. `packages/cli/test/node-usb-over-usbip.ts`
+  now puts node-usb's layering over the same USB/IP device: the OS copy, else nusb's real
+  descriptor read on the wire with nusb's validation (timed on the camera's clock), plus the real
+  `usb` shim over a native layer that rejects with nusb's text. node-usb's getter blocks and a
+  USB/IP transfer cannot, so the read happens once at attach, and the getter then returns or
+  throws each time it is read. `NodeUsbBackend` takes an optional `clock` for this (the CLI never
+  sets it).
+
+**Tests.**
+
+| test                                                                                                                                                                                                                                                                                                             | before                                        | after      |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- | ---------- |
+| `cli/test/emulator-cli.test.ts`: `run()` → `devices`, `info`, `dump --no-decrypt` through node-usb on the emulated `101310HSNEA2` dump. It asserts the premise (iSerialNumber 5, no OS copy, node-usb asked for string 5, the getter throws the bench's message) and that all 31 windows equal the emulated part | exit 1, `getString error: invalid descriptor` | pass, 63 s |
+| `cli/test/node-usb.test.ts`, "a string the device cannot produce" (4 tests: the four messages, product and manufacturer, another error still throws, `devices` exits 0)                                                                                                                                          | 3 of 4 fail                                   | pass       |
+| `core/test/protocol.test.ts`: `""` and null both give null, and a real serial is kept                                                                                                                                                                                                                            | — (new behaviour)                             | pass       |
+| `web/src/lib/usb-adapter.test.ts`: a Chrome device with `""` or null gives null                                                                                                                                                                                                                                  | —                                             | pass       |
+
+### 21.2 The flash gate: the running application's keys
+
+**What happened (FW-V1 Phase 51).** The upload is decrypted by the running application with the
+`g_keyA` built into it. When no per-device key is programmed, it is re-encrypted under that
+application's `g_keyB`. The toolkit encrypts under the bootloader's Key A. On the Mosaic
+10.9.1.31 dump the bootloader holds `874dfcf6...` / `b23b0d20...`, the application holds
+`f32ad771...` / `997ed6e5...` (the 4.18.2.0 pilot's pair), and the per-device key slot is
+erased. FW-V1 emulated that upload: the commit answers OK, cfg[0] = 1, and the bootloader boots
+slot A again. The camera silently keeps its old firmware. The toolkit's analysis called this
+camera flashable (`canFlash` true).
+
+**The fix (`device-info.ts` `runningApplicationKeyBlock`).** The booted slot is already
+decrypted. The camera's Key A is looked for in it by value (and Key B, when the store key is
+Key B), the same way `prepareImage` finds the pair it retargets. No anchor is used: `keys.ts`
+explains why one is not trusted. An absent key turns flashing off, with the reason in
+`flashBlockedBy`. `prepareImage` now says "this camera cannot be flashed from here: <reasons>"
+whenever the analysis gives any. Only an absent key refuses: that is the case the firmware
+cannot survive, and it needs no guess about which copy the code loads.
+
+**Tests.**
+
+| test                                                                                                                                                                                                                                                                             | before          | after               |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------- | ------------------- |
+| `core/test/emulator-flash-gate.test.ts`: `readDeviceInfo` over the emulated Mosaic 10.9.1.31 dump: the premise (both key pairs, the store key erased), `canFlash` false with the reason, `prepareImage` refuses, and no SetFeaturedFirmwareData / CompleteMemoryUpgrade went out | `canFlash` true | pass, ~4 s          |
+| the same file: the other 11 post-2016 full dumps (4.8.2.1 ×2, 4.9.2.0 ×2, 4.9.1.15, 4.18.2.0 ×3, Mosaic FF, Nano 200, Nano 300) carry their keys, and the gate adds no reason                                                                                                    | —               | pass, ~9 s in total |
+| `cli/test/flash.test.ts`: a synthetic camera whose application carries a foreign pair (then only a foreign Key B): `flash --yes` exits 1, nothing is staged, slot B is unchanged                                                                                                 | exit 0, flashed | pass                |
+
+The survey behind the second test was also run offline over the corpus with `decryptDump`. Of
+the full dumps, only the Mosaic 10.9.1.31 (every slot), the 2014 Compact (no key table) and two
+non-booted slots of 4.9.1.15 have an application without the bootloader's pair.
+
+### 21.3 Control reads: one EP0 packet at a time
+
+**What was checked.** The boot ROM clears an endpoint's completion bit only after the handler
+returns. EP0's handler primes the next packet of a control read itself, so from packet 2 on, a
+packet the host finishes early is erased unread (FW-V1 Phase 44 item 42; §14.2 here saw packet 2
+and packet 3 lost). Every control IN the toolkit sends by default is at most 64 bytes:
+GetErrorCode 4, GetOperationMode 2, GetFirmwareInfo 36 / 64 / 2, window reads and the device-id
+block at `DEFAULT_READ_CHUNK` 64. But `--chunk`, and the web's chunk option, accepted 1..65536
+and sent window reads of that size on every build. After a lost read, `readArmed` retried and
+kept going, so a firmware that had counted the lost request as served would have shifted the
+rest of a kept window.
+
+**The fix.** `MAX_CONTROL_IN = 64` (`ops.ts`). `readArmed` never asks for more. A larger chunk
+is read 64 bytes at a time, the dump logs that and records the effective size in the manifest,
+and the help texts say "at most 64". This is the shape FW-V1's own sweep uses: one packet per
+read.
+
+**The emulator does not show the old shape failing.** The toolkit's own `readWindow` at 128, 256
+and 512 bytes on 4.9.2.0 (`1215A0YZ9AA8`, three windows each) returned every byte, equal to the
+filled part. Over USB/IP the gated clock gives the camera no idle time between requests, so it
+never drops to the 12 MHz idle clock the race needs. FW-V1 reproduces the race only in-process,
+after its sweep's sequence. So there is no emulator test. `protocol.test.ts` "never asks for more
+than one 64-byte EP0 packet" pins the request sizes for chunks 65 .. 65536, and fails on the old
+`readArmed`. Two tests that exercised the shrink from 256 now shrink from 64 to 32.
+
+### 21.4 facts.json: the 39th row of 4.8.1.7 and 4.16.1.7
+
+`rpc_method_t` is {name, get, set, u8 flags, u8 reserved[3]} (FW-V1 `fw_types.h`). The generator
+walked on name pointers alone and ran one row past the end of the table in both files of each
+build: "HpGi6" / "HpGm6", flags 0x10004905 / 0x10004909, the first record of the next table of
+function pointers (FW-V1 Phase 46). The images' dispatchers accept ids 53..90 (`SUB.W Rd, Rn,
+#0x35`, `CMP Rd, #0x25` at 0x37B2 / 0x5D10 / 0x5E16 in 4.8.1.7), which is 38 rows. The same scan
+reads `#0x25` in 1.3.0.8 and 4.8.1.9 and `#0x28` in 4.18.2.0: 38 and 41, their table sizes.
+`update-firmware-facts.mjs` now ends a table at the first row whose fourth word is not a flags
+byte. Regenerated (and prettier-formatted, which reproduces the committed file byte for byte on
+the old generator), facts.json drops exactly those four rows. Two tests in
+`firmware-facts.test.ts` fail on the old file and pass on the new one: every row's fourth word is
+a byte, and 4.8.1.7 / 4.16.1.7 have 38 rows ending at SetRamDataFeatures.
+
+### 21.5 compact-2014: what 0.3.0.1's wire 0x52 does
+
+The profile said EnterBootloaderMode "would ask the camera to leave the application". The image
+says otherwise (FW-V1 Phase 47, handler 0x10005BDC). It checks the request (2 or 18 bytes,
+subcommand <= 33, the 16-byte key for 2..9), sets a flash target, arms the upgrade stage (64 KiB
+at 0x20000000, error bit 22 = GetErrorCode 0x00400000) and returns 0. FW-V1's run armed it three
+times with no reboot. The refusal stays, because an armed upgrade stage is not a read window.
+Only the stated reason changed, in the profile's comments, its refusal text and two test
+comments. `profiles.test.ts` now asserts the reason says it stays in the application; that
+assertion fails on the old text.
+
+### 21.6 Pinned results that changed
+
+Five tier-1 rows record the refusal text of 21.5 in `gate.refusal`: 0.3.0.1, 0.5.0.2, 0.6.0.4,
+0.7.0.7 and 0.7.0.8. (0.5.1.0 and 0.5.1.3 record `device/version-unknown` instead: their version read does not
+answer during the gate.) They were re-taken with
+`node scripts/update-emulator-expectations.mjs --tier 1`: 481 passed, 1 skipped. Nothing else in
+`expectations.rpc.json` moved, and `expectations.roundtrip.json` was unchanged.
+
+### 21.7 The bench Compact, read-only
+
+The camera was the Compact 1.3.0.0 `101310HSNEA2` (289D:0010) on the RP2040 power switch, channel
+2 on, and enumerated. Nothing else held it. The CLI was built from this source (`b567a97`) and run
+as built, with no preload. Only `devices`, `info` and `dump` were run: reads, window arms and
+GetErrorCode, and no flash or write command. There was no power change.
+
+| command                 | result                                                                                                                                                                                    |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `devices --json`        | exit 0; one camera, `serialNumber: null` (Phase 53: exit 1, `getString error: invalid descriptor`)                                                                                        |
+| `info --json`           | exit 0; firmware 1.3.0.0 "Oct 21 2014", bootloader 0.9.0.0 "Sep 29 2014", serial `101310HSNEA2` (device-id block), USB serial null                                                        |
+| `dump --out ... --json` | exit 0; 31 / 31 windows in 35 s, chunk 64, recipient interface; `flash_4m_usb_legacy_partial_gap_ff.bin` sha256 `40447c7e...eb72`, equal to the camera's backup and the FW-V1 corpus dump |
+
+The logs are FW-V1 bench data (`emu/data/bench/raw/compact_2026-09-28/toolkit_fixed_*`, README
+§9, campaign log Phase 54).
+
+### 21.8 The checks
+
+The source, tests and `docs/` were at `b08b910`, run against FW-V1 `1f982020` (unchanged), one
+run after another. Load is the 1-minute average at the start and the end.
+
+| run                                                             | load      | exit | tests                                                            | wall  |
+| --------------------------------------------------------------- | --------- | ---- | ---------------------------------------------------------------- | ----- |
+| `node scripts/update-emulator-expectations.mjs --tier 1`        | —         | 0    | 481 passed, 1 skipped                                            | —     |
+| `npm run check`                                                 | 5.0 → 8.3 | 0    | **727 / 727**, 41 files                                          | 266 s |
+| `SEEK_EMU_DIR=/none SEEK_DUMPS_DIR=/none npm run test:coverage` | —         | 0    | 574 passed, 7 skipped (the three new emulator files skip loudly) | —     |
+| `npm run build`, then `git status --porcelain -- docs`          | —         | 0    | clean                                                            | —     |
+
+727 = 702 + 25 new tests: 4 in `node-usb.test.ts`, 1 in `flash.test.ts`, 1 in
+`emulator-cli.test.ts`, 2 in `protocol.test.ts`, 2 in `firmware-facts.test.ts`, 13 in
+`emulator-flash-gate.test.ts` and 2 in `usb-adapter.test.ts`.
+
+### 21.9 Still open
+
+- The ROM race of 21.3 was not reproduced through USB/IP. A harness that let the emulated camera
+  idle between requests (into its 12 MHz idle clock) could show a 128-byte read failing. The
+  gated clock is what keeps the pins reproducible, so this was not tried.
+- The key gate refuses only an ABSENT key. An application that carries the camera's pair
+  somewhere and loads another one would still pass it; no dump in the corpus does that.
+- `emulator-cli.test.ts` covers the node-usb path for `devices`, `info` and `dump` on one dump.
+  `flash` and `sweep` through node-usb over the emulator are not run.
