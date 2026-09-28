@@ -6,7 +6,7 @@
  * worse than not reading it. Every other profile answers "which selector map",
  * and for these builds the honest answer is a different question: the command
  * the dump reads with is either missing or registered as a write, and on the
- * oldest build one of the other opcodes takes the camera out of the application.
+ * oldest build the opcode a dump arms with arms the firmware upgrade instead.
  *
  * ---- What the images say ---------------------------------------------
  *
@@ -46,13 +46,20 @@
  *
  * On 0.3.0.1 specifically, wire id 0x52 is `EnterBootloaderMode`. A dump arms
  * its windows and a sweep probes 66 selectors with that id; against that camera,
- * every one of those is a request to leave the application, with a two-byte
- * argument it will interpret as something of its own. Confirmed on the wire:
- * against emulated 0.3.0.1 the toolkit's own `armWindow` gets a clean control-OUT
- * for subcommands 0, 1 and 0x0A..0x21, a stall for 2..9, and `GetErrorCode` then
- * reports 0x00400000 — a status outside the documented vocabulary of every later
- * build — while `GetFeaturedFirmwareData` stalls at offset 0. The camera is
- * answering; it is answering a different protocol.
+ * every one of those is a request to that build's firmware upgrade, with a
+ * two-byte argument it interprets as its own. What the handler does is read off
+ * the image (FW-V1 Phase 47, `docs/EMULATOR_CORPUS.md` sec.36, handler
+ * 0x10005BDC): it checks the request (2 or 18 bytes, a subcommand <= 33, the
+ * 16-byte key for 2..9), sets a flash target, arms the upgrade stage (64 KiB of
+ * staging at 0x20000000, error bit 22) and returns 0. It does NOT leave the
+ * application or reboot - three arms in the emulated run, no reboot - and this
+ * profile said it did until 2026-09-28 (TESTING.md sec.21.5). Confirmed on the
+ * wire too: against emulated 0.3.0.1 the toolkit's own `armWindow` gets a clean
+ * control-OUT for subcommands 0, 1 and 0x0A..0x21, a stall for 2..9, and
+ * `GetErrorCode` then reports 0x00400000 — that bit 22, a status outside the
+ * documented vocabulary of every later build — while `GetFeaturedFirmwareData`
+ * stalls at offset 0. The camera is answering; it is answering a different
+ * protocol, and an armed upgrade stage is not a read window.
  *
  * So this profile refuses `dump`, `sweep` and `flash`, and says which command
  * it would otherwise have sent. `decrypt` stays available because a dump
@@ -99,7 +106,9 @@ const NO_READ_COMMAND =
   'table at 0x4F but registered as a setter (write handler) only, so the control-IN read a ' +
   'dump sends cannot be dispatched; before 0.7.0.7 wire id 0x4F is UploadFirmwareRowSize, and ' +
   'on 0.3.0.1 wire id 0x52 — the one a dump arms with — is EnterBootloaderMode rather than ' +
-  'BeginFirmwareUpgrade, so sending it would ask the camera to leave the application. ' +
+  'BeginFirmwareUpgrade: the camera stays in its application, but every arm sets a flash ' +
+  "target and arms that build's firmware-upgrade stage (GetErrorCode then reads 0x00400000), " +
+  'which is not a read window. ' +
   "Recovered from the images' own method tables, both handler columns; see " +
   'test/firmware/facts.json.';
 

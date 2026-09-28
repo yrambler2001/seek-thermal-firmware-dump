@@ -776,7 +776,7 @@ describe('capabilities', () => {
    * read. `compact-2014` cannot: the five builds it covers have no
    * `GetFeaturedFirmwareData` in their RPC method table at all, and on 0.3.0.1
    * the wire id a dump ARMS with is `EnterBootloaderMode`. A profile that
-   * dumped those would be sending a mode change 63 times.
+   * dumped those would be arming that build's firmware upgrade 63 times.
    *
    * So the invariant becomes: reading is open unless the profile gives a
    * reason, and offline work — decrypting a dump somebody took with an SPI
@@ -814,6 +814,12 @@ describe('capabilities', () => {
       if (support.supported) return;
       expect(support.reason).toContain('GetFeaturedFirmwareData');
       expect(support.reason).toContain('EnterBootloaderMode');
+      /* ...and says what that handler does, as the image has it: it arms the
+       * upgrade stage and returns; it does not leave the application (FW-V1
+       * Phase 47, handler 0x10005BDC; TESTING.md sec.21.5). */
+      expect(support.reason).not.toContain('leave the application');
+      expect(support.reason).toContain('stays in its application');
+      expect(support.reason).toContain('firmware-upgrade stage');
     }
   });
 

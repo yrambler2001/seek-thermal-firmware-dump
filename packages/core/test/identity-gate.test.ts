@@ -5,7 +5,8 @@
  * A wire id is an index into each build's OWN RPC method table, and the
  * tables differ: on Compact 0.3.0.1 wire id 0x52 — the id a dump, a sweep and
  * the capability probe all arm windows with — is `EnterBootloaderMode`, and
- * the selector-arm requests mean "leave the application". So until
+ * the selector-arm requests arm that build's firmware-upgrade stage instead of a
+ * read window (FW-V1 Phase 47: it stays in the application). So until
  * `GetFirmwareInfo` has come back with a version, the toolkit may send ONLY
  * the commands that sit at the same wire id with the same name on EVERY image
  * in `test/firmware/facts.json`, and that are read handlers (getter column,
