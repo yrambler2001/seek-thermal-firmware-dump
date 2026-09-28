@@ -175,6 +175,26 @@ export const EP0_BUF = 64;
  */
 export const DEFAULT_READ_CHUNK = 64;
 
+/**
+ * The most a single control IN may ask for: ONE 64-byte EP0 packet, whatever
+ * chunk the caller chose (TESTING.md sec.21.3).
+ *
+ * The LPC43xx boot ROM's USB ISR write-1-clears an endpoint's ENDPTCOMPLETE bit
+ * only after that endpoint's handler returns, and EP0's handler primes the NEXT
+ * packet of a control read itself. If the host finishes that packet before the
+ * handler returns, its completion is erased unread, nothing more is primed, and
+ * the read ends short with no status stage: packet 2 of a 128-byte or longer
+ * read. At 96 MHz the window (~19-39 instructions) is shorter than any
+ * transaction; at the 12 MHz / 500 kHz idle clocks of Compact PRO 4.9.2.0,
+ * 4.9.1.15 and 1.0.3.2 it is not (FW-V1 Phase 44, item 42; TESTING.md sec.14.2).
+ * A one-packet read is primed from the SETUP handler, never from inside the IN
+ * handler, so it cannot lose a packet this way - which is how FW-V1's own sweep
+ * reads a stage. The default was always 64; this makes a larger `--chunk` safe
+ * rather than a gamble per packet, and keeps a lost read from shifting the rest
+ * of a window by a request the firmware counted as served.
+ */
+export const MAX_CONTROL_IN = 64;
+
 /** The floor readArmed() shrinks to before it gives up on a chunk. */
 export const MIN_READ_CHUNK = 32;
 

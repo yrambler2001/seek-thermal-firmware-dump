@@ -147,12 +147,13 @@ export function OptionsDetails({
 
       <Prose>
         <p>
-          <strong>chunk</strong> is the size of each control-IN read. 64 is the EP0 packet size and
-          the value that works on every camera tested; raising it to 256 is roughly four times
-          faster, and if a camera stalls at that size the page drops back toward 64 on its own and
-          carries on. <strong>gap-fill</strong> is the byte written into the one 64 KiB block USB
-          cannot reach. <strong>recipient</strong> defaults to interface and falls back to device if
-          the browser cannot claim interface 0 — the firmware accepts both.
+          <strong>chunk</strong> is the size of each control-IN read, at most 64: one EP0 packet. A
+          longer read can lose a packet to the camera's boot ROM when the camera idles at a low
+          clock, so a larger value is read 64 bytes at a time; a smaller one is used as given, and
+          if a camera stalls the page drops lower on its own and carries on.{' '}
+          <strong>gap-fill</strong> is the byte written into the one 64 KiB block USB cannot reach.{' '}
+          <strong>recipient</strong> defaults to interface and falls back to device if the browser
+          cannot claim interface 0 — the firmware accepts both.
         </p>
       </Prose>
     </Disclosure>

@@ -35,7 +35,7 @@ import {
   type WindowRecord,
 } from '../archive/manifest.js';
 import { makeLegacyReadme, makeReadme } from '../archive/readme.js';
-import { WINDOW_SIZE } from '../protocol/ops.js';
+import { MAX_CONTROL_IN, WINDOW_SIZE } from '../protocol/ops.js';
 import { requireCapability } from '../profiles/registry.js';
 import type { WindowEntry } from '../profiles/types.js';
 import { decryptDump } from './decrypt.js';
@@ -321,9 +321,16 @@ export async function runDump(
   reporter.log(
     `transport: vendor control, recipient=${transport.recipient}` +
       `${transport.claimedInterface ? ' (interface claimed)' : ''}, ` +
-      `chunk=${String(args.chunk)} B, retries=${String(args.retries)}`,
+      `chunk=${String(Math.min(args.chunk, MAX_CONTROL_IN))} B, retries=${String(args.retries)}`,
     'detail',
   );
+  if (args.chunk > MAX_CONTROL_IN) {
+    reporter.log(
+      `chunk ${String(args.chunk)} B asked for: reading ${String(MAX_CONTROL_IN)} B per request ` +
+        'instead - a longer control IN can lose a packet to the boot ROM on an idle-clocked camera',
+      'warn',
+    );
+  }
   reporter.log('');
 
   const { records, okCount, cancelled } = await readWindowsInto(
@@ -385,7 +392,7 @@ export async function runDump(
     flashBase,
     flashSize,
     windowSize,
-    chunk: args.chunk,
+    chunk: Math.min(args.chunk, MAX_CONTROL_IN),
     gapFill: args.gapFill,
     producer: `seek-thermal-firmware-dump (${device.transport.info.api}, ${profile.id})`,
     transport,

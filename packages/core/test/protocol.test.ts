@@ -13,6 +13,7 @@ import {
   READ_ONLY_OPS,
   USB_COMMIT_TIMEOUT_MS,
   USB_TIMEOUT_MS,
+  MAX_CONTROL_IN,
   WINDOW_SIZE,
 } from '../src/protocol/ops.js';
 import type { WindowEntry } from '../src/profiles/types.js';
@@ -137,23 +138,39 @@ describe('readWindow', () => {
 
 describe('adaptive chunk shrinking', () => {
   it('shrinks past the stuck request and keeps the smaller size', async () => {
-    const camera = fakeCamera({ stallAt: [{ subcmd: 6, offset: 0x8000, minSize: 128 }] });
+    const camera = fakeCamera({ stallAt: [{ subcmd: 6, offset: 0x8000, minSize: 64 }] });
     const dev = await opened(camera);
 
-    const got = await dev.readWindow(entry(6), 256);
+    const got = await dev.readWindow(entry(6), 64);
 
     expect(got.data.length).toBe(WINDOW_SIZE);
     expect(got.stopReason).toBeNull();
     expect(got.shrank).toBe(true);
-    expect(got.chunkUsed).toBe(64);
+    expect(got.chunkUsed).toBe(32);
     expect(equalBytes(got.data, camera.flash.subarray(6 * WINDOW_SIZE, 7 * WINDOW_SIZE))).toBe(
       true,
     );
 
-    /* The size that worked is kept: nothing goes back up to 256 afterwards. */
+    /* The size that worked is kept: nothing goes back up to 64 afterwards. */
     const reads = camera.calls.filter((c) => c.op === OP.GET_FEATURED_FIRMWARE_DATA);
-    const afterStall = reads.slice(reads.findIndex((c) => c.length === 64));
-    expect(afterStall.every((c) => c.length <= 64)).toBe(true);
+    const afterStall = reads.slice(reads.findIndex((c) => c.length === 32));
+    expect(afterStall.every((c) => c.length <= 32)).toBe(true);
+  });
+
+  it('never asks for more than one 64-byte EP0 packet, whatever chunk it is given', async () => {
+    /* A control IN of two packets or more has its second packet primed from
+     * inside the boot ROM's IN handler, whose post-handler clear can erase that
+     * packet's completion on an idle-clocked camera (FW-V1 Phase 44 item 42;
+     * TESTING.md sec.21.3). */
+    for (const chunk of [65, 128, 256, 4096, WINDOW_SIZE]) {
+      const camera = fakeCamera();
+      const dev = await opened(camera);
+      const got = await dev.readWindow(entry(6), chunk);
+      expect(got.data.length, String(chunk)).toBe(WINDOW_SIZE);
+      expect(got.chunkUsed, String(chunk)).toBe(MAX_CONTROL_IN);
+      const reads = camera.calls.filter((c) => c.op === OP.GET_FEATURED_FIRMWARE_DATA);
+      expect(Math.max(...reads.map((c) => c.length)), String(chunk)).toBe(MAX_CONTROL_IN);
+    }
   });
 });
 

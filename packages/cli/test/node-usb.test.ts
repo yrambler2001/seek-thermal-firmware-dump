@@ -215,7 +215,7 @@ describe('the CLI transport: timeouts', () => {
     const camera = fakeCamera({
       initialMode: 0,
       fwInfo: new Map([[0, buildBlock()]]),
-      stallAt: [{ subcmd: 5, offset: 0x8000, minSize: 128 }],
+      stallAt: [{ subcmd: 5, offset: 0x8000, minSize: 64 }],
     });
     const device = nodeUsbDevice(camera);
     const transport = await openThroughBackend(device);

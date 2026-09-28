@@ -13,6 +13,7 @@ import { silentReporter, type Reporter } from '../events.js';
 import type { WindowEntry } from '../profiles/types.js';
 import {
   DEFAULT_READ_CHUNK,
+  MAX_CONTROL_IN,
   MIN_READ_CHUNK,
   MODE_SETTLE_MS,
   OP,
@@ -238,7 +239,9 @@ export class SeekDevice {
     const raw = new Uint8Array(length);
     let got = 0;
     let stopReason: string | null = null;
-    let size = chunk; /* adapts downward and stays there */
+    /* Never more than one EP0 packet per request (MAX_CONTROL_IN), then adapts
+     * downward and stays there. */
+    let size = Math.min(chunk, MAX_CONTROL_IN);
     let shrank = false;
 
     while (got < length) {
