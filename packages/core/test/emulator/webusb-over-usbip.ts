@@ -448,12 +448,19 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
       /* A REAL HOST DROPS A "STRING" THAT IS NOT A STRING DESCRIPTOR.
        *
        * Linux's usb_get_string() answers -ENODATA when byte 1 is not USB_DT_STRING
-       * (drivers/usb/core/message.c), so the kernel caches no such string and the
-       * WebUSB and node-usb views above it report none. The 2014 Compacts are why
-       * this matters: their device descriptor names iSerialNumber 5 and their string
-       * table ends at index 3, so string 5 comes back as the head of the
-       * configuration descriptor (09 02 40 00 02 01 00 80 32). Decoding that as
-       * UTF-16 invented a serial number no real host would show. */
+       * (drivers/usb/core/message.c), so the kernel caches no such string, and macOS
+       * shows none either (FW-V1 Phase 53). The 2014 Compacts 0.6.0.4 .. 1.3.0.0
+       * are why this matters: their device descriptor names iSerialNumber 5 and
+       * their string table ends at index 4, so string 5 comes back as the head of
+       * the configuration descriptor (09 02 40 00 02 01 00 80 32). Decoding that as
+       * UTF-16 invented a serial number no real host would show.
+       *
+       * THIS IS THE OS'S VIEW, AND IT IS WHAT CHROME ON LINUX REPORTS - NOT WHAT
+       * NODE-USB DOES. node-usb 3.1.0's getter, finding no OS copy, asks the device
+       * again through nusb and THROWS "getString error: invalid descriptor"
+       * (Chrome on macOS / Windows reports ""). That is what took the CLI down on
+       * the bench and why no row here could see it: the CLI's own path over this
+       * device is `packages/cli/test/node-usb-over-usbip.ts` (TESTING.md sec.21.1). */
       if (raw[1] !== DESC_STRING) return null;
       const body = raw.subarray(2, raw[0] ?? raw.length);
       return new TextDecoder('utf-16le').decode(body);

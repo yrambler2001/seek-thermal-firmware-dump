@@ -4,8 +4,9 @@
  * The `usb` package ships a WebUSB-shaped API, and core's `WebUsbTransport`
  * already speaks that shape — so this file contains no protocol code at all.
  * It finds Seek devices, wraps each one in the transport core exports — through
- * `fromNodeUsb`, which corrects the four places `usb` 3.x behaves unlike WebUSB
- * (timeouts, stalls, an unconfigured device, a refused claim) — and turns the
+ * `fromNodeUsb`, which corrects the five places `usb` 3.x behaves unlike WebUSB
+ * (timeouts, stalls, an unconfigured device, a refused claim, a string the
+ * device cannot produce) — and turns the
  * host's permission failures into the udev advice from the README.
  *
  * `usb` is imported DYNAMICALLY: it is a native addon, and `seek-fw decrypt`
@@ -16,6 +17,7 @@
 import {
   SEEK_VENDOR_ID,
   WebUsbTransport,
+  type DeadlineClock,
   type RecipientPreference,
   type UsbBackend,
   type UsbTransport,
@@ -41,6 +43,12 @@ export interface BackendOptions {
   readonly onWarning?: (message: string) => void;
   /** Replaces the real `usb` enumeration. Tests pass fake devices here. */
   readonly enumerate?: Enumerate;
+  /**
+   * The clock the transports time their deadlines on. The CLI never sets it
+   * (the wall clock); the emulator suites pass the emulated camera's, as they
+   * do for every other transport (TESTING.md sec.19, sec.21.1).
+   */
+  readonly clock?: DeadlineClock;
 }
 
 /** Enumerates through the `usb` package's WebUSB shim. No user prompt in Node. */
@@ -78,11 +86,13 @@ export class NodeUsbBackend implements UsbBackend {
   private readonly recipient: RecipientPreference;
   private readonly onWarning: ((message: string) => void) | undefined;
   private readonly enumerate: Enumerate;
+  private readonly clock: DeadlineClock | undefined;
 
   constructor(options: BackendOptions = {}) {
     this.recipient = options.recipient ?? 'auto';
     this.onWarning = options.onWarning;
     this.enumerate = options.enumerate ?? enumerateSeekDevices;
+    this.clock = options.clock;
   }
 
   async listDevices(): Promise<UsbTransport[]> {
@@ -102,6 +112,7 @@ export class NodeUsbBackend implements UsbBackend {
       api: CLI_TRANSPORT_API,
       host: hostString(),
       ...(this.onWarning === undefined ? {} : { onWarning: this.onWarning }),
+      ...(this.clock === undefined ? {} : { clock: this.clock }),
     });
   }
 }

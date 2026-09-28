@@ -178,6 +178,12 @@ export function isPlatformClaimRefusal(error: unknown): boolean {
   );
 }
 
+/** A device string, or null when the device has none: WebUSB's null, and the
+ *  "" Chrome keeps for a string it could not read (see `description`). */
+function presentString(value: string | null | undefined): string | null {
+  return value === null || value === undefined || value === '' ? null : value;
+}
+
 /**
  * WebUSB has no timeout of its own: a camera that simply does not answer leaves
  * the transfer pending forever, which shows up as a frozen dump with no error
@@ -244,13 +250,29 @@ export class WebUsbTransport implements UsbTransport {
     this.recipient = this.preference === 'device' ? 'device' : 'interface';
   }
 
+  /**
+   * The device's own strings, with "no string" spelled one way.
+   *
+   * A device can NAME a string it cannot produce: the 2014 Compacts 0.6.0.4 ..
+   * 1.3.0.0 give iSerialNumber 5 and answer string 5 with the configuration
+   * descriptor's head (FW-V1 Phase 53). Chrome's WebUSB then reports "" on
+   * macOS and Windows - it reads the string itself (services/device/usb
+   * `ReadUsbStringDescriptors`), `ParseUsbStringDescriptor` refuses a reply
+   * whose bDescriptorType is not 3, and the empty string it started with is
+   * stored because the index was non-zero - and null on Linux, where it takes
+   * the string from sysfs and the kernel's `usb_get_string` refused the same
+   * reply (-ENODATA), so there is no `serial` attribute. The CLI's host stack
+   * reports null (packages/cli node-usb.ts, correction 5). An empty string is
+   * no identity either, so every front end gets null here, and a manifest,
+   * a label or a `--serial` match never sees "" (TESTING.md sec.21.1).
+   */
   get description(): DeviceDescription {
     return {
       vendorId: this.device.vendorId,
       productId: this.device.productId,
-      productName: this.device.productName,
-      manufacturerName: this.device.manufacturerName,
-      serialNumber: this.device.serialNumber,
+      productName: presentString(this.device.productName),
+      manufacturerName: presentString(this.device.manufacturerName),
+      serialNumber: presentString(this.device.serialNumber),
     };
   }
 

@@ -378,3 +378,81 @@ describe('the CLI transport: a claim the OS refused', () => {
     expect(device.native).toHaveLength(0);
   });
 });
+
+describe('the CLI transport: a string the device cannot produce', () => {
+  /* node-usb-rs v3.1.0's string getters: the OS's copy, else nusb's
+   * get_string_descriptor, whose failure THROWS (TESTING.md sec.21.1). These are
+   * its four messages: the bench Compact 1.3.0.0's, a stalled string, nusb's
+   * 100 ms deadline, and the implicit open that precedes the read. */
+  const FAILURES = [
+    'getString error: invalid descriptor',
+    'getString error: endpoint stalled',
+    'getString error: transfer was cancelled',
+    'open error: could not open device',
+  ];
+
+  function withThrowingString(
+    name: 'serialNumber' | 'productName' | 'manufacturerName',
+    message: string,
+  ): { device: FakeNodeUsb; reads: () => number } {
+    const device = nodeUsbDevice(fakeCamera({ initialMode: 0 }));
+    let reads = 0;
+    Object.defineProperty(device, name, {
+      get(): never {
+        reads++;
+        throw new Error(message);
+      },
+    });
+    return { device, reads: () => reads };
+  }
+
+  it('reads a serial string node-usb cannot produce as null, as WebUSB does', async () => {
+    for (const message of FAILURES) {
+      const { device, reads } = withThrowingString('serialNumber', message);
+      const backend = new NodeUsbBackend({ enumerate: () => Promise.resolve([device]) });
+      const [transport] = await backend.listDevices();
+      expect(transport?.description, message).toMatchObject({
+        serialNumber: null,
+        productName: 'Seek Thermal Compact PRO',
+        manufacturerName: 'Seek Thermal',
+      });
+      /* ...asked once, however often the description is read. */
+      expect(transport?.description.serialNumber, message).toBeNull();
+      expect(transport?.description.serialNumber, message).toBeNull();
+      expect(reads(), message).toBe(1);
+    }
+  });
+
+  it('does the same for the product and manufacturer strings', async () => {
+    for (const name of ['productName', 'manufacturerName'] as const) {
+      const { device } = withThrowingString(name, 'getString error: invalid descriptor');
+      const backend = new NodeUsbBackend({ enumerate: () => Promise.resolve([device]) });
+      const [transport] = await backend.listDevices();
+      expect(transport?.description[name], name).toBeNull();
+    }
+  });
+
+  it('still throws anything that is not one of those two failures', async () => {
+    const { device } = withThrowingString('serialNumber', 'something else entirely');
+    const backend = new NodeUsbBackend({ enumerate: () => Promise.resolve([device]) });
+    const [transport] = await backend.listDevices();
+    expect(() => transport?.description).toThrow('something else entirely');
+  });
+
+  it('lets `seek-fw devices` list the camera instead of exiting 1', async () => {
+    const { run } = await import('../src/cli.js');
+    const { testIo } = await import('./helpers.js');
+    const { device } = withThrowingString('serialNumber', 'getString error: invalid descriptor');
+    const { io, stdout, stderr } = testIo({
+      backend: (options) =>
+        new NodeUsbBackend({ ...options, enumerate: () => Promise.resolve([device]) }),
+    });
+    const code = await run(['devices', '--json'], io, new AbortController().signal);
+    expect(code, stderr.text).toBe(0);
+    expect(JSON.parse(stdout.text)).toMatchObject({
+      ok: true,
+      count: 1,
+      devices: [{ serialNumber: null, productName: 'Seek Thermal Compact PRO' }],
+    });
+  });
+});

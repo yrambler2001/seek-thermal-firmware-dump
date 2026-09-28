@@ -445,6 +445,22 @@ function stubDevice(options: StubOptions = {}): WebUsbDevice & { setups: unknown
 }
 
 describe('WebUsbTransport', () => {
+  it('reports a string the device named but could not produce as null, not "" (sec.21.1)', () => {
+    /* Chrome on macOS and Windows keeps "" for a string whose read or parse failed
+     * (services/device/usb ReadUsbStringDescriptors); on Linux it has none, null.
+     * The 2014 Compacts' iSerialNumber 5 is such a string. */
+    const chrome = { ...stubDevice(), serialNumber: '', productName: '', manufacturerName: '' };
+    expect(new WebUsbTransport(chrome).description).toMatchObject({
+      serialNumber: null,
+      productName: null,
+      manufacturerName: null,
+    });
+    const linux = { ...stubDevice(), serialNumber: null };
+    expect(new WebUsbTransport(linux).description.serialNumber).toBeNull();
+    const real = { ...stubDevice(), serialNumber: '1818B0Z3K6C8' };
+    expect(new WebUsbTransport(real).description.serialNumber).toBe('1818B0Z3K6C8');
+  });
+
   it('turns a stall into a thrown error instead of an empty read', async () => {
     const transport = new WebUsbTransport(stubDevice({ inResult: { status: 'stall' } }));
     await transport.open();

@@ -3,7 +3,7 @@
  *
  * The CLI's host stack is `usb` 3.1.0: node-usb-rs over nusb 0.2.7, not
  * libusb. It ships a WebUSB-shaped API, and core's `WebUsbTransport` is written
- * against WebUSB, but the shape and the behaviour differ in four places. Each
+ * against WebUSB, but the shape and the behaviour differ in five places. Each
  * one is corrected here and nowhere else, so core keeps one transport for both
  * front ends (TESTING.md sec.11):
  *
@@ -40,6 +40,27 @@
  *      `NetworkError`, which is the one claim failure the transport's 'auto'
  *      mode answers with device recipient; these two are renamed to it, with
  *      the host's own message kept. Every other claim error is left as it is.
+ *   5. A STRING THE DEVICE CANNOT PRODUCE. `manufacturerName`, `productName`
+ *      and `serialNumber` are getters that can THROW (node-usb-rs v3.1.0
+ *      src/webusb_device.rs): each returns the OS's cached string when there
+ *      is one, and otherwise opens the device and asks it, through nusb's
+ *      `get_string_descriptor` (GET_DESCRIPTOR(STRING, i, 0x0409), 100 ms),
+ *      which refuses any reply that is not a well-formed string descriptor
+ *      (nusb 0.2.7 src/descriptors.rs `validate_string_descriptor`: bLength
+ *      equal to the reply's length and bDescriptorType 3). Its error comes
+ *      out as "getString error: invalid descriptor" (or ": endpoint stalled",
+ *      ": transfer was cancelled"), the implicit open's as "open error: ...".
+ *      The 2014 Compacts 0.6.0.4 .. 1.3.0.0 name iSerialNumber 5 past a
+ *      five-entry string table, answer string 5 with the configuration
+ *      descriptor's head, and so made `devices`, `info` and `dump` exit 1
+ *      before a single vendor request (FW-V1 Phase 53; TESTING.md sec.21.1).
+ *      WebUSB's string attributes never throw: Chrome stores "" for a string
+ *      it could not read on macOS and Windows, and has none (null) on Linux.
+ *      Those two errors therefore read as null here, and anything else still
+ *      throws. Each string is asked for ONCE per device, as WebUSB's are fixed
+ *      when the device is found: node-usb re-reads on every access, which for
+ *      a camera with no OS copy is a GET_DESCRIPTOR in the middle of a
+ *      session each time the transport's description is read.
  */
 
 import {
@@ -62,6 +83,7 @@ import {
 export interface NodeUsbDevice {
   readonly vendorId: number;
   readonly productId: number;
+  /** These three THROW when the device's string cannot be read (see 5 above). */
   readonly manufacturerName: string | null;
   readonly productName: string | null;
   readonly serialNumber: string | null;
@@ -101,6 +123,33 @@ const CLAIM_BUSY: readonly string[] = [
   'interface is busy',
 ];
 
+/** node-usb-rs's prefixes for a string getter's two failures: the descriptor
+ *  read (nusb `GetDescriptorError`) and the implicit open before it. */
+const STRING_FAILURES: readonly string[] = ['getString error:', 'open error:'];
+
+type StringGetter = 'manufacturerName' | 'productName' | 'serialNumber';
+
+/**
+ * One string attribute, read once, as WebUSB reads it: a string the device
+ * cannot produce is null, never a throw (see 5 above).
+ */
+function stringOnce(device: NodeUsbDevice, name: StringGetter): () => string | null {
+  let read = false;
+  let value: string | null = null;
+  return () => {
+    if (read) return value;
+    try {
+      value = device[name];
+    } catch (error) {
+      const message = messageOf(error);
+      if (!STRING_FAILURES.some((prefix) => message.startsWith(prefix))) throw error;
+      value = null;
+    }
+    read = true;
+    return value;
+  };
+}
+
 /** WebUSB's name for a claim the platform refused, with the host's words kept. */
 class PlatformClaimRefused extends Error {
   constructor(message: string, cause: unknown) {
@@ -131,6 +180,9 @@ function transferFailure<T>(
 
 /** Core's `WebUsbDevice` over a `usb` 3.x device. See the file comment for what changes. */
 export function fromNodeUsb(device: NodeUsbDevice): WebUsbDevice {
+  const manufacturerName = stringOnce(device, 'manufacturerName');
+  const productName = stringOnce(device, 'productName');
+  const serialNumber = stringOnce(device, 'serialNumber');
   return {
     get vendorId(): number {
       return device.vendorId;
@@ -139,13 +191,13 @@ export function fromNodeUsb(device: NodeUsbDevice): WebUsbDevice {
       return device.productId;
     },
     get manufacturerName(): string | null {
-      return device.manufacturerName;
+      return manufacturerName();
     },
     get productName(): string | null {
-      return device.productName;
+      return productName();
     },
     get serialNumber(): string | null {
-      return device.serialNumber;
+      return serialNumber();
     },
     get configuration(): WebUsbConfiguration | null {
       try {
