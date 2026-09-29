@@ -2909,7 +2909,7 @@ machine is 10 cores with a desktop session (screen recording, a browser) beside 
 
 ### 19.8 Still open
 
-- **The faithful give-up is not run.** `SEEK_EMU_HOST_GIVE_UP_MS=Infinity` works (the FW-V1
+- ~~**The faithful give-up is not run.**~~ Run in §22, per real host, for every long operation. `SEEK_EMU_HOST_GIVE_UP_MS=Infinity` works (the FW-V1
   self-test checks the mechanism at 50 ms), but at 5 s a single unanswered 0.6.0.4 request did
   not finish in 9.5 minutes, so no row has been measured that way.
 - ~~**`ensureMode0` still waits on the wall clock.**~~ Closed in §20.1. `SeekDevice.ensureMode0` polls
@@ -3068,7 +3068,7 @@ throughout, and the load climbed through the hour, independently of these runs. 
 
 ### 20.6 Still open
 
-- The faithful 5 s host give-up is still not run (§19.8).
+- ~~The faithful 5 s host give-up is still not run (§19.8).~~ Run in §22.
 - The side channel's remaining cost, about 0.5-1 s of harness CPU per 65k URBs, is within the
   noise of a row. Removing it would take a cheaper channel (a Unix socket, say). That is a
   protocol change in FW-V1 and would buy well under 1% of the check.
@@ -3258,3 +3258,211 @@ run after another. Load is the 1-minute average at the start and the end.
   somewhere and loads another one would still pass it; no dump in the corpus does that.
 - `emulator-cli.test.ts` covers the node-usb path for `devices`, `info` and `dump` on one dump.
   `flash` and `sweep` through node-usb over the emulator are not run.
+
+## 22. The real hosts' give-up, per host, on every long operation (2026-09-29)
+
+§19.8 and §20.6 left one item: the emulated host gave every transfer the firmware never
+completes up after 200 ms of the camera's time (the poll budget, §19.3), and nothing was ever run
+with the give-up a real host uses. This section takes each real host's give-up from its own
+source, models it in the harness on the camera's clock with a switch, runs every toolkit
+operation that can take long under it, and fixes the one place a real host fails. The toolkit
+source changed in one function (`webusb.ts`, `WebUsbTransport.withDeadline`); the harness gained
+the host models; FW-V1 did not change.
+
+### 22.1 What each host does with a slow control transfer, from its source
+
+| path                        | stack, as installed                                    | the transfer's timeout                                                                                                                                                                                                                                                                                        | at the timeout                                                                                                                                                                                            |
+| --------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| CLI, Linux                  | `usb` 3.1.0 = node-usb-rs 3.1.0 over nusb 0.2.7, usbfs | the shim's default is 1,000 ms (`DEFAULT_TIMEOUT`, node_modules/usb/dist/index.js:8), but the transport passes its own deadline on every call (5,000 / 1,500 / 20,000 ms, §11.2); node-usb-rs hands it on as `Duration::from_millis(timeout)` (src/webusb_device.rs `nativeControlTransferIn/Out`)            | nusb's own timer submits `USBDEVFS_DISCARDURB` (platform/linux_usbfs/device.rs `handle_timeouts`); the URB ends `-ENOENT`/`-ECONNRESET`, reported as `TransferError::Cancelled`, "transfer was cancelled" |
+| CLI, macOS                  | the same, IOKit                                        | the same deadline, as `IOUSBDevRequestTO { noDataTimeout: timeout, completionTimeout: timeout }` to `DeviceRequestAsyncTO` (platform/macos_iokit/device.rs `control_in` / `control_out`)                                                                                                                      | IOKit aborts the request, `kIOUSBTransactionTimeout`, which nusb reports as `Cancelled` (platform/macos_iokit/mod.rs)                                                                                     |
+| CLI, Windows                | the same, WinUSB                                       | the same deadline; nusb first turns WinUSB's own default on the control pipe off (`PIPE_TRANSFER_TIMEOUT` = 0, windows_winusb/device.rs)                                                                                                                                                                      | nusb's timer calls `CancelIoEx`                                                                                                                                                                           |
+| web app, Linux and ChromeOS | Chrome's WebUSB over usbfs (`UsbServiceLinux`)         | **none.** Blink sends every WebUSB transfer with a timeout of 0 (third_party/blink/renderer/modules/webusb/usb_device.cc: `ControlTransferIn(..., length, 0, ...)`); `UsbDeviceHandleUsbfs::SetUpTimeoutCallback` returns at once for 0, and an async URB has no kernel timeout                               | nothing. The transport's own timer (`withTimeout`) rejects; the transfer stays on EP0                                                                                                                     |
+| web app, macOS              | Chrome's WebUSB over its libusb (`UsbServiceImpl`)     | **none.** libusb arms no timer for 0, and its darwin backend puts the 0 in both `noDataTimeout` and `completionTimeout` (third_party/libusb darwin_usb.c); IOUSBHost: "If 0, the request will never timeout" (the 5,000 ms `kUSBDefaultControlNoDataTimeoutMS` is only the default of the calls without `TO`) | nothing, as on Linux                                                                                                                                                                                      |
+| web app, Windows            | Chrome's WebUSB over WinUSB                            | **5 s**: Chrome never sets a pipe policy (usb_device_handle_win.cc), and WinUSB's `PIPE_TRANSFER_TIMEOUT` default is "5 seconds (5000 milliseconds) for control; 0 for others" (Microsoft, WinUSB functions for pipe policy modification)                                                                     | WinUSB cancels; not modelled here                                                                                                                                                                         |
+
+- **What a cancel does to the pipe.** On every stack above: no CLEAR_FEATURE(HALT), no reset. The
+  next control transfer is simply a new SETUP, and USB 2.0 sec.5.5.5 says a device must abort a
+  control transfer it had not finished when a new SETUP arrives. Until then the host does not
+  send one: "after the Status transaction for a control transfer is completed, the host can
+  advance to the next control transfer" (sec.5.5.5). So on Chrome (macOS, Linux), a transfer the
+  camera never completes holds EP0, and every later control transfer waits behind it. WebUSB has
+  no way to cancel one transfer; `close()` cancels them all (`UsbDeviceHandleImpl::Close`,
+  `UsbDeviceHandleUsbfs::Close`).
+- **USB 2.0 sec.9.2.6** binds the device, not the host. sec.9.2.6.1: "USB sets an upper limit of 5
+  seconds as the upper limit for any command to be processed. This limit is not applicable in
+  all instances." sec.9.2.6.4, standard requests: 50 ms with no data stage; with a data stage to
+  the host, 500 ms for the first packet and each next one and 50 ms for the status stage; with a
+  data stage to the device, 5 s. sec.9.2.6.5 holds class requests to the same. Vendor requests,
+  all the Seek RPCs, are named nowhere. And sec.9.2.6: a request whose operation "will take a
+  relatively long period of time" should complete when the operation starts, with its end
+  signalled another way. No host enforces these numbers; Linux's own 5,000 ms
+  (`USB_CTRL_GET_TIMEOUT`) is for the kernel's own requests, such as enumeration.
+
+### 22.2 The host models in the harness
+
+`SEEK_EMU_HOST` (harness.ts) or `attach({ hostModel })` picks what the emulated host does with a
+transfer, per transfer, on the camera's clock (webusb-over-usbip.ts `HostModel`):
+
+| model              | the emulated host's deadline for a transfer the transport gives `D` | is                                                                                                                                                                           |
+| ------------------ | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `budget` (default) | `min(D, SEEK_EMU_HOST_GIVE_UP_MS)`, 200 ms                          | the cost decision of §19.3, unchanged; every existing suite and pin                                                                                                          |
+| `nusb`             | exactly `D`                                                         | the CLI on every OS: cancelled at the deadline; `node-usb-over-usbip.ts` then rejects with nusb's own "transfer was cancelled", which `fromNodeUsb` turns into `usb/timeout` |
+| `chrome`           | none, up to a 60 s horizon (`CHROME_HOST_HORIZON_MS`)               | the web app on macOS and Linux: never cancelled; the transport's timer is the only deadline. A transfer reaching the horizon fails the row (`HarnessFidelityError`)          |
+
+- The adapter's own descriptor reads are the OS's, under the kernel's 5 s, in `nusb` and `chrome`.
+- **A late completion under `chrome`.** The clock fires the transport's timer when the record of
+  the late completion arrives, before its reply is delivered. On a real host the toolkit reacted
+  at its deadline, not at the completion, so a timer started (or a time read) before the next
+  record now counts from the moment the last timer fired (`EmulatedDeviceClock`, `firedAtNs`).
+  Under `nusb` that moment is the record's own; under `budget` no timer fires.
+- **The trace.** `attach({ onTransfer })` reports every control transfer with its request, the
+  transport's deadline, what the emulated host was told, its start and end on the camera's clock,
+  and how it ended (`ok`, `stall`, `host-gave-up`, `error`).
+- **Closing under a reported completion.** `UsbIpWebUsbDevice.close()` now waits for any reply
+  whose completion the side channel has already reported (`UsbIpSession.closeAfterReported`): the
+  transport now closes the device when its deadline fires (22.4), which on the emulator is the
+  moment that record arrives, with its reply one write behind it. A transfer with no record yet is
+  closed under and counted as abandoned, as before.
+- What `chrome` cannot represent: a transfer the firmware never completes. Chrome would hold EP0
+  until `close()`; the emulated host cannot be left polling for ever (§19.3: past about a second
+  0.6.0.4 is emulated instruction by instruction), so the row fails at the horizon rather than
+  measure something else. That case is tested against Chrome's behaviour from its source
+  (22.5).
+
+### 22.3 The long operations, measured with the real give-up
+
+Every transfer of `info` (`readDeviceInfo`, after the selector-channel probe picks the profile),
+the whole `dump` (`runDump`, 64-byte reads, the tier-2 fill) and, where the analysis allows it, a
+flash of the camera's own running image (`prepareImage` + `writeFirmware`: arm, 1,024 staging
+writes, CompleteMemoryUpgrade), on 14 builds, under `nusb` - the host that gives up only at the
+toolkit's own deadline - with every transfer traced on the camera's clock. Measured with a
+scratch file that is not committed; the suite keeps the cases in 22.5.
+
+| build                                                                                                                                     | transfers (info / flash / dump)  | longest transfer, device time            | CompleteMemoryUpgrade | host give-ups / deadlines fired |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | ---------------------------------------- | --------------------- | ------------------------------- |
+| Compact 4.8.1.7, 4.16.1.7-FF, 4.8.1.9 (images); Compact 4.8.2.1, Compact XR 4.8.2.1, Nano 200 (dumps) - the 32K builds of the modern line | 2,872-3,640 / 797-1,057 / 64,766 | 14-15 ms (an arm, 0x52); every read 1 ms | 43-74 ms              | 0 / 0                           |
+| Compact 1.3.0.8 (image), Compact 1.3.0.0 (the bench unit's dump) - 32K, legacy                                                            | 1,586-2,095 / - / 31,870         | 1 ms                                     | - (not flashable)     | 0 / 0                           |
+| Compact PRO 4.9.1.15, 4.9.2.0, 4.18.2.0-FF, 1.0.3.0; Mosaic 2.27.1.33-FF; Nano 300 (dumps)                                                | 2,872-3,640 / 797-1,057 / 64,766 | 36-53 ms (the commit); every read 1-2 ms | 36-53 ms              | 0 / 0                           |
+
+- **No toolkit transfer came within a factor of 20 of any deadline.** The longest anywhere was
+  CompleteMemoryUpgrade on Compact / Compact XR 4.8.2.1, 74 ms; the tightest deadline the toolkit
+  sets is 1,500 ms. So on the emulator neither real host gives any of them up, and `nusb`,
+  `chrome` and `budget` send the same transfers and get the same answers.
+- **The slow GetFirmwareInfo selectors** (6, 7, 8: a whole-image key probe, ~1.9 s on XR / Nano
+  200 and ~2.15 s on 4.8.1.x at the 500 kHz idle clock; 9, never answered on XR, Nano 200 and
+  4.8.1.9; FW-V1 Phases 45-46) are sent by no toolkit operation: `info` reads the unarmed build
+  block and selectors 1, 20, 17 and 10, and on the 32K builds none of those took more than 2 ms.
+- **4.8.1.9's watchdog** (the WWDT at 3.0 s, fed only from SysTick, which the USB interrupt
+  blocks) resets the part when two key probes are asked back to back (FW-V1 `probe_pair_watchdog`,
+  and the sweep's `_let_watchdog_feed` pause). The toolkit asks none; `info`, the flash and the
+  dump on 4.8.1.9 took no transfer over 43 ms, and the part never reset.
+- **The start-up gates** (§18): a refused version read is a STALL, which completes at once; the
+  window is a count of reads. Only 0.6.0.4's refusal never completes (below).
+- **What the 200 ms budget ever changed**: in both tiers only 0.6.0.4's 127 transfers reached it
+  (§19.6), all of them transfers the firmware never completes; every other transfer the suites
+  have sent ended inside 200 ms of the camera's time. So the budget moved nothing but the message
+  text of those 127 (`usb/transfer-failed` for `usb/timeout`) and the 4.8 s per request the camera
+  is not polled (§19.3).
+- **CompleteMemoryUpgrade on the emulator is not the camera's.** Its 36-74 ms are CPU time: the
+  emulated SPIFI part completes every erase and program at once (FW-V1 `seekemu/spifi.py`, "the
+  one deliberate infidelity"). The real part's time is ops.ts's: 0.52 s typical, 5,334 ms at the
+  datasheet maximums on the path the toolkit can reach, 8,117 ms for everything the code can do.
+
+### 22.4 What would fail on a real host, and what was done
+
+1. **The web app on macOS and Linux, and a transfer the camera never completes: FIXED.** Chrome
+   never cancels it (22.1), so it holds EP0 and every later transfer queues behind it and times
+   out too. Compact 0.6.0.4 never completes the first GetFirmwareInfo it is sent (its silent
+   FW-init refusal: the vendor handler returns "handled" without a data stage, FW-V1 Phase 29);
+   the version read's rule for it is "one more read" (§18.1), and that read never reached the
+   camera, so the web app refused 0.6.0.4 as unidentified. The CLI identifies it: nusb cancels
+   the first read at 5 s and the second goes out. **The fix** (`WebUsbTransport.withDeadline`):
+   when the transport's own deadline fires on a transfer still pending, it closes the device -
+   the one thing WebUSB offers that cancels a transfer - and opens it again (no packet either way;
+   the recipient already decided is kept), and only then reports `usb/timeout`. A reopen that
+   fails leaves the transport closed, and the next transfer says so. On the CLI nusb has already
+   cancelled at the same deadline, so it costs a handle and sends nothing. It applies to every
+   timeout, so `readArmed`'s retry after a timeout now reaches the camera in a browser instead of
+   queueing behind the stuck read; `runDump`'s reopen between windows did that before, one level
+   up. In the emulator suites the transport's deadline never fires (the budget ends such a
+   transfer first; §19.3), so no pin moves.
+2. **The flash commit and WinUSB's 5 s (the web app on Windows): documented, not fixable here.**
+   CompleteMemoryUpgrade erases, programs and verifies inside the transfer and completes its
+   status stage only then (FW-V1 `cmd_CompleteMemoryUpgrade` -> `fw_validate_decrypt_program`,
+   `update_write_boot_config`; ops.ts). The CLI gives it 20 s through nusb and the web app 20 s
+   on its own timer, over 2x the 8,117 ms bound, and neither host below cancels earlier. Chrome on
+   Windows gets WinUSB's 5 s, under the 5,334 ms the reachable path can take at the datasheet
+   maximums (typical: 0.52 s). WebUSB offers no per-transfer timeout to raise, and no Seek build
+   has an asynchronous commit to poll instead. Should it happen, the transfer fails and the
+   toolkit's existing `flash/commit` error ("the camera may be part-way through erasing or
+   programming ... re-read the device info") is the right answer: the firmware runs on
+   regardless of the host's cancel. The commit also breaks USB 2.0's 5 s rule for a request with
+   a data stage to the device (sec.9.2.6.4) at those maximums, if that rule were read onto a
+   vendor request.
+3. **A request that outlasts nusb's deadline while the firmware is still working on it inside its
+   USB interrupt: the next request reads the late answer.** Measured (22.5): XR's key probe
+   cancelled at 1.5 s, the next GetFirmwareInfo received the probe's one-byte `02`, not the build
+   block. Under Chrome, with the fix, the late answer went with the reopen. No toolkit request
+   comes near a deadline (22.3), so no toolkit read can meet this; it is the reason the CLI's
+   deadlines must stay far above what any request takes.
+4. **Compact 0.6.0.4 under a real host's 5 s: not run.** One such request did not finish in 9.5
+   minutes of emulation (§19.3), and the row sends 127. Its outcome is argued from the firmware
+   instead: each of those transfers is one the firmware never completes, so a real host gives
+   each up at 5 s (CLI) or holds it until the reopen of item 1 (web app), as the budget does at
+   200 ms. The difference is 4.8 s more of the camera's own time per request (§19.3).
+
+### 22.5 The tests, and what each did on the old code
+
+- `packages/core/test/host-giveup.test.ts` (no emulator; a camera behind Chrome's WebUSB exactly
+  as its source says: one FIFO control pipe, no host timeout, `close()` cancels):
+  - a transfer the camera never completes is taken off the pipe at the deadline, and the next one
+    reaches the camera - **fails on the old code** (the second transfer queued and timed out);
+  - Compact 0.6.0.4, whose first GetFirmwareInfo is never completed, is identified - **fails on
+    the old code** (`version: null`, two failures in a row);
+  - a transfer answered in time never closes the device - passes on both, as it must;
+  - the emulated clock counts a timer started after a late completion from the moment the toolkit
+    gave up - **fails on the old code** (it counted from the completion).
+- `packages/cli/test/emulator-host-giveup.test.ts` (the emulator; ~30 s):
+  - **the two models on real firmware**: Compact XR 4.8.2.1's GetFirmwareInfo(6), sent with
+    `USB_PROBE_TIMEOUT_MS`. `nusb`: the emulated host cancelled it at exactly 1,500 ms of the
+    camera's time, the transport reported `usb/timeout`, and the next read got `02` (22.4, 3).
+    `chrome`: the firmware completed it at 1,877 ms, the transport had reported `usb/timeout` at
+    1.5 s, reopened, and the next read got the build block `4.8.2.1`;
+  - **the web app's info and flash under `chrome`** on Compact 4.8.2.1 (the longest commit, 74 ms)
+    and 4.8.1.9 (the watchdog build): `readDeviceInfo`, then the camera's own running image
+    written back through `writeFirmware`; the commit answered, no transfer was given up and no
+    deadline fired;
+  - **the CLI's `info` and `flash` through node-usb under `nusb`** on Compact XR 4.8.2.1: `run()`
+    with `NodeUsbBackend`, `fromNodeUsb` and node-usb's own shim over the emulated camera, `flash
+<its own running image> --yes --no-rescue-dump`: both exit 0, the commit went to nusb with its
+    20,000 ms, nothing was given up. This is also the first `flash` through node-usb over the
+    emulator (§21.9).
+- The harness's new parts are exercised by these; the existing suites run under `budget` and
+  their pins are unchanged.
+
+### 22.6 The checks
+
+FW-V1 `028ad3ab` (unchanged). A desktop session and another session's emulators shared the
+machine; load is the 1-minute average at the start and the end.
+
+| run                                                     | load    | exit | tests     | wall (vitest)   | tier 1: delivered = received, host give-ups / deadlines fired | tier 2: delivered = received, dropped, give-ups / fired |
+| ------------------------------------------------------- | ------- | ---- | --------- | --------------- | ------------------------------------------------------------- | ------------------------------------------------------- |
+| `npm run check`                                         | 14 → 38 | 0    | 734 / 734 | 494 s (493.5 s) | 21,305, 127 / 0 (all 0.6.0.4's, as before)                    | 904,935, 0, 0 / 0                                       |
+| `npx vitest run packages/cli/test/emulator-host-giveup` | ~12     | 0    | 3 / 3     | 30 s            | -                                                             | -                                                       |
+
+- 734 = 727 (§21.8) + 4 in `host-giveup.test.ts` + 3 in `emulator-host-giveup.test.ts`. No pin
+  changed: the suites run under `budget`, where the transport's deadline never fires.
+- The web bundle was rebuilt (`npm run build`, which rebuilds core before the web app;
+  `build:docs` alone reuses core's stale `dist/`), and a second rebuild left `docs/` unchanged.
+
+### 22.7 Still open
+
+- **Chrome on Windows** (WinUSB's 5 s on the control pipe) is not a host model here; 22.4 item 2
+  is its only consequence found, argued from the sources rather than run.
+- **A transfer the firmware never completes** cannot be run under `chrome` (the horizon fails the
+  row) or afforded under `nusb` on 0.6.0.4 (22.4 item 4); the reopen that ends it in a browser is
+  tested against Chrome's behaviour from its source, not on the emulator.
+- **The commit's real flash time is not emulated** (22.3). In particular 4.8.1.9's watchdog
+  (3.0 s, fed only from SysTick, which the USB interrupt blocks) against a commit whose erase and
+  programming ran longer than that on a slow part was not run: the emulated part answers at once.
+- `sweep` through node-usb over the emulator is still not run (§21.9); `flash` now is (22.5).
