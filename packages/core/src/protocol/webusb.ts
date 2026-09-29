@@ -392,11 +392,10 @@ export class WebUsbTransport implements UsbTransport {
   ): Promise<Uint8Array> {
     this.assertOpen();
     const what = `control IN ${hex(request)}`;
-    const result = await withTimeout(
+    const result = await this.withDeadline(
       this.transferIn(request, length, timeoutMs, what),
       timeoutMs,
       what,
-      this.clock,
     );
     /* WebUSB resolves on a stall instead of rejecting, so status must be checked
      * explicitly — otherwise a stalled read silently becomes a zero-length one,
@@ -414,13 +413,78 @@ export class WebUsbTransport implements UsbTransport {
   ): Promise<void> {
     this.assertOpen();
     const what = `control OUT ${hex(request)}`;
-    const result = await withTimeout(
+    const result = await this.withDeadline(
       this.transferOut(request, data, timeoutMs, what),
       timeoutMs,
       what,
-      this.clock,
     );
     if (result.status !== 'ok') throw statusError(what, result.status);
+  }
+
+  /**
+   * The transfer, raced against this transport's deadline - and, when the
+   * deadline wins, the transfer taken off the camera's control pipe before the
+   * timeout is reported.
+   *
+   * WHY (TESTING.md sec.22). Giving up on a promise does not give up on the
+   * transfer. In a browser nothing else does either: Blink passes a timeout of 0
+   * with every WebUSB transfer, and 0 is "none" on Chrome's macOS and Linux
+   * stacks (libusb arms no timer and hands IOKit 0 / 0; usbfs posts no timeout
+   * callback), so a transfer the camera never completes stays on EP0 for ever,
+   * and every later control transfer waits behind it (USB 2.0 sec.5.5.5: the host
+   * advances to the next control transfer only after the Status stage). Compact
+   * 0.6.0.4 never completes the first GetFirmwareInfo it is sent (its silent
+   * FW-init refusal, FW-V1 Phase 29), so the version read's second read - the one
+   * that answers on the CLI - never reached it in a browser, and the camera was
+   * refused as unidentified. WebUSB has one way to end a pending transfer:
+   * close(), which Chrome carries out by cancelling every transfer the handle
+   * has (`UsbDeviceHandleImpl::Close`, `UsbDeviceHandleUsbfs::Close`). So when
+   * the deadline fires on a transfer still pending, the device is closed and
+   * opened again - no packet either way, the recipient already decided is kept -
+   * and only then is the timeout reported. On the CLI nusb has already cancelled
+   * the transfer at the same deadline, so this costs a handle and sends nothing.
+   * A reopen that fails leaves the transport closed; the timeout is still what
+   * is reported, and the next transfer says the transport is not open.
+   */
+  private async withDeadline<T>(transfer: Promise<T>, timeoutMs: number, what: string): Promise<T> {
+    const state = { settled: false, pendingAtDeadline: false };
+    const tracked = transfer.finally(() => {
+      state.settled = true;
+    });
+    const deadline: DeadlineClock = {
+      startTimer: (ms, onExpire) =>
+        this.clock.startTimer(ms, () => {
+          state.pendingAtDeadline = !state.settled;
+          onExpire();
+        }),
+      now: () => this.clock.now(),
+    };
+    try {
+      return await withTimeout(tracked, timeoutMs, what, deadline);
+    } catch (error) {
+      if (state.pendingAtDeadline) {
+        /* The late settlement of the abandoned transfer is nobody's business now. */
+        tracked.catch(() => undefined);
+        await this.reopen();
+      }
+      throw error;
+    }
+  }
+
+  /** Close the device - cancelling whatever is still pending on it - and open it again. */
+  private async reopen(): Promise<void> {
+    try {
+      if (this.device.opened) await this.device.close();
+    } catch {
+      /* already closed */
+    }
+    this.claimed = false;
+    this.opened = false;
+    try {
+      await this.open();
+    } catch {
+      /* Left closed: the next transfer reports usb/not-open. */
+    }
   }
 
   private setupPacket(request: number): WebUsbControlSetup {
