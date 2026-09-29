@@ -164,7 +164,9 @@ describe.skipIf(dir === null)('real dump corpus', () => {
     const want = table.dumps[digest];
     if (!want) continue;
 
-    describe(want.label, () => {
+    /* The committed label never names a local file (see the generator); the
+     * local path is added here, at run time, so a failure still names a file. */
+    describe(`${want.label} (${dir === null ? file : path.relative(dir, file)})`, () => {
       it('detects the same firmware profile', async () => {
         const got = await decryptOnce(digest, file);
         expect(got.detection?.best.profile.id ?? null).toBe(want.profile);

@@ -3,7 +3,7 @@
   "dumpCount": 13,
   "dumps": {
     "10b2bd961bd7d4af50c5dfea3c1896e0f8dbb74db9e835fb0056b654b5586bbc": {
-      "label": "BENCH_0E1CA0Z16D19_PRE_HT201_SWAP_2026-08-12.bin",
+      "label": "modern-4x dump 10b2bd961bd7",
       "profile": "modern-4x",
       "ambiguous": false,
       "slots": [
@@ -46,7 +46,7 @@
       ]
     },
     "db4efc84f5338815ef9e4fa8b8242d9d8fdfad7f118d97aaa0180cbbddae4dee": {
-      "label": "Compact Pro Android UQ-AAA/Compact Pro Android UQ-AAA vlab 112543.BIN",
+      "label": "compact-2016 dump db4efc84f533",
       "profile": "compact-2016",
       "ambiguous": false,
       "slots": [
@@ -89,7 +89,7 @@
       ]
     },
     "a042bb7179c7513a94564f52e7050220a499a80c0d2b0c23998dc03b6599fad5": {
-      "label": "Compact Pro FF/Compact Pro FF my iOS 2023 LQ-AAAX/flash_4m_usb_partial_gap_ff.bin",
+      "label": "modern-4x dump a042bb7179c7",
       "profile": "modern-4x",
       "ambiguous": false,
       "slots": [
@@ -132,7 +132,7 @@
       ]
     },
     "42b8fe1232de3452bc7a92207a94ed75aa55ea0e59c0fd427224a1d7fcbbf734": {
-      "label": "Compact Pro FF/Compact Pro FF my iOS LQ-AAAX_decrypted/prompts/Compact Pro FF my iOS LQ-AAAX full spifi image 0x14000000.bin",
+      "label": "modern-4x dump 42b8fe1232de",
       "profile": "modern-4x",
       "ambiguous": false,
       "slots": [
@@ -175,7 +175,7 @@
       ]
     },
     "d7d28caf81dc23db9e09f03f6319c42d9c5db614dd498c8b81afef3697270e19": {
-      "label": "Compact Pro FF/Compact Pro FF my type c Android CQ-AAAX.bin",
+      "label": "modern-4x dump d7d28caf81dc",
       "profile": "modern-4x",
       "ambiguous": false,
       "slots": [
@@ -218,7 +218,7 @@
       ]
     },
     "195f53383fd3bdd33dd867aa53df9350d01d035b50eeed338b4b56c2e447cdbe": {
-      "label": "Compact Pro FF/Compact Pro FF vlab 112543 broken/Seek_pro_FF_LQ-XXX.bin",
+      "label": "compact-2016 dump 195f53383fd3",
       "profile": "compact-2016",
       "ambiguous": false,
       "slots": [
@@ -237,7 +237,7 @@
       ]
     },
     "bc439db99f0108a636113db9e50844ca431795c12f7d1e2327580c752f69727b": {
-      "label": "Compact Pro FF/Compact Pro FF vlab 112543 broken/Seek_pro_FF_fixed_vlab.su.bin",
+      "label": "compact-2016 dump bc439db99f01",
       "profile": "compact-2016",
       "ambiguous": false,
       "slots": [
@@ -280,7 +280,7 @@
       ]
     },
     "9fa38b8d5c37c1d51777bc3d5b03e34d13e8878777eff4854414ec989ddb7329": {
-      "label": "Compact Pro Mar 14 2019 09-18-41 4.9.1.15 84.00 Dump/Compact Pro Mar 14 2019 09-18-41 4.9.1.15 84.00 Dump.bin",
+      "label": "modern-4x dump 9fa38b8d5c37",
       "profile": "modern-4x",
       "ambiguous": false,
       "slots": [
@@ -335,7 +335,7 @@
       ]
     },
     "8aa32da0ee79f7e3da103adaf51007371331be276817cf74b82a1ffb844faccc": {
-      "label": "Compact XR Feb 26 2020 11-23-26 4.8.2.1 99.28 Dump.bin",
+      "label": "modern-4x dump 8aa32da0ee79",
       "profile": "modern-4x",
       "ambiguous": false,
       "slots": [
@@ -378,7 +378,7 @@
       ]
     },
     "31cc2b7e3a5e6cc6eadc938692fe5c9d658d91b34021ad70c28dfda12eb2afdd": {
-      "label": "Compact/Compact Android CW-___.BIN",
+      "label": "modern-4x dump 31cc2b7e3a5e",
       "profile": "modern-4x",
       "ambiguous": false,
       "slots": [
@@ -421,13 +421,13 @@
       ]
     },
     "5eceb781109254d57b84163fa0be90d7ce9a577f54528ee8dbcae9aa38dbadaa": {
-      "label": "HT-201/HT-201-my.bin",
+      "label": "generic dump 5eceb7811092",
       "profile": "generic",
       "ambiguous": true,
       "slots": []
     },
     "3ddf55b0c46531258f96c28c4fcf01e4300eab4402a1841b125ac06f0fb6c4d3": {
-      "label": "Nano/seek nano 300 CQ-ABAX.bin",
+      "label": "modern-4x dump 3ddf55b0c465",
       "profile": "modern-4x",
       "ambiguous": false,
       "slots": [
@@ -482,7 +482,7 @@
       ]
     },
     "7d7d33dfeb6c627005ca326617ba3d671214b6e2c6f8c620f05e27604ae3a7ee": {
-      "label": "spifi_14000000_4m_20260801_185420_CEST/spifi_14000000_4m_20260801_185420_CEST.bin",
+      "label": "modern-4x dump 7d7d33dfeb6c",
       "profile": "modern-4x",
       "ambiguous": false,
       "slots": [

@@ -233,11 +233,14 @@ export const USB_PROBE_TIMEOUT_MS = 1500;
  * refuses to stage past it — but it is in the code, so the bound counts it,
  * and counts step 5 as 128 KiB (512 pages) to go with it.
  *
- * The part is a Winbond W25Q32FV (the firmware's own SPIFI device table: JEDEC
- * EF 40 16, 64 blocks of 64 KiB, 256-byte pages). Its datasheet, rev. J of
- * 2016-06-03, sec.9.6 "AC Electrical Characteristics", MAX column:
+ * The timings are those of a 32 Mbit SPI-NOR with 64 blocks of 64 KiB and
+ * 256-byte pages. The bound takes them from the Winbond W25Q32 datasheet (JEDEC
+ * EF 40 16, one of the ids in the firmware's own SPIFI device table; rev. J of
+ * 2016-06-03, sec.9.6 "AC Electrical Characteristics", MAX column):
  * tBE2 (64 KB block erase) 2,000 ms, tPP (page program) 3 ms, tW (write status
- * register) 15 ms. Typical values are 150 ms, 0.7 ms and 10 ms.
+ * register) 15 ms. Typical values are 150 ms, 0.7 ms and 10 ms. That table is a
+ * list of parts the driver accepts, not a record of the part a camera carries;
+ * the one camera whose SPI-NOR was read on the bench answered JEDEC 01 02 15.
  *
  *   block erases       3 x 2,000 ms                          = 6,000 ms
  *   page programs    514 x     3 ms   (512 image + 2 record) = 1,542 ms
@@ -259,9 +262,9 @@ export const USB_PROBE_TIMEOUT_MS = 1500;
  * has no per-transfer timeout, it is the transport's own timer — so on either
  * host nothing ends a commit sooner than 20 s.
  */
-const W25Q32FV_BLOCK_ERASE_64K_MAX_MS = 2000; /* tBE2 */
-const W25Q32FV_PAGE_PROGRAM_MAX_MS = 3; /* tPP, one 256-byte page */
-const W25Q32FV_WRITE_STATUS_MAX_MS = 15; /* tW */
+const NOR_BLOCK_ERASE_64K_MAX_MS = 2000; /* tBE2 */
+const NOR_PAGE_PROGRAM_MAX_MS = 3; /* tPP, one 256-byte page */
+const NOR_WRITE_STATUS_MAX_MS = 15; /* tW */
 const COMMIT_BLOCK_ERASES = 3;
 const COMMIT_PAGE_PROGRAMS = 512 + 2;
 const COMMIT_STATUS_WRITES = 5;
@@ -269,9 +272,9 @@ const COMMIT_CPU_ALLOWANCE_MS = 500;
 
 /** The longest `CompleteMemoryUpgrade` can take, from the firmware's steps and the datasheet. */
 export const COMMIT_WORST_CASE_MS =
-  COMMIT_BLOCK_ERASES * W25Q32FV_BLOCK_ERASE_64K_MAX_MS +
-  COMMIT_PAGE_PROGRAMS * W25Q32FV_PAGE_PROGRAM_MAX_MS +
-  COMMIT_STATUS_WRITES * W25Q32FV_WRITE_STATUS_MAX_MS +
+  COMMIT_BLOCK_ERASES * NOR_BLOCK_ERASE_64K_MAX_MS +
+  COMMIT_PAGE_PROGRAMS * NOR_PAGE_PROGRAM_MAX_MS +
+  COMMIT_STATUS_WRITES * NOR_WRITE_STATUS_MAX_MS +
   COMMIT_CPU_ALLOWANCE_MS;
 
 /** CompleteMemoryUpgrade erases and programs inside the transfer: 2 x the worst case, rounded up. */

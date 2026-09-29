@@ -1526,10 +1526,13 @@ calling `fw_validate_decrypt_program` and `update_write_boot_config`
 
 Step 4 cannot run on this path. BeginFirmwareUpgrade caps staging at `FLASH_BLOCK_BYTES`,
 and SetFeaturedFirmwareData refuses to stage past it. The bound counts step 4 anyway,
-together with 128 KiB of programming. The part is a W25Q32FV: JEDEC `EF 40 16` in the
-firmware's own SPIFI table, with 64 KiB blocks and 256-byte pages. Its datasheet (rev. J,
-2016-06-03, §9.6 AC Electrical Characteristics, MAX column) gives tBE2 (64 KB block erase)
-2,000 ms, tPP (page program) 3 ms and tW (write status register) 15 ms.
+together with 128 KiB of programming. The timings are those of a 32 Mbit SPI-NOR with
+64 KiB blocks and 256-byte pages, taken from the Winbond W25Q32 datasheet: JEDEC `EF 40 16`
+is one of the ids in the firmware's own SPIFI table. That table lists the parts the driver
+accepts. It does not record the part a camera carries, and the one camera whose SPI-NOR was
+read on the bench answered `01 02 15`. The datasheet (rev. J, 2016-06-03, §9.6 AC Electrical
+Characteristics, MAX column) gives tBE2 (64 KB block erase) 2,000 ms, tPP (page program)
+3 ms and tW (write status register) 15 ms.
 
 | step                                                    | count | max each |        total |
 | ------------------------------------------------------- | ----: | -------: | -----------: |

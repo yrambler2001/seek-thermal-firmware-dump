@@ -72,10 +72,13 @@ for (const file of findDumps(dumpDir).sort()) {
   const result = await decryptDump(bytes, stem, {}, silentReporter);
 
   const entry = {
-    /* A human label only. The sha256 key is the identity; this is so a failure
-     * message can name something a person recognises. Renaming a dump file is
-     * not a behaviour change, so this field is excluded from the assertions. */
-    label: path.relative(dumpDir, file),
+    /* A human label only. The sha256 key is the identity. The label is built
+     * from the result and the digest, never from the file's name: local dump
+     * names can carry a unit's serial or an owner's notes, and this file is
+     * published. The test adds the local path to its own output at run time.
+     * Renaming a dump file is not a behaviour change, so this field is excluded
+     * from the assertions. */
+    label: `${result.detection?.best.profile.id ?? 'no profile'} dump ${digest.slice(0, 12)}`,
     profile: result.detection?.best.profile.id ?? null,
     ambiguous: result.detection?.ambiguous ?? null,
     slots: result.slots.map((s) => ({
@@ -97,10 +100,10 @@ for (const file of findDumps(dumpDir).sort()) {
     before &&
     JSON.stringify({ ...before, label: '' }) !== JSON.stringify({ ...entry, label: '' })
   ) {
-    console.warn(`CHANGED  ${entry.label}  (${digest.slice(0, 12)}…)`);
+    console.warn(`CHANGED  ${path.relative(dumpDir, file)}  (${entry.label})`);
     changed += 1;
   } else if (!before) {
-    console.log(`new      ${entry.label}  (${digest.slice(0, 12)}…)`);
+    console.log(`new      ${path.relative(dumpDir, file)}  (${entry.label})`);
   }
   dumps[digest] = entry;
 }
