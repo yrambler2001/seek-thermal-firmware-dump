@@ -65,6 +65,20 @@ interface Timer {
  */
 export class EmulatedDeviceClock implements DeadlineClock {
   private nowNs = 0;
+  /**
+   * WHEN THE TOOLKIT GAVE UP, until the next record: the due time of the latest
+   * timer the last `advance()` fired, or null.
+   *
+   * A record can reach past a deadline: under the `chrome` host model the device
+   * answers late and nobody cancelled the transfer (webusb-over-usbip.ts
+   * `HostModel`). On a real host the toolkit reacted at its deadline, not at the
+   * late completion, and what it sent next waited on the pipe from THEN. So a timer
+   * started - or a time read - before the next record counts from here, and a
+   * transfer queued behind a late one is timed as Chrome times it. Under `nusb`
+   * the record ends at the deadline and this is the record's own time (to within
+   * one microframe); under `budget` no timer fires and this stays null.
+   */
+  private firedAtNs: number | null = null;
   private readonly timers: Timer[] = [];
   /** Timers started, ever: the harness checks every vendor transfer started one. */
   timersStarted = 0;
@@ -82,7 +96,12 @@ export class EmulatedDeviceClock implements DeadlineClock {
    *  URBs the gated clock does not move, so a host pause ages the camera by nothing. */
   now(): number {
     this.reads++;
-    return this.nowNs / NS_PER_MS;
+    return this.baseNs / NS_PER_MS;
+  }
+
+  /** Where a timer started now counts from (`firedAtNs`). */
+  private get baseNs(): number {
+    return this.firedAtNs ?? this.nowNs;
   }
 
   /** Timers started and neither fired nor cancelled. */
@@ -91,7 +110,7 @@ export class EmulatedDeviceClock implements DeadlineClock {
   }
 
   startTimer(ms: number, onExpire: () => void): () => void {
-    const timer: Timer = { dueNs: this.nowNs + ms * NS_PER_MS, onExpire, done: false };
+    const timer: Timer = { dueNs: this.baseNs + ms * NS_PER_MS, onExpire, done: false };
     this.timersStarted++;
     this.timers.push(timer);
     return () => {
@@ -106,6 +125,7 @@ export class EmulatedDeviceClock implements DeadlineClock {
    */
   advance(ns: number): void {
     if (ns > this.nowNs) this.nowNs = ns;
+    this.firedAtNs = null;
     for (;;) {
       let next: Timer | undefined;
       for (const t of this.timers) {
@@ -114,6 +134,7 @@ export class EmulatedDeviceClock implements DeadlineClock {
       if (next === undefined) return;
       this.remove(next);
       this.timersFired++;
+      this.firedAtNs = Math.max(this.firedAtNs ?? 0, next.dueNs);
       next.onExpire();
     }
   }
@@ -308,6 +329,11 @@ export class DeviceClockLink {
     }
     this.held++;
     this.waiting.set(key, deliver);
+  }
+
+  /** Whether this URB's completion has been reported and its reply not yet delivered. */
+  hasRecord(peerPort: number, seqnum: number): boolean {
+    return this.records.has(`${String(peerPort)}:${String(seqnum)}`);
   }
 
   snapshot(): ClockLinkSnapshot {

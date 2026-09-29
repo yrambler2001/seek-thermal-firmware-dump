@@ -52,6 +52,8 @@ import {
 } from './device-clock.js';
 import {
   DEFAULT_HOST_GIVE_UP_MS,
+  HOST_MODELS,
+  type HostModel,
   UsbIpWebUsbDevice,
   type UsbIpWebUsbOptions,
 } from './webusb-over-usbip.js';
@@ -92,6 +94,26 @@ const wallClockUses = { reads: 0, timers: 0 };
 export const HOST_GIVE_UP_MS = Number(
   process.env.SEEK_EMU_HOST_GIVE_UP_MS ?? String(DEFAULT_HOST_GIVE_UP_MS),
 );
+
+/**
+ * Which real host the emulated host gives a control transfer up like
+ * (`HostModel`, TESTING.md sec.22): `budget` (the default; `HOST_GIVE_UP_MS`),
+ * `nusb` (the CLI: cancelled at exactly the transport's deadline) or `chrome` (the
+ * web app: never cancelled; the transport's own timer is the only deadline).
+ * `attach({ hostModel })` overrides it for one device.
+ */
+export const HOST_MODEL: HostModel = hostModelFrom(process.env.SEEK_EMU_HOST);
+
+function hostModelFrom(value: string | undefined): HostModel {
+  if (value === undefined || value === '') return 'budget';
+  const model = HOST_MODELS.find((m) => m === value);
+  if (model === undefined) {
+    throw new Error(
+      `SEEK_EMU_HOST=${value} is not a host model; use one of ${HOST_MODELS.join(', ')}`,
+    );
+  }
+  return model;
+}
 
 /* ---- locating the emulator ----------------------------------------- */
 
@@ -962,6 +984,7 @@ export class Emulator {
       gone: this.deathController.signal,
       clockLink: this.clockLink,
       hostGiveUpMs: HOST_GIVE_UP_MS,
+      hostModel: options.hostModel ?? HOST_MODEL,
     });
   }
 

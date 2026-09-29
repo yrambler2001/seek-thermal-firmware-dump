@@ -35,6 +35,12 @@
  *    on success, a rejection with nusb's `TransferError` text on a stall.
  *  - THE CONFIGURATION getter throws nusb's "configuration error: device is
  *    not configured" for configuration 0, as node-usb-rs's does.
+ *  - A TRANSFER NUSB GAVE UP. Under the `nusb` host model (TESTING.md sec.22)
+ *    the emulated host cancels a transfer at exactly the deadline the shim
+ *    passed, as nusb does, and the native layer then rejects with nusb's
+ *    `TransferError::Cancelled` text, "transfer was cancelled", behind
+ *    node-usb-rs's "controlTransferIn error: " prefix - which is what
+ *    `fromNodeUsb` turns into `usb/timeout`.
  * ==================================================================== */
 
 import { createRequire } from 'node:module';
@@ -46,6 +52,7 @@ import type {
   WebUsbOutTransferResult,
 } from '@seek-fw/core';
 
+import { UsbIpError } from '../../core/test/emulator/usbip-client.js';
 import type { UsbIpWebUsbDevice } from '../../core/test/emulator/webusb-over-usbip.js';
 import type { NodeUsbDevice } from '../src/node-usb.js';
 
@@ -67,6 +74,34 @@ require('usb');
 const { UsbDevice } = require('usb/index.js') as {
   UsbDevice: { prototype: { controlTransferIn: ShimIn; controlTransferOut: ShimOut } };
 };
+
+/** The emulated host's status for a transfer it gave up (-ETIMEDOUT). */
+const HOST_GAVE_UP = -110;
+
+/**
+ * node-usb-rs's native call, with nusb's text for a transfer nusb itself gave up
+ * (see the file comment). Only under the `nusb` host model is a give-up nusb's.
+ */
+async function nusbTransfer<T>(
+  device: UsbIpWebUsbDevice,
+  direction: 'In' | 'Out',
+  run: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (
+      device.hostModel === 'nusb' &&
+      error instanceof UsbIpError &&
+      error.errno === HOST_GAVE_UP
+    ) {
+      throw new Error(`controlTransfer${direction} error: transfer was cancelled`, {
+        cause: error,
+      });
+    }
+    throw error;
+  }
+}
 
 /** nusb `descriptors::language_id::US_ENGLISH`, which node-usb-rs asks for. */
 const US_ENGLISH = 0x0409;
@@ -201,7 +236,9 @@ export async function nodeUsbOverUsbIp(device: UsbIpWebUsbDevice): Promise<NodeU
       timeout: number,
       length: number,
     ): Promise<Uint8Array> => {
-      const result = await device.controlTransferIn(setup, length, timeout);
+      const result = await nusbTransfer(device, 'In', () =>
+        device.controlTransferIn(setup, length, timeout),
+      );
       if (result.status !== 'ok') throw new Error('controlTransferIn error: endpoint stalled');
       const view = result.data;
       return view === undefined
@@ -213,7 +250,9 @@ export async function nodeUsbOverUsbIp(device: UsbIpWebUsbDevice): Promise<NodeU
       timeout: number,
       data: Uint8Array,
     ): Promise<number> => {
-      const result = await device.controlTransferOut(setup, data, timeout);
+      const result = await nusbTransfer(device, 'Out', () =>
+        device.controlTransferOut(setup, data, timeout),
+      );
       if (result.status !== 'ok') throw new Error('controlTransferOut error: endpoint stalled');
       return result.bytesWritten ?? data.length;
     },

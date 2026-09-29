@@ -521,6 +521,35 @@ export class UsbIpSession {
     }
   }
 
+  /**
+   * Close once every reply whose completion the device-time side channel has
+   * already reported has arrived (TESTING.md sec.22).
+   *
+   * The transport closes the device when its deadline fires on a transfer still
+   * pending, which is how WebUSB ends one. Here that deadline fires the moment the
+   * record of the transfer's completion arrives - the emulator writes it just
+   * before the reply - so the reply is already on the wire: a real host that
+   * cancels at the deadline has that completion (or its own cancel) in hand, and
+   * closing under it would count as a transfer the client abandoned. A transfer
+   * with no record yet is still closed under, and counted, as before.
+   */
+  async closeAfterReported(): Promise<void> {
+    const owed: Promise<void>[] = [];
+    for (const [seq, deliver] of this.waiting) {
+      if (this.clockLink?.hasRecord(this.port, seq) !== true) continue;
+      owed.push(
+        new Promise<void>((resolve) => {
+          this.waiting.set(seq, (reply) => {
+            deliver(reply);
+            resolve();
+          });
+        }),
+      );
+    }
+    await Promise.all(owed);
+    this.close();
+  }
+
   close(): void {
     this.stopped = true;
     /* A transfer still waiting here was ABANDONED: its caller had already given up

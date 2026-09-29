@@ -103,6 +103,10 @@ export const DEFAULT_URB_TIMEOUT_MS = 30_000;
  */
 const STANDARD_REQUEST_DEADLINE_MS = USB_TIMEOUT_MS;
 
+/** The status the emulated host completes a transfer with when it gave it up
+ *  (-ETIMEDOUT, FW-V1 `usb_host.py` THE HOST'S DEADLINE). */
+const HOST_GAVE_UP = -110;
+
 /**
  * How much of the camera's time the EMULATED host polls a transfer the firmware
  * never completes before it gives the transfer up (-110), when that is less than
@@ -126,8 +130,71 @@ const STANDARD_REQUEST_DEADLINE_MS = USB_TIMEOUT_MS;
  *
  * Either way the result is a function of the URB sequence alone, never of machine
  * load. `SEEK_EMU_HOST_GIVE_UP_MS` overrides it (`Infinity` for full fidelity).
+ * That is the `budget` host model; `nusb` and `chrome` (below) are the two real
+ * hosts, each given up exactly as its own source says.
  */
 export const DEFAULT_HOST_GIVE_UP_MS = 200;
+
+/**
+ * WHICH REAL HOST THE EMULATED HOST GIVES A CONTROL TRANSFER UP LIKE (TESTING.md
+ * sec.22). The switch is `SEEK_EMU_HOST` (harness.ts) or `attach({ hostModel })`.
+ *
+ *  - `budget` (the default): `min(the transport's deadline, hostGiveUpMs)`, 200 ms
+ *    unless overridden - the cost decision of sec.19.3, not a real host.
+ *  - `nusb`: the CLI. node-usb 3.1.0's shim passes the transport's own deadline to
+ *    node-usb-rs (`nativeControlTransferIn(setup, timeout, length)`), which hands it
+ *    to nusb 0.2.7 as `Duration::from_millis(timeout)`; nusb cancels the transfer at
+ *    exactly that moment - on Linux its own timer and USBDEVFS_DISCARDURB
+ *    (platform/linux_usbfs/device.rs `handle_timeouts`), on macOS IOKit's
+ *    `DeviceRequestAsyncTO` with `noDataTimeout = completionTimeout = timeout`
+ *    (platform/macos_iokit/device.rs), on Windows its own timer and CancelIoEx
+ *    after it turns WinUSB's default control timeout off. No clear-halt, no reset:
+ *    the next request is a new SETUP, which USB 2.0 sec.8.5.3 says aborts whatever
+ *    the device was still doing for the old one. So: the emulated host gives the
+ *    transfer up at exactly the transport's deadline, and moves on.
+ *  - `chrome`: the web app. Blink passes a timeout of 0 for every WebUSB transfer
+ *    (third_party/blink/renderer/modules/webusb/usb_device.cc,
+ *    `ControlTransferIn(..., length, 0, ...)`), and 0 is "none" underneath: Linux
+ *    usbfs (`UsbDeviceHandleUsbfs::SetUpTimeoutCallback` returns at once for 0, and
+ *    an async URB has no kernel timeout) and macOS (libusb: no timer for 0, and
+ *    `DeviceRequestAsyncTO` with both timeouts 0 - IOUSBHost: "If 0, the request
+ *    will never timeout"). So the host NEVER gives up: the transport's own timer is
+ *    the only deadline, the transfer stays on the pipe after it fires, and the next
+ *    control transfer waits behind it (USB 2.0 sec.5.5.5: the host advances to the
+ *    next control transfer only after the Status stage). The emulated host
+ *    therefore polls until the device answers, bounded only by
+ *    `CHROME_HOST_HORIZON_MS` of the camera's time so a transfer the firmware never
+ *    completes cannot run for ever; reaching it fails the row
+ *    (`HarnessFidelityError`), because what Chrome does then - hold EP0 until
+ *    `close()` - is not something this harness measures. (Chrome on WINDOWS is
+ *    different: WinUSB's own default timeout on the control pipe applies; not
+ *    modelled.)
+ */
+export type HostModel = 'budget' | 'nusb' | 'chrome';
+
+export const HOST_MODELS: readonly HostModel[] = ['budget', 'nusb', 'chrome'];
+
+/**
+ * The emulated host's cap on one transfer under the `chrome` model, in ms of the
+ * camera's time: three times the longest deadline the toolkit ever sets (the
+ * 20 s flash commit), so any transfer the device completes late is seen to
+ * complete, and one it never completes ends the row instead of the machine.
+ */
+export const CHROME_HOST_HORIZON_MS = 60_000;
+
+/** One control transfer as the adapter saw it, on the camera's clock (`onTransfer`). */
+export interface TransferTrace {
+  readonly bmRequestType: number;
+  readonly bRequest: number;
+  /** The transport's deadline for it (the adapter's own for a standard request). */
+  readonly timeoutMs: number;
+  /** What the emulated host was told (`hostModel`). */
+  readonly hostDeadlineMs: number;
+  /** The camera's time when it was submitted and when its completion was delivered. */
+  readonly startNs: number;
+  readonly endNs: number;
+  readonly outcome: 'ok' | 'stall' | 'host-gave-up' | 'error';
+}
 
 /** How long `open()` keeps trying to re-import after a `close()`. */
 export const REOPEN_TIMEOUT_MS = 20_000;
@@ -223,8 +290,12 @@ export interface UsbIpWebUsbOptions {
    * `deadlineClock` is the clock the transport must time its deadlines on.
    */
   readonly clockLink?: DeviceClockLink;
-  /** With `clockLink`: `DEFAULT_HOST_GIVE_UP_MS`'s value for this device. */
+  /** With `clockLink`: `DEFAULT_HOST_GIVE_UP_MS`'s value for this device (`budget`). */
   readonly hostGiveUpMs?: number;
+  /** With `clockLink`: which real host the emulated host gives transfers up like. */
+  readonly hostModel?: HostModel;
+  /** Called once per control transfer, when it has ended (with `clockLink`). */
+  readonly onTransfer?: (trace: TransferTrace) => void;
 }
 
 /** Throws at once when `gone` has been aborted, carrying its reason. */
@@ -252,6 +323,9 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
   private readonly gone: AbortSignal | undefined;
   private readonly clockLink: DeviceClockLink | undefined;
   private readonly hostGiveUpMs: number;
+  /** Which real host the emulated host gives transfers up like (`HostModel`). */
+  readonly hostModel: HostModel;
+  private readonly onTransfer: ((trace: TransferTrace) => void) | undefined;
   /** bNumInterfaces of the active configuration, from the import record. USB 2.0
    *  sec.9.6.5: bInterfaceNumber is the zero-based index into that array, so the
    *  interfaces that exist are exactly 0 .. interfaceCount-1. */
@@ -278,6 +352,8 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     gone: AbortSignal | undefined,
     clockLink: DeviceClockLink | undefined,
     hostGiveUpMs: number,
+    hostModel: HostModel,
+    onTransfer: ((trace: TransferTrace) => void) | undefined,
   ) {
     this.session = session;
     this.timeoutMs = timeoutMs;
@@ -286,6 +362,8 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     this.gone = gone;
     this.clockLink = clockLink;
     this.hostGiveUpMs = hostGiveUpMs;
+    this.hostModel = hostModel;
+    this.onTransfer = onTransfer;
     gone?.addEventListener(
       'abort',
       () => {
@@ -336,6 +414,8 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
       options.gone,
       options.clockLink,
       options.hostGiveUpMs ?? DEFAULT_HOST_GIVE_UP_MS,
+      options.hostModel ?? 'budget',
+      options.onTransfer,
     );
     if (options.gone?.aborted === true) {
       session.close();
@@ -367,13 +447,9 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     wIndex: number,
     length: number,
   ): Promise<Uint8Array> {
-    await this.clockLink?.useDeadline(this.hostDeadline(STANDARD_REQUEST_DEADLINE_MS));
-    return this.session.controlTransfer(
-      { bmRequestType: STANDARD_IN_DEVICE, bRequest, wValue, wIndex },
-      null,
-      length,
-      this.timeoutMs,
-    );
+    const setup = { bmRequestType: STANDARD_IN_DEVICE, bRequest, wValue, wIndex };
+    const traced = await this.beginTransfer(STANDARD_REQUEST_DEADLINE_MS, setup, false);
+    return traced(() => this.session.controlTransfer(setup, null, length, this.timeoutMs));
   }
 
   private async standardOut(
@@ -382,13 +458,9 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     wValue: number,
     wIndex: number,
   ): Promise<void> {
-    await this.clockLink?.useDeadline(this.hostDeadline(STANDARD_REQUEST_DEADLINE_MS));
-    await this.session.controlTransfer(
-      { bmRequestType, bRequest, wValue, wIndex },
-      null,
-      0,
-      this.timeoutMs,
-    );
+    const setup = { bmRequestType, bRequest, wValue, wIndex };
+    const traced = await this.beginTransfer(STANDARD_REQUEST_DEADLINE_MS, setup, false);
+    await traced(() => this.session.controlTransfer(setup, null, 0, this.timeoutMs));
   }
 
   /** WebUSB "check if the device is configured": opened, and a configuration active. */
@@ -559,12 +631,13 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
 
   /** Ends the session. As WebUSB's close() does, every claimed interface is released
    *  with it — host-side state, no packet — and a reopen starts with none claimed. */
-  close(): Promise<void> {
-    if (!this.opened) return Promise.resolve();
+  async close(): Promise<void> {
+    if (!this.opened) return;
     this.opened = false;
     this.claimed.clear();
-    this.session.close();
-    return Promise.resolve();
+    /* A reply the side channel has already reported is on the wire; it is read
+     * before the session goes (UsbIpSession.closeAfterReported, TESTING.md sec.22). */
+    await this.session.closeAfterReported();
   }
 
   /** A real SET_CONFIGURATION (bmRequestType 0x00), as WebUSB and nusb both send. The
@@ -650,32 +723,83 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     );
   }
 
-  /** The emulated host's deadline for a transfer the transport gives `timeoutMs`. */
+  /** The emulated host's deadline for a transfer the transport gives `timeoutMs` (`HostModel`). */
   private hostDeadline(timeoutMs: number): number {
-    return Math.min(timeoutMs, this.hostGiveUpMs);
+    switch (this.hostModel) {
+      case 'nusb':
+        return timeoutMs;
+      case 'chrome':
+        return Math.max(timeoutMs, CHROME_HOST_HORIZON_MS);
+      case 'budget':
+        return Math.min(timeoutMs, this.hostGiveUpMs);
+    }
   }
 
   /**
-   * Before a vendor transfer: note the clock's timer count (the transport starts its
-   * deadline timer right after this call's synchronous part), and hand the
-   * transport's deadline to the emulator's host. Returns the check to run after.
+   * Before a transfer: hand its deadline to the emulator's host and note the
+   * clock's timer count (a vendor transfer's transport starts its deadline timer
+   * right after this call's synchronous part). Returns the wrapper that runs the
+   * transfer, traces it and checks the timer after.
    */
-  private async beginTransfer(timeoutMs: number | undefined): Promise<() => void> {
+  private async beginTransfer(
+    timeoutMs: number | undefined,
+    setup: { readonly bmRequestType: number; readonly bRequest: number },
+    vendor: boolean,
+  ): Promise<<T>(run: () => Promise<T>) => Promise<T>> {
     const clock = this.clockLink?.clock;
     const before = clock?.timersStarted ?? 0;
-    if (this.clockLink) {
-      if (timeoutMs === undefined) {
-        throw new HarnessFidelityError(
-          'a vendor transfer came without its deadline: WebUsbTransport passes one with every ' +
-            'call, and the emulated host must give the transfer up where it does',
-        );
-      }
-      await this.clockLink.useDeadline(this.hostDeadline(timeoutMs));
+    if (this.clockLink && timeoutMs === undefined) {
+      throw new HarnessFidelityError(
+        'a vendor transfer came without its deadline: WebUsbTransport passes one with every ' +
+          'call, and the emulated host must give the transfer up where it does',
+      );
     }
-    return () => {
-      /* A transport built without `clock: device.deadlineClock` started its timer on
-       * the wall clock; the ledger counts it and the audit fails the row. */
-      if (clock?.timersStarted === before) this.ledger.wallClockTransfers++;
+    const deadline = timeoutMs ?? 0;
+    /* The adapter's own standard requests are the OS's (its descriptor reads at
+     * enumeration, under the kernel's own 5 s), whatever the application is. */
+    const hostDeadlineMs =
+      vendor || this.hostModel === 'budget' ? this.hostDeadline(deadline) : deadline;
+    await this.clockLink?.useDeadline(hostDeadlineMs);
+    const startNs = clock?.timeNs ?? 0;
+    return async <T>(run: () => Promise<T>): Promise<T> => {
+      let outcome: TransferTrace['outcome'] = 'error';
+      try {
+        const value = await run();
+        outcome = 'ok';
+        return value;
+      } catch (error) {
+        if (error instanceof UsbIpStall) {
+          outcome = 'stall';
+        } else if (error instanceof UsbIpError && error.errno === HOST_GAVE_UP) {
+          outcome = 'host-gave-up';
+          /* Chrome never gives a transfer up; the horizon only keeps a transfer the
+           * firmware never completes from running for ever (`HostModel`). */
+          if (this.hostModel === 'chrome') {
+            throw new HarnessFidelityError(
+              `control ${String(setup.bRequest)} did not complete within ` +
+                `${String(hostDeadlineMs)} ms of the camera's time. Chrome would still be ` +
+                'polling it and would hold EP0 until close(); the chrome host model does not ' +
+                'measure that (TESTING.md sec.22).',
+            );
+          }
+        }
+        throw error;
+      } finally {
+        if (clock) {
+          this.onTransfer?.({
+            bmRequestType: setup.bmRequestType,
+            bRequest: setup.bRequest,
+            timeoutMs: deadline,
+            hostDeadlineMs,
+            startNs,
+            endNs: clock.timeNs,
+            outcome,
+          });
+          /* A transport built without `clock: device.deadlineClock` started its timer
+           * on the wall clock; the ledger counts it and the audit fails the row. */
+          if (vendor && clock.timersStarted === before) this.ledger.wallClockTransfers++;
+        }
+      }
     };
   }
 
@@ -686,25 +810,21 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
   ): Promise<WebUsbInTransferResult> {
     throwIfGone(this.gone, 'controlTransferIn');
     this.assertTransferAllowed(setup, 'controlTransferIn');
-    const done = await this.beginTransfer(timeoutMs);
+    const wire = {
+      bmRequestType: requestType(setup, true),
+      bRequest: setup.request,
+      wValue: setup.value,
+      wIndex: setup.index,
+    };
+    const traced = await this.beginTransfer(timeoutMs, wire, true);
     try {
-      const data = await this.session.controlTransfer(
-        {
-          bmRequestType: requestType(setup, true),
-          bRequest: setup.request,
-          wValue: setup.value,
-          wIndex: setup.index,
-        },
-        null,
-        length,
-        this.timeoutMs,
+      const data = await traced(() =>
+        this.session.controlTransfer(wire, null, length, this.timeoutMs),
       );
       return { status: 'ok', data: new DataView(data.buffer, data.byteOffset, data.byteLength) };
     } catch (error) {
       if (error instanceof UsbIpStall) return { status: 'stall' };
       throw error;
-    } finally {
-      done();
     }
   }
 
@@ -716,25 +836,19 @@ export class UsbIpWebUsbDevice implements WebUsbDevice {
     throwIfGone(this.gone, 'controlTransferOut');
     this.assertTransferAllowed(setup, 'controlTransferOut');
     const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    const done = await this.beginTransfer(timeoutMs);
+    const wire = {
+      bmRequestType: requestType(setup, false),
+      bRequest: setup.request,
+      wValue: setup.value,
+      wIndex: setup.index,
+    };
+    const traced = await this.beginTransfer(timeoutMs, wire, true);
     try {
-      await this.session.controlTransfer(
-        {
-          bmRequestType: requestType(setup, false),
-          bRequest: setup.request,
-          wValue: setup.value,
-          wIndex: setup.index,
-        },
-        bytes,
-        0,
-        this.timeoutMs,
-      );
+      await traced(() => this.session.controlTransfer(wire, bytes, 0, this.timeoutMs));
       return { status: 'ok', bytesWritten: bytes.length };
     } catch (error) {
       if (error instanceof UsbIpStall) return { status: 'stall' };
       throw error;
-    } finally {
-      done();
     }
   }
 }
