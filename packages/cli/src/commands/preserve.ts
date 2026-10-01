@@ -50,7 +50,6 @@ import {
   type PreserveRunState,
   type PreserveStepId,
   type SessionOpener,
-  V1_2014_PATCH_SITES,
 } from '@seek-fw/core';
 import type { CommandContext, CommandResult } from '../cli.js';
 import { CliError } from '../errors.js';
@@ -64,6 +63,34 @@ import { openSession, type Session } from './shared.js';
 
 /** The artifacts land here when --out is not given. */
 const DEFAULT_OUT = 'preserve-run';
+
+/** The staged-form line of the plan print, in plain words. */
+function describeStagedForm(form: 'plain' | 'xor-ks0' | 'xor-ks0-ksD'): string {
+  switch (form) {
+    case 'plain':
+      return 'plain — the 2014 banks hold the image as stored; the wire payload is the conjugated capture';
+    case 'xor-ks0':
+      return 'staged = patched plain XOR keystream(key block 0) — the 2016 two-keystream cipher';
+    case 'xor-ks0-ksD':
+      return 'staged = patched plain XOR keystream(block 0) XOR keystream(block 1) — the FF build two-stream form';
+  }
+}
+
+/** The drain line of the plan print: what this build's drain may promise. */
+function describeCapability(capability: {
+  wholePart: boolean;
+  losslessReadUnit: number;
+  maxPerArmReach?: number;
+  note: string;
+}): string {
+  if (capability.wholePart) {
+    return (
+      `whole part: yes — one widened-window arm; lossless read unit ` +
+      `${String(capability.losslessReadUnit)} B`
+    );
+  }
+  return `REFUSED on this build — ${capability.note}`;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -164,20 +191,24 @@ async function freshCommand(ctx: CommandContext, outDir: string): Promise<Comman
 
   say('');
   say(`preserve plan — ${fileName}`);
+  say(`  build              ${patch.label} (${patch.buildId}, family ${patch.family})`);
   say(`  image version      ${created.state.expectedVersion} (${String(image.length)} B)`);
-  say(`  patch sites        ${String(V1_2014_PATCH_SITES.length)} instructions`);
-  for (const site of V1_2014_PATCH_SITES) {
+  say(`  patch sites        ${String(patch.sites.length)} instruction edit(s)`);
+  for (const site of patch.sites) {
     say(`    ${hexUp(site.offset)}  ${site.what}`);
   }
   say(`  rebalance word     ${hexUp(patch.rebalanceWord)} at 0x00000238`);
   say(
     `  bytes that move    ${String(patch.diffOffsets.length)} on the part, all inside the ` +
-      'active bank',
+      (patch.route === 'recovery-only' ? 'recovery bank' : 'active bank'),
   );
+  say(`  staged form        ${describeStagedForm(patch.stagedForm)}`);
+  if (patch.routeNote !== null) say(`  commit route       ${patch.routeNote}`);
+  say(`  drain              ${describeCapability(patch.capability)}`);
   say('  steps              backup -> patch -> commit -> drain -> restore -> verify');
   say('  run directory      each step checkpoints there; the backup (and the standard dump');
   say('                     archive built from it) is on disk BEFORE anything is written');
-  say('  RISK               commit and restore write the ACTIVE boot slot. On hardware an');
+  say('  RISK               commit and restore write a BOOT slot. On hardware an');
   say('                     interrupted write there has no bootable fallback (an SPI');
   say('                     programmer is the only way back).');
   say(`  interrupted?       seek-fw preserve --resume ${outDir}`);
@@ -185,8 +216,10 @@ async function freshCommand(ctx: CommandContext, outDir: string): Promise<Comman
 
   if (!ctx.options.yes) {
     const confirmed = await ctx.io.confirm(
-      `Back this camera up, patch the ACTIVE slot in place, dump the whole part, and restore ` +
-        `it (${created.state.expectedVersion})? [y/N] `,
+      `Back this camera up, patch the ${patch.route === 'recovery-only' ? 'RECOVERY' : 'ACTIVE'} ` +
+        `slot in place, dump the whole part${
+          patch.capability.wholePart ? '' : ' (NOT on this build — the drain will refuse)'
+        }, and restore it (${created.state.expectedVersion})? [y/N] `,
     );
     if (!confirmed) {
       throw new CliError('aborted at the confirmation prompt — nothing was written', {
@@ -303,8 +336,12 @@ async function resumeCommand(ctx: CommandContext, runDir: string): Promise<Comma
   }
 
   /* The image (already sha-checked above) is needed only by the steps that
-   * rebuild the patch; the others resume without it. */
-  const needsPlain = start === 'patch' || start === 'commit';
+   * rebuild the patch — and by the restore of a cipher-family run, whose
+   * staged-form restore payload is derived from the factory plaintext. */
+  const needsPlain =
+    start === 'patch' ||
+    start === 'commit' ||
+    (start === 'restore' && state.stagedForm !== undefined && state.stagedForm !== 'plain');
   if (image === null && needsPlain) {
     throw new CliError(
       `resuming at ${start} needs the factory plaintext the patch derives from — pass the ` +
@@ -505,6 +542,13 @@ async function printStateCommand(ctx: CommandContext, runDir: string): Promise<C
     say(`  created            ${state.createdAt}`);
     say(`  image sha256       ${state.imageSha256}`);
     say(`  expected version   ${state.expectedVersion}`);
+    say(
+      `  build              ${state.buildId ?? state.buildFamily} (family ` +
+        `${state.buildFamily}${state.stagedForm === undefined ? '' : `, staged ${state.stagedForm}`})`,
+    );
+    if (state.capability !== undefined) {
+      say(`  drain              ${describeCapability(state.capability)}`);
+    }
     say(`  next step          ${state.nextStep}`);
     for (const id of PRESERVE_STEP_IDS) {
       const record = state.steps[id];
