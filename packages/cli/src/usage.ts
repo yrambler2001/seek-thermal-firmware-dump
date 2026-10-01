@@ -60,9 +60,18 @@ flash also takes
   --yes                  skip the interactive confirmation
   --no-rescue-dump       skip the full-flash backup taken before writing (not recommended)
 
+preserve also takes
+  --resume <dir>         continue the run whose state lives in <dir> (from its next step)
+  --from-step <id>       with --resume: start at a chosen step (backup patch commit drain
+                         restore verify); refused when the step's prerequisites are missing
+  --print-state <dir>    print a run's state, its next step, and whether the checkpoint
+                         files still match what was recorded; touches no camera
+
 Examples
   seek-fw dump --out ./my-camera
   seek-fw preserve plain-1.3.0.0.bin --out ./preserve-run --yes
+  seek-fw preserve --resume ./preserve-run
+  seek-fw preserve --print-state ./preserve-run
   seek-fw info --json | jq .firmware
   seek-fw decrypt flash_4m.bin --out ./decrypted
   seek-fw flash image-KeyA-....-KeyB-....bin --out ./rescue
@@ -141,31 +150,61 @@ it contains, exactly as \`seek-fw dump\` wrote it. Refused otherwise.
 
 Usage
   seek-fw preserve <plain-image> [--out <dir>] [--yes] [options]
+  seek-fw preserve --resume <dir> [plain-image] [--from-step <id>] [--yes]
+  seek-fw preserve --print-state <dir>
 
-The four phases for a v1 locked-line camera (Compact 1.0.0.0 / 1.2.0.0 /
-1.3.0.0): P1 backs up the 31 reachable windows (read-only), P2 names the
-ACTIVE boot slot from the boot-config record and patches it IN PLACE — the
-reader-window widening and cursor fix, conjugated into the slot's ciphertext
-so the decrypted image changes by exactly the ten enumerated bytes — P3 resets
-the camera, drains the whole 4 MiB through the widened window and post-
-processes the dump back to the camera's original content, and P4 restores the
-original bank and re-reads the part to prove it.
+The pipeline runs as SIX RESUMABLE STEPS, checkpointed after every one, for a
+v1 locked-line camera (Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0):
+
+  backup   read the 31 windows a stock camera can serve (read-only), name the
+           ACTIVE boot slot, capture its bank, and write the backup AND the
+           standard dump archive (decrypted slots, reports, manifest) built
+           from it. The user's pre-flash dump of every reachable region —
+           on disk before anything write-shaped can run.
+  patch    offline, no device: derive the in-place patch (the reader-window
+           widening and cursor fix, conjugated later into the slot's
+           ciphertext so exactly the ten enumerated bytes change).
+  commit   verify the bank against the backup, read the bank back (a commit
+           that already landed is never replayed), stage image-length-only,
+           and commit — on a session that never resets.
+  drain    the reset that boots the patched image (with its retry ladder for
+           the ~10 s of silence a reboot costs), then the whole 4 MiB through
+           the widened window, drained FIRST on its own single arm.
+  restore  stage the original bank content back, verbatim, and reset.
+  verify   a fresh boot re-reads the 31 windows: 0 differing bytes proves the
+           camera's flash came back byte-identical.
 
 THE IMAGE ARGUMENT is the DECRYPTED factory plaintext of the build the camera
 runs (the corpus image, or your own decrypt). The expected firmware version is
 derived from it; the camera must report that build before anything is sent.
+--resume needs it only when it resumes at patch or commit.
 
-THE RISK, PLAINLY: P2 and P4 write the ACTIVE boot slot. On real hardware an
-interrupted write there has no bootable fallback — a power loss mid-commit
-needs an SPI programmer. P1's backup and P4's restore are the mitigation, not
-a guarantee. Run on mains power, keep the backup.
+THE RISK, PLAINLY: commit and restore write the ACTIVE boot slot. On real
+hardware an interrupted write there has no bootable fallback — a power loss
+mid-commit needs an SPI programmer. The backup checkpoint (written before the
+first write) and the restore are the mitigation, not a guarantee. Run on mains
+power, keep the run directory.
 
   --yes                  skip the confirmation (required when stdin is not a tty)
+  --resume <dir>         continue the run in <dir> from its next step
+  --from-step <id>       with --resume: start at a chosen step. Refused when the
+                         step's prerequisites are missing from the run directory
+                         (commit without the backup files; drain before commit);
+                         warns loudly when jumping past the commit, because the
+                         camera is then expected to be in the patched state.
+  --print-state <dir>    print the run's state, its next step, and whether the
+                         checkpoint files still match what was recorded.
 
-Artifacts written under --out: preserve_backup_windows.bin,
-preserve_bank_capture.bin, preserve_dump_postwrite.bin (the patched part),
-preserve_dump_original.bin (the delivered, original-content image) and
-preserve_run.json (phase records, sha256 of everything).
+Interrupted runs: Ctrl-C stops at the next safe point, leaves the previous
+checkpoint standing, and exits 130. Re-run the same --resume command to
+continue; the interrupted step starts over.
+
+Artifacts in the run directory: preserve_run.json (the state, rewritten after
+every step), preserve_backup_windows.bin, preserve_bank_capture.bin,
+preserve_patch_plain_patched.bin, preserve_dump_postwrite.bin (the patched
+part), preserve_dump_original.bin (the delivered, original-content image),
+manifest.json and README.md (the backup's dump archive) plus the decrypted
+slots under decrypted/.
 `,
   profiles: `seek-fw profiles — list the supported firmware families
 

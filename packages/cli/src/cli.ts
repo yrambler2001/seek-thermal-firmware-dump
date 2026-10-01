@@ -72,6 +72,13 @@ export interface GlobalOptions {
   readonly colorFlag: boolean;
   readonly yes: boolean;
   readonly rescueDump: boolean;
+  /* ---- preserve only; every other command ignores them ------------------- */
+  /** `--resume <dir>`: continue the run whose state lives in that directory. */
+  readonly resume: string | null;
+  /** `--from-step <id>`: with --resume, start at a chosen step. */
+  readonly fromStep: string | null;
+  /** `--print-state <dir>`: print a run's state and next step; touch no device. */
+  readonly printState: string | null;
 }
 
 export type ParsedCli =
@@ -158,6 +165,9 @@ export function parseCli(argv: readonly string[]): ParsedCli {
         yes: { type: 'boolean', default: false },
         'rescue-dump': { type: 'boolean', default: true },
         probe: { type: 'boolean', default: true },
+        resume: { type: 'string' },
+        'from-step': { type: 'string' },
+        'print-state': { type: 'string' },
         help: { type: 'boolean', short: 'h', default: false },
         version: { type: 'boolean', short: 'V', default: false },
       },
@@ -182,7 +192,17 @@ export function parseCli(argv: readonly string[]): ParsedCli {
   if (values.help) return { kind: 'help', command: commandWord, json: values.json };
 
   const takesFile = FILE_COMMANDS.has(commandWord);
-  if (takesFile && rest.length === 0) {
+  /* `preserve` is the one file command whose positional is conditional: a
+   * `--print-state` run touches no image at all, and a `--resume` run needs
+   * it only when it resumes at a step that rebuilds the patch. The command
+   * itself refuses with the reason when the image it was given is not enough. */
+  const needsFile =
+    takesFile &&
+    !(
+      commandWord === 'preserve' &&
+      (values['print-state'] !== undefined || values.resume !== undefined)
+    );
+  if (needsFile && rest.length === 0) {
     throw new UsageError(`${commandWord} needs a file argument`);
   }
   if (rest.length > (takesFile ? 1 : 0)) {
@@ -227,6 +247,9 @@ export function parseCli(argv: readonly string[]): ParsedCli {
     colorFlag: values.color,
     yes: values.yes,
     rescueDump: values['rescue-dump'],
+    resume: values.resume ?? null,
+    fromStep: values['from-step'] ?? null,
+    printState: values['print-state'] ?? null,
   };
 
   if (options.quiet && options.verbose) {
