@@ -436,6 +436,8 @@ export class InfrastructureDefect extends Error {
 }
 
 export interface StartOptions {
+  /** The corpus entry to boot — or, when `flashOverride` is given, just the
+   *  label this process is audited under. */
   readonly entryId: string;
   /** `--fill-erased SEED`; omit to serve the vendored bytes unchanged. */
   readonly fillSeed?: number;
@@ -445,6 +447,21 @@ export interface StartOptions {
   /** How long to wait for the READY line. Boots are ~1-20 s; be generous. */
   readonly readyTimeoutMs?: number;
   readonly urbTimeoutMs?: number;
+  /* ---- preservation-pipeline additions (2026-09-24, additive) ----
+   * The four phases need boots this suite's own rows never make: an image-only
+   * corpus entry spliced onto a DONOR dump (the v1 chimeras), the donor's JEDEC
+   * id, a longer per-transfer wait budget so a wire-81 commit's erase+program+
+   * verify URB outlives the flash work, and a `--flash` override that boots a
+   * SPECIFIC part image (the post-commit state) instead of the vendored one. */
+  /** `--donor ID` — the corpus entry an image-only boot is spliced onto. */
+  readonly donor?: string;
+  /** `--jedec <id>` — the emulated NOR's JEDEC identity. */
+  readonly jedec?: string;
+  /** `--host-wait-budget <steps>` — per-transfer guest-step budget. */
+  readonly hostWaitBudget?: number;
+  /** `--flash <path>` — boot this 4 MiB part image instead of the vendored one.
+   *  Mutually exclusive with `entryId` by the emulator's own rules. */
+  readonly flashOverride?: string;
 }
 
 /** How long a SIGTERM'd emulator gets to join its threads and print its ledger. A
@@ -827,8 +844,9 @@ export class Emulator {
       String(port),
       '--usbip-bind',
       '127.0.0.1',
-      '--corpus-entry',
-      options.entryId,
+      ...(options.flashOverride !== undefined
+        ? (['--flash', options.flashOverride] as const)
+        : (['--corpus-entry', options.entryId] as const)),
       /* NO SENSOR.
        *
        * `--usbip` normally attaches the SGPIO sensor feed, because a client may
@@ -854,6 +872,15 @@ export class Emulator {
       argv.push('--fill-erased-scope', options.fillScope ?? 'safe');
     }
     if (options.flashOut !== undefined) argv.push('--flash-out', options.flashOut);
+    /* The preservation pipeline's boots. Each flag exists on the FW-V1 emulator
+     * (seekemu/cli.py); when the pointed-at emulator predates one, the spawn
+     * fails on the unknown argument and the error says so — there is no silent
+     * fallback onto a boot the caller did not describe. */
+    if (options.donor !== undefined) argv.push('--donor', options.donor);
+    if (options.jedec !== undefined) argv.push('--jedec', options.jedec);
+    if (options.hostWaitBudget !== undefined) {
+      argv.push('--host-wait-budget', String(options.hostWaitBudget));
+    }
 
     const child = spawn(pythonFor(dir), argv, {
       cwd: dir,
@@ -1003,7 +1030,7 @@ export class Emulator {
    * that needs it fails the audit — it did not stop, so nobody knows what it
    * delivered.
    */
-  async stop(): Promise<void> {
+  async stop(graceMs: number = STOP_GRACE_MS): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
     live.delete(this.child);
@@ -1030,7 +1057,7 @@ export class Emulator {
     const timer = setTimeout(() => {
       this.killed = true;
       this.child.kill('SIGKILL');
-    }, STOP_GRACE_MS);
+    }, graceMs);
     await this.closed;
     clearTimeout(timer);
     this.clockLink.close();

@@ -201,6 +201,74 @@ never touches the device.
 Writing lives on its own page, [Firmware and flashing](#firmware-and-flashing), with its own listed
 command set. Nothing in the dump view reaches it.
 
+## The v1 full-flash preservation pipeline
+
+`packages/core/src/preservation/` and `seek-fw preserve <image>` implement a full-flash
+preservation pipeline for the v1 "locked line" cameras — Compact 1.0.0.0, 1.2.0.0 and 1.3.0.0
+(derived and wire-proven against the FW-V1 emulator; FW-V1 docs 33 sec. 11.7 and 34). These are
+the builds whose write path the profiles refuse, and that refusal is still right for the general
+`flash` command; this pipeline is a separate, explicit, operator-invoked route that exists because
+in-place preservation cannot be done read-only.
+
+### What it does — the four phases
+
+| Phase                 | What happens                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | What it touches            |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| **P1 backup**         | Reads all 31 windows a stock camera can serve (BeginFirmwareUpgrade modes 3..9 with the 18-byte token, 0x0A..0x21 plain; 0x14010000..0x141FFFFF, 64 KiB each) and refuses to continue if any window comes back short.                                                                                                                                                                                                                                                             | read-only                  |
+| **P2 in-place patch** | Reads the 28-byte boot-config record (mode 3), names the ACTIVE slot (a blank `cfg[0]` boots bank A 0x14050000 — the bootloader's fixed A→B→recovery validate order), captures that bank and verifies it against the builder's expected bytes BEFORE anything is written, then commits the patch into the active slot via the raw types-7 path (`0x52` mode 7 + token, `0x50` staging in 64-B chunks, `0x51` commit with the u16 sum). No boot-config write, no other-slot write. | **writes the active slot** |
+| **P3 full dump**      | Sends the wire-89 reset, which boots the PATCHED image; after re-enumeration it probes the widened mode-2 window (the patch turns the reader's 64 KiB window into the whole 4 MiB part) and drains all 4 MiB at 512 B per call. The DELIVERED dump is post-processed: the active bank's 64 KiB is replaced from the P1 backup, so the file you keep is the camera's original flash content, byte-clean.                                                                           | read-only after the reset  |
+| **P4 restore**        | Commits the ORIGINAL bank content (the P1 capture, staged verbatim — the raw path programs exactly what is staged) back over the active bank while the patched image still runs from SRAM, resets, then re-reads the 31 windows and requires 0 differing bytes against the P1 backup.                                                                                                                                                                                             | **writes the active slot** |
+
+### The patch, and the ciphertext rule
+
+The patch is four instruction edits in the build's own update machinery (the reader-window
+widening `mov.w r3,#0x10000 → #0x400000` and the three halfword loads/stores of the wire-79
+reader's 32-bit cursor that wrapped every 64 KiB), plus one free header word rebalanced so the
+bootloader's plaintext word-sum check still passes. Together they move exactly **ten bytes** on
+the part: 0x238, 0x239, 0x23B, 0x3C1C, 0x3C1D, 0x3C68, 0x3C69, 0x3C70, 0x3C71, 0x3DB7 (bank-
+relative).
+
+A flash slot does not hold the firmware image; it holds the image XOR a keystream. The wire-79
+reader serves those SLOT BYTES. Pasting the new plaintext bytes into a ciphertext capture corrupts
+the slot — the first FW-V1 wire run did exactly that. The pipeline conjugates instead:
+`wire[off] := wire[off] XOR old_plain[off] XOR new_plain[off]` per patched byte; the keystream
+cancels, the decrypted image changes by exactly the diff. (`conjugateCapture` in
+`src/preservation/patch.ts`.)
+
+### The honest risk
+
+**P2 and P4 write the ACTIVE boot slot.** On real hardware an interrupted write there has NO
+bootable fallback: the other banks hold whatever they hold, the recovery slot is not written by
+this pipeline, and a power loss mid-commit is unrecoverable without an SPI programmer. P1's backup,
+P4's restore and the post-processed dump are the mitigation — not a guarantee. Run it on mains
+power, keep `preserve_backup_windows.bin`, and treat every commit transfer as the moment the
+camera can die.
+
+### Running it
+
+Against the emulator (the four-phase suite; needs the FW-V1 `emu` directory — point `SEEK_EMU_DIR`
+at one whose `seekemu/cli.py` carries `--host-wait-budget`, e.g. the FW-V1_copy tree — and boots
+Compact 1.3.0.0 as a chimera on the 2016 Compact PRO donor):
+
+```sh
+SEEK_EMU_DIR=/path/to/FW-V1/emu npm run test -- preserve
+# the whole file:
+SEEK_EMU_DIR=/path/to/FW-V1/emu npx vitest run packages/core/test/preservation/
+```
+
+On hardware (Chrome/WebUSB or the node-usb backend), with the DECRYPTED factory plaintext of the
+build the camera runs — the expected version is derived from it, and the camera must report that
+build before anything is sent:
+
+```sh
+seek-fw preserve plain-1.3.0.0.bin --out ./preserve-run --yes
+```
+
+Artifacts in `--out`: `preserve_backup_windows.bin` (the P1 backup, assembled at its flash
+addresses), `preserve_bank_capture.bin`, `preserve_dump_postwrite.bin` (the part as patched),
+`preserve_dump_original.bin` (the delivered image — the camera's original content) and
+`preserve_run.json` (per-phase records with sha256 of everything).
+
 ## Operation mode 0, and why a cold camera used to hang
 
 Each RPC carries two permission bits in the firmware's dispatch table: bit 0 "allowed in operation
