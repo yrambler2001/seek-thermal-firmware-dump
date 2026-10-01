@@ -21,15 +21,28 @@ export {
   buildV1Patch,
   conjugateCapture,
   keystream,
+  stagedAcceptanceSum,
+  stagedFormOf,
   sum16,
   verifyCapture,
   wordSum,
   xorWindowVerbatim,
+  keyWordsOf,
   REBALANCE_WORD_OFFSET,
+  BUILD_PATCH_PROFILES,
   V1_2014_PATCH_SITES,
   V1_PAYLOAD_VMA_BASE,
 } from './patch.js';
-export type { PatchSite, V1Patch } from './patch.js';
+export type {
+  BuildPatchProfile,
+  CommitRouteId,
+  DrainCapability,
+  LocatedKeys,
+  PatchSite,
+  PreserveFamilyId,
+  StagedFormId,
+  V1Patch,
+} from './patch.js';
 
 export {
   BACKUP_WINDOW_COUNT,
