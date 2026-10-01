@@ -3674,6 +3674,167 @@ plus the reset server's boot and the post-reset retry that the shape of 23.4 spe
   the camera's clock).
 - **The commit's real flash time on silicon** is still not emulated (sec.22.7); unchanged.
 
+## 24. The pipeline as six resumable steps, the checkpointed CLI, and the run resumed on the real dump (2026-10-01)
+
+§23's four phases run in ONE call with cross-phase state in locals — right for a process that
+stays alive, wrong for everything else: a run that dies after the commit takes the restore source
+with it if the backup only reaches disk at the end. This round splits the same operation at the
+joints a crash actually leaves behind, gives both front ends a checkpoint format, and proves the
+whole point on the real dump: a run interrupted after the commit, resumed in a fresh process on
+fresh servers, still lands byte-exactly.
+
+### 24.1 What was built
+
+| file                                         | what it is                                                                                                                                                                                                                    |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/core/src/preservation/steps.ts`    | the six steps (`backup patch commit drain restore verify`) as `createPreserveRun` + `runPreserveStep`; the JSON `PreserveRunState`; `describeStepGate` (every prerequisite, as text a person can act on); `recordStepFailure` |
+| `packages/core/src/preservation/pipeline.ts` | `runPreservationPipeline` kept, now COMPOSED from the six steps (same signature, same proofs); `PipelineOptions` gains `signal` (threaded through every loop) and `drainChunk`                                                |
+| `packages/cli/src/preserve-store.ts`         | the run directory: atomic writes (same-directory tmp + rename), state load/validate/save, the artifact inventory                                                                                                              |
+| `packages/cli/src/commands/preserve.ts`      | the stepwise command: full run, `--resume`, `--from-step`, `--print-state`                                                                                                                                                    |
+
+The steps, and what each one is allowed to do: **backup** reads the 31 stock windows, names the
+active slot, verifies the capture, and emits the assembled backup + the bank capture + the
+STANDARD DUMP ARCHIVE (decrypted slots, reports, manifest — the offline `decryptDump` path on
+the assembled backup; the camera is not read twice). That is the user's pre-flash dump of every
+region the stock plan can read, and it is handed to the caller before anything write-shaped can
+possibly run. **patch** is offline (no device): `buildV1Patch`, refusing on every before-byte
+gate. **commit** requires the backup files, verifies the capture against the factory image,
+reads the bank's head back BEFORE writing, stages image-length-only, commits — on a session that
+never resets. **drain** sends the wire-89 reset ONCE on its own first session, then drains the
+whole part through the widened window, DRAIN FIRST on its own single arm. **restore** stages the
+original capture back verbatim and resets; a bank that already holds the original (a previous
+restore whose checkpoint was lost) is marked done instead of erased and reprogrammed.
+**verify** re-reads the 31 windows on a fresh boot and refuses any diff against the backup.
+
+Core never touches the filesystem: each step RETURNS its bytes as `Artifact[]`, and resume hands
+the state back in with a `loadArtifact(name)` callback (the CLI serves the checkpoint files from
+the run directory and the factory plaintext from the positional image path, sha-checked against
+`state.imageSha256` on every load). The state is JSON-shaped by construction —
+`JSON.parse(JSON.stringify(state))` round-trips it, which is exactly what the CLI persists. Two
+behavioural notes on the refactor: the wire-89 reset moved from the end of the commit session to
+the drain step's own first session (the commit server can then stop politely and its `.final`
+is the ground truth, per §23.8); and `runPreservationPipeline`'s existing behaviour and proofs
+are unchanged — its emulator baseline (the §23 corpus case) re-ran green after the refactor.
+
+### 24.2 The checkpoint format, and the write order
+
+The run directory holds `preserve_run.json` — the `PreserveRunState`: `version: 1`, `runId`
+(timestamped), `buildFamily`, `imageSha256`, `expectedVersion`, `createdAt`, `nextStep`, per-step
+records (`done`/`failed`, timestamps, notes, and the sha256 of EVERY artifact the step emitted),
+the slot `detection`, the `patch` summary (sites, rebalance word, staged length, chunk count,
+patched sha), the dump shas, and the verify outcome. Checkpoint files:
+`preserve_backup_windows.bin` (the 31 windows assembled at their flash addresses, 0xFF past),
+`preserve_bank_capture.bin`, `preserve_patch_plain_patched.bin`, `preserve_dump_postwrite.bin`,
+`preserve_dump_original.bin`, plus the archive's `manifest.json` / `README.md` / `decrypted/`.
+
+Two rules make it crash-safe, both enforced in one place (`preserve-store.ts`): every write is a
+same-directory temporary file followed by a rename (a kill leaves either the old file or the new
+one, never a truncated checkpoint); and the state document is written AFTER the artifacts it
+names — a crash in between leaves the state BEHIND the files, which is the safe direction
+(`--resume` re-runs the step and rewrites them). The initial checkpoint is written before the
+first step, so even a crash during the backup leaves a resumable run. A FAILED step is
+checkpointed with its error and stays re-runnable; a CANCELLED step is never recorded — the
+previous checkpoint stands and the step starts over on the next resume.
+
+### 24.3 The gates, and the explicit jump override
+
+`describeStepGate` refuses, with the reason, whenever a step's prerequisites are not on disk or
+in the state: the backup only on a fresh run; patch after the backup (the run's rule: the
+regions are dumped and persisted first — the backup is the only copy of this camera); commit
+after backup+patch and only with the backup files present (sha-checked against what the backup
+step recorded — a checkpoint file edited underneath a run is a refusal, not a silent accept);
+drain only past a completed commit; restore likewise; verify only past a completed restore.
+
+One deliberate relaxation exists, and it is the resolution of a wording mismatch the web wizard's
+review caught: the CLI's `--from-step` SAYS it can jump past the commit, but the ordering gates
+refused it inside `runPreserveStep`. Core now takes `options.allowJump` on
+`runPreserveStep`/`describeStepGate`, which relaxes EXACTLY the three ordering gates past the
+commit (drain/restore without a completed commit, verify without a completed restore) — nothing
+else. The file gates stay absolute (a jump cannot fabricate a restore source), the commit step's
+own gates never relax, and the wire-side protections stay in the steps: the commit pre-check
+reads the bank before writing, the restore detects an already-original bank, the verify refuses
+any diff. The CLI grants the override only behind the explicit `--from-step` flag with its
+WARNING line; the web wizard (§25) does not offer the jump at all yet — the override is there
+for it when it wants to, dialog-gated.
+
+### 24.4 The run resumed on the real dump (`resume.emulator.test.ts`)
+
+One boot description — the §23 corpus entry (the vendored 101310HSNEA2 dump, JEDEC 010215,
+Compact 1.3.0.0) — and one test: SERVER A takes the backup, patch and COMMIT steps (each
+checkpointing the way the CLI does, artifacts in memory, the commit session never reset, so the
+server stops politely and its `.final` is asserted to exist); then THE CRASH — everything
+wire-shaped is thrown away and the state that enters the resume is
+`JSON.parse(JSON.stringify(...))` of what the first three steps produced (nextStep `drain`, the
+bank already holding the patch); SERVERS B run the DRAIN step on fresh servers (the step's own
+first session sends the wire-89 once; the ladder goes back to the reset's server once, then
+boots a fresh server from the committed part — the commit is never replayed); SERVER C runs the
+RESTORE step (original bank staged back verbatim, reset, the §23 polite-stop treatment);
+SERVER D runs the VERIFY step on a fresh boot from the restored part.
+
+**The green run (2026-10-01, 357.6 s wall):**
+
+| proof                                                                             | result                                                                                                         |
+| --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| commit phase (backup + patch + commit, one server, reset-free commit session)     | 88.2 s; the commit server stopped politely, `.final` exists                                                    |
+| drain (resumed; reset once, then fresh server from the committed part)            | 182.3 s at 64-byte asks (65,536 asks)                                                                          |
+| raw dump == the commit server's `.final`                                          | 0 diffs; sha256 `7ada1be6b211329189ff3e87d109e9d5ac5f2fcb9e891d054127e72f53d499f9`                             |
+| delivered dump (bank swapped back from the backup ARTIFACT) == the as-booted part | 0 diffs; sha256 `40447c7e6da5cbc84621f4694ffff5bda0f783e7807a45e80443383b19a8eb72` — the source dump's own sha |
+| verify (fresh boot from the restored part)                                        | 31/31 windows, 0 diffs; the restored `.final` == the as-booted part over the whole 4 MiB                       |
+| delivery audits, all four servers                                                 | 0 violations (the tolerance never had to fire); no emulator leaked                                             |
+
+The raw sha is §23's own corpus-entry P3 raw sha, byte for byte — the post-commit part is
+deterministic across boots, across the one-call pipeline and the six-step resume, and across
+runs. The delivered sha IS the source dump's sha — the delivered image is the camera's original
+flash content, reconstructed by a process that never saw the camera before the drain.
+
+### 24.5 What the resume run measured: two reader facts behind the pre-checks
+
+The first resume attempt failed in the commit step's pre-check, and the two failures it produced
+before going green are new machine facts about the RE-ARMED stock window (the §23 serve law was
+measured on the WIDENED window):
+
+- **A re-armed stock bank window refuses a second long sequential read.** The pre-check's
+  original shape — read the full 47,768 B image back through the re-armed mode-7 window —
+  stalled permanently at 28,544 B (56 asks, after 4 tries), while each backup window reads its
+  whole 64 KiB fine on its own fresh arm. The same reader, one arm later, is not the same
+  reader.
+- **At a 512-ask the re-armed window serves SHORT while its cursor advances by the full ask —
+  the delivered stream is SPARSE.** Shrinking the pre-check to 1 KiB still failed, and the
+  diagnostic told the story: the live head matched the capture byte-for-byte for the first
+  24 B and diverged within the first 1 KiB (identical leading hex in the refusal text — the
+  head reads were serving REAL but NON-CONTIGUOUS bytes). That is §23.3's arithmetic (budget
+  and cursor move by wLength per ask, the serve is the reader's own) biting a second read:
+  ask 1 delivers ~192-256 B, the cursor jumps 512, ask 2 delivers from there — gaps.
+- **The fix is the shape §23 already proved: 64-byte asks.** At a 64-ask serve == ask always,
+  so the pre-check now delivers its 1 KiB as sixteen 64-B asks, contiguous and byte-accurate.
+  1 KiB is enough for the question the pre-checks actually ask: the rebalance word at 0x238
+  (568, inside the first 1 KiB) is one of the ten patch bytes — 0 on the factory image
+  (`buildV1Patch` refuses a busy rebalance word) and the nonzero rebalance on the patched one
+  (0x30006240 on the corpus image) — so the head alone distinguishes original from patched.
+  The instruction-site bytes (0x3DB7..0x3C71) are NOT checked live.
+
+### 24.6 The CLI surface, and what the tests pin
+
+`seek-fw preserve <image> [--out dir] [--yes]` — full run, checkpoint after every step.
+`--resume <dir> [image]` — continue from `state.nextStep` (the image only for patch/commit;
+sha-checked against the run whenever given, even on a done run). `--resume --from-step <id>` —
+explicit jump (24.3). `--print-state <dir>` — the state, the next step, and a sha inventory of
+the checkpoint files (`ok` / `CHANGED` / `MISSING`), no camera touched. Exit codes unchanged
+(130 on cancel, 2 on usage). A second fresh run into an occupied directory refuses instead of
+overwriting.
+
+Tests (all green): 21 core unit (`steps.test.ts`, on the fake v1 camera — JSON round-trip,
+every gate refusal, allowJump's exact reach, commit-skip and the crash recovery refusals, abort
+mid-step leaving the state untouched, restore's already-original detection, the whole six-step
+run with delivered == as-booted, and verify's failure recording); 12 CLI (`preserve.test.ts`,
+same fake camera through the REAL command — the full run's run directory with per-file sha
+assertions, no tmp leftovers, the occupied-directory refusal, the early-abort resumable
+checkpoint, the drain-torn run resumed to completion with the commit NOT replayed, the
+missing-image and wrong-image refusals, the loud-warn jump recovering an ambiguous state without
+touching the camera, `--print-state`'s inventory catching a tampered file); and the emulator
+resume test of 24.4. The `npm run check` totals grow accordingly (§23's 779 + 34 unit + 1
+emulator).
+
 ---
 
 ## 25. The preserve wizard, in the web package: six gated steps, a run file as the only memory, and a round trip (2026-10-01)

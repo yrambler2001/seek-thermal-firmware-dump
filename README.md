@@ -271,6 +271,51 @@ build before anything is sent:
 seek-fw preserve plain-1.3.0.0.bin --out ./preserve-run --yes
 ```
 
+### Stepwise runs, and resuming one
+
+The pipeline also exists as SIX RESUMABLE STEPS — `backup → patch → commit → drain → restore →
+verify` — and this is what `seek-fw preserve` drives: after every step it rewrites
+`preserve_run.json` (the run state: what completed, what each step produced, the sha256 of every
+artifact) in the run directory. Two properties fall out of that, and they are the reason the
+stepwise shape exists:
+
+- **The restore source reaches disk before the first write.** The backup step persists the 31
+  windows, the active-bank capture, AND the standard dump archive built offline from them
+  (decrypted slots, reports, manifest) — the user's pre-flash dump of every region the stock plan
+  can read — before anything write-shaped can possibly run.
+- **A crash is a pause, not a loss.** Re-run with `--resume <dir>` and the run continues at
+  `state.nextStep`; the interrupted step starts over, and a completed step is never repeated.
+  The commit step is not replayable, so it reads the bank back before it writes: a bank that
+  already holds the patch (a crash between the commit transfer and its checkpoint) is refused
+  with "resume at the drain", and a bank that changed any other way is refused outright.
+
+```sh
+seek-fw preserve --print-state ./preserve-run    # the run's state, its next step, and
+                                                 # whether the checkpoint files still match
+seek-fw preserve --resume ./preserve-run         # continue from the run's next step
+seek-fw preserve --resume ./preserve-run --from-step restore  # start at a chosen step
+```
+
+`--from-step` refuses, with the reason, when the step it names is missing its files from the
+run directory (commit without the backup files) or already completed; jumping past an incomplete
+commit warns loudly and then proceeds on your explicit assertion that the camera is in the
+patched state — the restore's already-original detection and the verify's 0-diff proof stay in
+the steps either way. A Ctrl-C is not a failure: it stops at the
+next safe point, leaves the previous checkpoint standing, and exits 130 — the interrupted step is
+re-run on the next `--resume`.
+
+On a core level the same steps are `createPreserveRun(plain, opts)` and
+`runPreserveStep(step, opener, state, loadArtifact, reporter, signal?)` in
+`packages/core/src/preservation/steps.ts`: core returns bytes as `Artifact[]` and never touches
+the filesystem; the caller (CLI or web) persists them and rewrites the state after every step.
+
+Artifacts in the run directory: `preserve_run.json` (the state, rewritten after every step),
+`preserve_backup_windows.bin` (the backup, assembled at its flash addresses),
+`preserve_bank_capture.bin`, `preserve_patch_plain_patched.bin` (the patched plaintext),
+`preserve_dump_postwrite.bin` (the part as patched), `preserve_dump_original.bin` (the delivered
+image — the camera's original content), plus `manifest.json`, `README.md` and the decrypted
+slots under `decrypted/` (the backup's dump archive).
+
 Artifacts in `--out`: `preserve_backup_windows.bin` (the P1 backup, assembled at its flash
 addresses), `preserve_bank_capture.bin`, `preserve_dump_postwrite.bin` (the part as patched),
 `preserve_dump_original.bin` (the delivered image — the camera's original content) and
