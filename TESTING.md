@@ -4325,8 +4325,12 @@ re-enumerated, the `claimInterface` of that reopen is refused with `kIOReturnExc
 (0xe00002c5) — the close-after-churn leaves the OS's user client in the way — so the transport
 stays closed and the remaining tries report `the USB transport is not open` instantly. The
 attempt errors read "wire-79 read failed at 0/4194304 B after 6 tries: the USB transport is not
-open"; the camera was never the thing refusing. Each 512 run burned ~46 s (2 attempts × ~20 s
-deadline + reopen) before the pipeline said so.
+open"; the camera was never the thing refusing. That reopen refusal is a documented limit of
+reopen-on-deadline under macOS — the failed ask's deadline reopen hits `claimInterface error
+0xe00002c5` (exclusive access left behind by the close-churn) and the poisoned transport, not
+the camera, answers every later try — and this campaign met it only on the doomed 512 path,
+whose asks never complete; a 64-ask drain never times out, so it never reopens. Each 512 run
+burned ~46 s (2 attempts × ~20 s deadline + reopen) before the pipeline said so.
 
 The fallback ran exactly the resumed shape, no code change: the CLI's global `--chunk` already
 maps to `PipelineOptions.drainChunk` (`preserve --resume /tmp/phase2_run --from-step drain
@@ -4334,7 +4338,9 @@ maps to `PipelineOptions.drainChunk` (`preserve --resume /tmp/phase2_run --from-
 65,536 asks, the whole 4 MiB on one arm, the dump itself 78.3 s — 52.3 KiB/s, ~1.2 ms per ask —
 no retry, no short serve, sha below in 28.2. The 512 default is left in the tree untouched; the
 measurement is this section's, and every hardware caller now has `--chunk 64` as the proven
-form. (Changing `READ_CHUNK` is a one-line decision for the owner, not taken here.)
+form. (Changing `READ_CHUNK` is a one-line decision for the owner, not taken here. Later the
+same day it was taken: `READ_CHUNK` is 64 in the tree now, and `--chunk` remains the explicit
+override.)
 
 ### 28.4 The exhausted reader stalls the restore's boot-config read; re-boot clears it
 

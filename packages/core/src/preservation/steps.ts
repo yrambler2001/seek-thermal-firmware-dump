@@ -197,7 +197,8 @@ export interface PreserveRunState {
   /** What the drain step may promise on this build, as measured. */
   capability?: DrainCapability;
   /** The wire-79 read size the drain asks for, in bytes. Default READ_CHUNK
-   *  (512 — the hardware default); the emulator suite drains at 64 asks. */
+   *  (64 — one EP0 packet, the ask measured exact on silicon, TESTING.md
+   *  sec. 28.3); the emulator suites pass 64 explicitly. */
   drainChunk?: number;
   /** The bank's expected as-booted image prefix (plain XOR keystream), hex,
    *  when the slot key is known — the strongest pre-write capture gate. */
@@ -704,6 +705,18 @@ async function gateVersion(device: SeekDevice, state: PreserveRunState): Promise
 
 function expectedPrefixOf(state: PreserveRunState): Uint8Array | undefined {
   return state.expectedSlotPrefix === undefined ? undefined : hexToBytes(state.expectedSlotPrefix);
+}
+
+/** True when the error, or something it wraps, is the wire's stall answer:
+ *  both transports map a stalled endpoint to `usb/stalled`, and `drainExact`
+ *  rethrows the transport's error as `cause` — the exhausted reader's
+ *  measured signature (TESTING.md sec. 28.4: `control IN 0x4f -> stall`,
+ *  four reads in a row). */
+function isWireStall(error: unknown): boolean {
+  for (let cause: unknown = error; cause instanceof Error; cause = cause.cause) {
+    if (cause instanceof SeekError && cause.code === 'usb/stalled') return true;
+  }
+  return false;
 }
 
 function fail(message: string): never {
@@ -1213,7 +1226,29 @@ async function runRestoreStep(
     const version = await gateVersion(device, state);
     reporter.log(`camera reports firmware ${version}`, 'detail');
 
-    const now = effectiveDetection(state, await detectActiveSlot(device));
+    /* The stall path, measured on silicon (TESTING.md secs. 23.3, 28.4): the
+     * drain's asks spend the reader's whole per-arm budget, and the exhausted
+     * reader stays dead — every later wire-79 read stalls at its first read,
+     * the boot-config record first of all, while the same session's version
+     * read still answers. A stall here is that signature, so it carries the
+     * remedy with it. */
+    let now: SlotDetection;
+    try {
+      now = effectiveDetection(state, await detectActiveSlot(device));
+    } catch (error) {
+      if (isWireStall(error)) {
+        throw new SeekError(
+          'pipeline/refused',
+          'the restore’s first read (the boot-config record) stalled. After a drain that ' +
+            'spent the reader’s whole per-arm budget the reader stays dead — every later ' +
+            'wire-79 read stalls at its first read — until the camera is power-cycled ' +
+            '(TESTING.md secs. 23.3 and 28.4). Power-cycle the camera (unplug and replug it), ' +
+            'then re-run `preserve --resume <run-directory>`.',
+          { cause: error },
+        );
+      }
+      throw error;
+    }
     if (now.bank !== detection.bank || now.bankAddress !== detection.bankAddress) {
       fail(
         `the active slot changed between the backup (${detection.bankAddress.toString(16)}) ` +

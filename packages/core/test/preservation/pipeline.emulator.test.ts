@@ -93,6 +93,8 @@ import { FLASH_BASE, FLASH_SIZE } from '../../src/profiles/modern-4x.js';
 import {
   BACKUP_WINDOW_COUNT,
   PostResetWedgeError,
+  PROBE_OFFSET,
+  READ_CHUNK,
   backupSlice,
   backupWindows,
   commitToBank,
@@ -362,9 +364,12 @@ async function withDrainAfterReset(
                * 2,010,240 B, then a permanent stall). At 64 B the ask is one
                * packet, serve == ask always, and the drain lands exactly:
                * 65,536 asks, remaining 0 at cursor 0x400000, no short serve.
-               * The pipeline keeps its 512 default for hardware; a real host
-               * NAKs a late packet instead of ending the data stage, so its
-               * serves should be full where this model's are not. */
+               * The pipeline now asks 64 by default too: the hardware run
+               * measured the other side (TESTING.md sec. 28.3) and overturned
+               * the real-host NAK bet — silicon never completed a 512-ask at
+               * all (0/4,194,304 B served, four attempts), while 64 asks
+               * drained the whole 4 MiB exactly. 64 is the proven shape on
+               * both sides of the bridge, not just in this model. */
               const dump = await drainWholePart(seek, silentReporter, { chunk: 64 });
               process.stderr.write(
                 `[preservation] r${String(round)}s${String(session)} DRAIN COMPLETE\n`,
@@ -710,7 +715,7 @@ describe.skipIf(UNSUPPORTED !== null)(
           async () => {
             const row = new RowEmulators(`${spec.key} P3`);
             const truthPath = scratch('truth.bin');
-            const probeBytes = backupSlice(st.backup!, 0x21000 - 512, 512);
+            const probeBytes = backupSlice(st.backup!, PROBE_OFFSET - READ_CHUNK, READ_CHUNK);
 
             let rawDump: Uint8Array;
             const startedAt = Date.now();

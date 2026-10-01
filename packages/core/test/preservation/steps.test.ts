@@ -32,9 +32,10 @@ import { describe, expect, it } from 'vitest';
 
 import { sha256hex } from '../../src/bytes.js';
 import { silentReporter, type Reporter } from '../../src/events.js';
-import { CancelledError } from '../../src/errors.js';
+import { CancelledError, SeekError } from '../../src/errors.js';
 import { FLASH_SIZE } from '../../src/profiles/modern-4x.js';
 import { SeekDevice } from '../../src/protocol/client.js';
+import { OP } from '../../src/protocol/ops.js';
 import {
   PRESERVE_BANK_CAPTURE_FILE,
   PRESERVE_BACKUP_FILE,
@@ -132,6 +133,19 @@ function fakeOpener(camera: FakeCamera): SessionOpener {
       await camera.close();
     },
   };
+}
+
+/** A device whose wire-79 data reads stall — the exhausted reader's measured
+ *  afterlife (TESTING.md sec. 28.4: `control IN 0x4f -> stall`, four reads in
+ *  a row) — while every other request, the version read included, answers
+ *  normally, exactly as the hardware ordered it after a spent drain. */
+class StalledWire79Device extends SeekDevice {
+  override rpcIn(op: number, length: number, timeoutMs?: number): Promise<Uint8Array> {
+    if (op === OP.GET_FEATURED_FIRMWARE_DATA) {
+      throw new SeekError('usb/stalled', 'control IN 0x4f -> stall');
+    }
+    return super.rpcIn(op, length, timeoutMs);
+  }
 }
 
 /** A loader that serves the in-memory artifacts a step emitted — the
@@ -602,6 +616,50 @@ describe('runPreserveStep — the recovery behaviours', () => {
       const outcome = await step('restore', camera, state, store);
       expect(outcome.steps.restore?.status).toBe('done');
       expect(outcome.steps.restore?.notes).toMatch(/already held the original content/);
+    },
+  );
+
+  it(
+    'a restore whose first read stalls after the drain names the power-cycle remedy',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore(plain);
+      const created = await createPreserveRun(plain, { runId: 'stall' });
+      let state = created.state;
+      for (const id of ['backup', 'patch', 'commit', 'drain'] as const) {
+        state = await step(id, camera, state, store);
+      }
+      /* The hardware shape (TESTING.md secs. 23.3, 28.4): the drain's asks
+       * spent the reader's arm budget, the version read still answers, and the
+       * boot-config read — the restore's first wire-79 — stalls on every
+       * retry. The error must carry the remedy a person at the camera needs. */
+      const stallingOpener: SessionOpener = {
+        open: async () => {
+          await camera.open();
+          return new StalledWire79Device(camera, { reporter: silentReporter });
+        },
+        close: async () => {
+          await camera.close();
+        },
+      };
+      const error: unknown = await runPreserveStep(
+        'restore',
+        stallingOpener,
+        state,
+        store.load,
+        silentReporter,
+      ).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(SeekError);
+      expect((error as Error).message).toMatch(/stalled/);
+      expect((error as Error).message).toMatch(/power-cycle the camera/i);
+      expect((error as Error).message).toMatch(/preserve --resume/);
+      /* And the caller can checkpoint it: the step is recorded failed, and the
+       * run stays at restore for the re-run after the power cycle. */
+      const failed = recordStepFailure(state, 'restore', error);
+      expect(failed.steps.restore?.status).toBe('failed');
+      expect(failed.nextStep).toBe('restore');
+      expect(failed.steps.restore?.error).toMatch(/preserve --resume/);
     },
   );
 

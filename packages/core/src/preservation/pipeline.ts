@@ -28,7 +28,8 @@
  *       whose mode-2 window now spans the whole 4 MiB part. A fresh session
  *       (the post-reset quirk: re-enumerate, probe once, then drain — retry
  *       once on a still-dead window and NEVER re-send the commit) drains the
- *       part at 512 B per call. The RAW dump equals the post-write part; the
+ *       part at 64 B per call (READ_CHUNK; sec. 28.3). The RAW dump equals
+ *       the post-write part; the
  *       DELIVERED dump has the active bank's 64 KiB replaced from the P1
  *       backup, so it is the camera's original flash content, byte-clean.
  *
@@ -90,8 +91,11 @@ import {
   type SlotDetection,
 } from './windows.js';
 
-/** Wire-79 drain unit. The reader serves at most 512 B per call. */
-export const READ_CHUNK = 512;
+/** Wire-79 drain unit: ONE EP0 packet, the ask where serve == ask — measured
+ *  exact on both sides of the bridge (TESTING.md sec. 28.3: silicon never
+ *  completed a 512 ask, 0/4,194,304 B over four attempts; 64 asks drained the
+ *  whole 4 MiB with no short serve). */
+export const READ_CHUNK = 64;
 /** Wire-80 staging unit: the device's EP0 buffer truncates longer chunks. */
 export const STAGE_CHUNK = EP0_BUF;
 /** Per-read retries before a drain fails (the bench contract: fail loudly). */
@@ -361,7 +365,8 @@ export async function drainExact(
 
 /**
  * P3's drain: arm the PATCHED image's widened mode-2 window and read the
- * whole 4 MiB part at 512 B per call.
+ * whole 4 MiB part at READ_CHUNK (64, one EP0 packet) per call — the ask
+ * measured exact on silicon (TESTING.md sec. 28.3).
  */
 export async function drainWholePart(
   device: SeekDevice,
@@ -392,8 +397,8 @@ export async function drainWholePart(
 
 /**
  * The patch-live probe: read through window offset 0x21000 and compare with
- * `expected` (512 B from the P1 backup at flash offset 0x21000). The STOCK
- * 16-bit reader cursor wraps at 0x10000 and serves bootloader-block bytes
+ * `expected` (READ_CHUNK B from the P1 backup at flash offset 0x21000). The
+ * STOCK 16-bit reader cursor wraps at 0x10000 and serves bootloader-block bytes
  * there; only the widened window returns the true bytes past it.
  */
 export async function probeWidenedWindow(
@@ -431,9 +436,9 @@ export async function probeWidenedWindow(
 }
 
 /**
- * The probe's 512-byte expectation, cut from the P1 backup at flash offset
- * `start`. The backup is window-addressed, so a slice that crosses a window
- * boundary is assembled from its parts.
+ * The probe's expectation (READ_CHUNK B), cut from the P1 backup at flash
+ * offset `start`. The backup is window-addressed, so a slice that crosses a
+ * window boundary is assembled from its parts.
  */
 export function backupSlice(backup: BackupResult, start: number, length: number): Uint8Array {
   const out = new Uint8Array(length);
@@ -578,8 +583,9 @@ export interface PipelineOptions {
   /** Threaded through every step's loops: the CLI's interrupt path and the
    *  web runner both stop a run this way. */
   readonly signal?: AbortSignal;
-  /** The wire-79 read size the drain asks for. Default READ_CHUNK (512, the
-   *  hardware default); the emulator suite drains at 64 asks. */
+  /** The wire-79 read size the drain asks for. Default READ_CHUNK (64, one
+   *  EP0 packet — the ask measured exact on silicon and in the emulator,
+   *  TESTING.md sec. 28.3). */
   readonly drainChunk?: number;
 }
 

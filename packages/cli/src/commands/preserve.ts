@@ -197,8 +197,9 @@ async function freshCommand(ctx: CommandContext, outDir: string): Promise<Comman
     );
   }
   const created = await createPreserveRun(image, {
-    /* The global --chunk, where the drain step is given one; the emulator
-     * suite drains at 64 asks, hardware keeps the 512 default. */
+    /* The global --chunk, where the drain step is given one; the default
+     * (READ_CHUNK, 64) is the ask measured exact on silicon (TESTING.md
+     * sec. 28.3). */
     ...(ctx.options.chunk === null ? {} : { drainChunk: ctx.options.chunk }),
   });
   const patch = created.patch;
