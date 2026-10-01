@@ -76,6 +76,23 @@ function describeStagedForm(form: 'plain' | 'xor-ks0' | 'xor-ks0-ksD'): string {
   }
 }
 
+/** The restore line of the plan print: can the run put the bank back? */
+function describeRestoreForm(form: 'capture-verbatim' | 'factory-staged' | 'none'): string {
+  switch (form) {
+    case 'capture-verbatim':
+      return 'the backup capture, staged verbatim (the plaintext banks hold the image)';
+    case 'factory-staged':
+      return 'the factory image in the staged form (the commit transform reproduces the slot)';
+    case 'none':
+      return (
+        'REFUSED on this build — no staged form of the factory image passes the running ' +
+        'app\u2019s own acceptance while transforming back to the original slot bytes ' +
+        '(accept1 reads sum(P ^ ksD); the factory carries 0xB7AB9D17 there, not 0xFFFF). ' +
+        'The run ends with the delivered dump in hand and the patch in place.'
+      );
+  }
+}
+
 /** The drain line of the plan print: what this build's drain may promise. */
 function describeCapability(capability: {
   wholePart: boolean;
@@ -204,6 +221,7 @@ async function freshCommand(ctx: CommandContext, outDir: string): Promise<Comman
   );
   say(`  staged form        ${describeStagedForm(patch.stagedForm)}`);
   if (patch.routeNote !== null) say(`  commit route       ${patch.routeNote}`);
+  say(`  restore            ${describeRestoreForm(patch.restoreForm)}`);
   say(`  drain              ${describeCapability(patch.capability)}`);
   say('  steps              backup -> patch -> commit -> drain -> restore -> verify');
   say('  run directory      each step checkpoints there; the backup (and the standard dump');
