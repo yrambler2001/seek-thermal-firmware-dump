@@ -40,6 +40,7 @@ export type {
   LocatedKeys,
   PatchSite,
   PreserveFamilyId,
+  RestoreFormId,
   StagedFormId,
   V1Patch,
 } from './patch.js';

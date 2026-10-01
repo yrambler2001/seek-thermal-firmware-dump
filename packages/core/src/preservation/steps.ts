@@ -94,11 +94,13 @@ import {
   type CommitRouteId,
   type DrainCapability,
   type PreserveFamilyId,
+  type RestoreFormId,
   type StagedFormId,
   type V1Patch,
 } from './patch.js';
 import {
   BACKUP_WINDOW_COUNT,
+  BANKS,
   WINDOW_BYTES,
   bankWindow,
   preservationWindows,
@@ -184,6 +186,9 @@ export interface PreserveRunState {
   buildId?: string;
   /** How the wire-80 staged bytes relate to the patched plaintext. */
   stagedForm?: StagedFormId;
+  /** How (and whether) the restore step can put the original bank back
+   *  through the running app's own commit path ('none' on the FF build). */
+  restoreForm?: RestoreFormId;
   /** Which bank the patch may be committed into (`recovery-only` for the
    *  1.3.0.8-FF build). */
   route?: CommitRouteId;
@@ -298,6 +303,7 @@ export async function createPreserveRun(
      * capability table all read the run state, not the image, after this. */
     buildId: patch.buildId,
     stagedForm: patch.stagedForm,
+    restoreForm: patch.restoreForm,
     route: patch.route,
     routeNote: patch.routeNote,
     capability: patch.capability,
@@ -373,6 +379,36 @@ async function loadPlain(
 
 const isDone = (state: PreserveRunState, id: PreserveStepId): boolean =>
   state.steps[id]?.status === 'done';
+
+/**
+ * The bank the camera actually boots, for a recovery-only build. The FF
+ * build's raw word sum is the 0xFFFF sentinel, which the 2014 bootloader
+ * rejects at slots A/B — it boots the recovery bank 0x14070000 UNCHECKED
+ * (measured on the wire: the factory chimera with a blank record runs from
+ * recovery; doc 35.3.3). The cfg-derived detection names A for a blank
+ * record, which for this build names a bank that can never run — so the
+ * detection is re-pointed at recovery, and every step (capture, commit,
+ * swap-back, restore) acts on the bank that truly runs. An explicit record
+ * naming recovery behaves the same; a record naming B cannot boot this
+ * build at all, and `routeRefusal` refuses the write.
+ */
+function effectiveDetection(state: PreserveRunState, detection: SlotDetection): SlotDetection {
+  if (state.route !== 'recovery-only') return detection;
+  const recovery = BANKS.find((b) => b.key === 'r');
+  if (recovery === undefined) return detection;
+  return {
+    ...detection,
+    blank: false,
+    cfg0: 2,
+    bank: 'r',
+    bankAddress: recovery.address,
+    bankMode: recovery.mode,
+    verdict:
+      'the 0xFFFF-sum build: slots A/B are rejected by the bootloader and the recovery ' +
+      `bank ${recovery.address.toString(16)} boots unchecked — the running bank is ` +
+      'recovery (doc 35.3)',
+  };
+}
 
 /**
  * The route refusal, shared by the three steps that would touch the patch's
@@ -519,6 +555,16 @@ export async function describeStepGate(
       if (route !== null) return route;
       if (state.patch === undefined) {
         return 'restore needs the patch summary (for the staged length) — run the patch step first';
+      }
+      if (state.restoreForm === 'none') {
+        return (
+          `the restore step refuses on ${state.buildId ?? state.buildFamily}: no staged form ` +
+          'of the factory image passes the running app\u2019s own acceptance while ' +
+          'transforming back to the original slot bytes \u2014 accept1 reads sum(P ^ ksD), ' +
+          'the factory image carries 0xB7AB9D17 there (measured), not the 0xFFFF the app ' +
+          'demands. This run ends with the delivered dump in hand and the patch in place; ' +
+          'the original content can only go back with a full-flash programmer.'
+        );
       }
       /* A cipher family's restore stages the FACTORY image in the build's
        * staged form (the commit's own transform turns it back into the
@@ -751,7 +797,7 @@ async function runBackupStep(
     reporter.log(`camera reports firmware ${version}`, 'detail');
 
     const backup = await backupWindows(device, reporter, READ_CHUNK, signal);
-    const detection = await detectActiveSlot(device);
+    const detection = effectiveDetection(state, await detectActiveSlot(device));
     reporter.log(`slot: ${detection.verdict}`, 'detail');
     const captured = backup.byAddress.get(detection.bankAddress);
     if (captured === undefined) {
@@ -1167,7 +1213,7 @@ async function runRestoreStep(
     const version = await gateVersion(device, state);
     reporter.log(`camera reports firmware ${version}`, 'detail');
 
-    const now = await detectActiveSlot(device);
+    const now = effectiveDetection(state, await detectActiveSlot(device));
     if (now.bank !== detection.bank || now.bankAddress !== detection.bankAddress) {
       fail(
         `the active slot changed between the backup (${detection.bankAddress.toString(16)}) ` +

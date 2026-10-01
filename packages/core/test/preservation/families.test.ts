@@ -39,6 +39,7 @@ import {
   type CommitRouteId,
   type DrainCapability,
   type PreserveFamilyId,
+  type RestoreFormId,
   type StagedFormId,
 } from '../../src/preservation/patch.js';
 import { describeStepGate, type PreserveRunState } from '../../src/preservation/steps.js';
@@ -464,6 +465,7 @@ function handState(fields: {
   buildFamily: PreserveFamilyId;
   buildId?: string;
   stagedForm?: StagedFormId;
+  restoreForm?: RestoreFormId;
   route?: CommitRouteId;
   routeNote?: string | null;
   capability?: DrainCapability;
@@ -576,6 +578,37 @@ describe('the capability table and the commit route, in the gates', () => {
       const refusal = await describeStepGate(step, onRecovery, neverLoader);
       expect(refusal ?? '').not.toMatch(/RECOVERY slot only/);
     }
+  });
+
+  it('the FF build restoreForm is none: the gate refuses with the measured constant', async () => {
+    /* The measured fact behind the refusal, from the corpus image when it is
+     * here: accept1 on the factory two-stream staged form is 0xB7AB9D17, not
+     * the 0xFFFF the app demands. */
+    const ffImage = CORPUS_IMAGES['compact-1.3.0.8-ff'];
+    if (ffImage !== null) {
+      const patch = buildV1Patch(readImage(ffImage));
+      expect(patch.restoreForm).toBe('none');
+      const ksD = keystream(keyWordsOf(patch.keys?.block1Hex ?? ''), patch.factory.length >> 2);
+      const accept1 = wordSum(xorWindowVerbatim(patch.factory, ksD) /* header at face value */);
+      expect(accept1).toBe(0xb7ab9d17);
+      expect(accept1).not.toBe(0xffff);
+    }
+    const state = handState({
+      buildFamily: 'v1-2014-ff',
+      buildId: 'compact-1.3.0.8-ff',
+      restoreForm: 'none',
+      detection: {
+        ...DETECTED_A,
+        blank: false,
+        cfg0: 2,
+        bank: 'r',
+        bankAddress: 0x14070000,
+        bankMode: 9,
+      },
+    });
+    const refusal = await describeStepGate('restore', state, neverLoader);
+    expect(refusal).toMatch(/the restore step refuses on compact-1\.3\.0\.8-ff/);
+    expect(refusal).toMatch(/0xB7AB9D17/);
   });
 
   it('a cipher-family restore needs the factory plaintext; a plain-family restore does not', async () => {

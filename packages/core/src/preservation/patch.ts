@@ -178,6 +178,22 @@ export type PreserveFamilyId = 'v1-2014' | 'v1-2014-ff' | 'compact-2016';
 /** How the wire-80 staged bytes relate to the patched plaintext. */
 export type StagedFormId = 'plain' | 'xor-ks0' | 'xor-ks0-ksD';
 
+/** How (and whether) the RESTORE step can put the original bank back through
+ *  the running app's own commit path.
+ *
+ *  - 'capture-verbatim': the 2014 plaintext chain — the capture IS the image,
+ *    its stored word sum is 0, and the commit programs it as staged.
+ *  - 'factory-staged': the 2016 cipher chain — the factory image ^ ks0
+ *    satisfies the decrypted-sum-0 acceptance, and the commit's two-stream
+ *    transform reproduces the original slot bytes.
+ *  - 'none': NO staged form of the factory image passes the running app's
+ *    acceptance while transforming back to the original slot bytes — the FF
+ *    build: accept1 reads sum(P ^ ksD) and the factory carries 0xB7AB9D17
+ *    there, not 0xFFFF (measured on the image), so the only payloads the app
+ *    accepts land DIFFERENT bytes than the backup holds. The run ends with
+ *    the delivered dump in hand and the patch in place. */
+export type RestoreFormId = 'capture-verbatim' | 'factory-staged' | 'none';
+
 /** Which bank the patch may be committed into. */
 export type CommitRouteId = 'active-bank' | 'recovery-only';
 
@@ -484,6 +500,7 @@ export interface BuildPatchProfile {
   readonly locate: (plain: Uint8Array) => readonly PatchSite[];
   readonly keysOf: (plain: Uint8Array) => LocatedKeys | null;
   readonly stagedForm: StagedFormId;
+  readonly restoreForm: RestoreFormId;
   /** The content-acceptance constant of the family: 0 for a word-sum-0 gate,
    *  0xFFFF for the FF build's collapsed staged-form gate. */
   readonly acceptanceSum: number;
@@ -553,6 +570,7 @@ const V1_2014_PROFILE: BuildPatchProfile = {
     }),
   keysOf: () => null,
   stagedForm: 'plain',
+  restoreForm: 'capture-verbatim',
   acceptanceSum: 0,
   route: 'active-bank',
   routeNote: null,
@@ -582,6 +600,7 @@ const COMPACT_1308_8HZ_PROFILE: BuildPatchProfile = {
   locate: (plain) => [widen2014Site(plain, ladderOffset(plain))],
   keysOf: () => null,
   stagedForm: 'plain',
+  restoreForm: 'capture-verbatim',
   acceptanceSum: 0,
   route: 'active-bank',
   routeNote: null,
@@ -613,6 +632,7 @@ const COMPACT_1308_FF_PROFILE: BuildPatchProfile = {
   },
   keysOf: (plain) => requireKeys(findKeyPair(plain, KEY_PAIRS.ff1308)),
   stagedForm: 'xor-ks0-ksD',
+  restoreForm: 'none',
   acceptanceSum: 0xffff,
   route: 'recovery-only',
   routeNote:
@@ -647,6 +667,7 @@ const CP_1030_PROFILE: BuildPatchProfile = {
   },
   keysOf: (plain) => requireKeys(findKeyPair(plain, KEY_PAIRS.cp103)),
   stagedForm: 'xor-ks0',
+  restoreForm: 'factory-staged',
   acceptanceSum: 0,
   route: 'active-bank',
   routeNote: null,
@@ -679,6 +700,7 @@ function cp1032Profile(
     },
     keysOf: (plain) => requireKeys(findKeyPair(plain, keys)),
     stagedForm: 'xor-ks0',
+    restoreForm: 'factory-staged',
     acceptanceSum: 0,
     route: 'active-bank',
     routeNote: null,
@@ -745,6 +767,7 @@ export interface V1Patch {
   readonly sites: readonly PatchSite[];
   readonly keys: LocatedKeys | null;
   readonly stagedForm: StagedFormId;
+  readonly restoreForm: RestoreFormId;
   readonly acceptanceSum: number;
   readonly route: CommitRouteId;
   readonly routeNote: string | null;
@@ -918,6 +941,7 @@ function buildWithProfile(plain: Uint8Array, profile: BuildPatchProfile): V1Patc
     sites: profile.locate(plain),
     keys,
     stagedForm: profile.stagedForm,
+    restoreForm: profile.restoreForm,
     acceptanceSum: profile.acceptanceSum,
     route: profile.route,
     routeNote: profile.routeNote,
