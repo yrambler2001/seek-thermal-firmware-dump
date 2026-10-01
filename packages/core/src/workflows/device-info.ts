@@ -28,6 +28,7 @@ import {
   type StoreKey,
 } from '../crypto/keys.js';
 import { CANDIDATE_K, recoverKeyInfo } from '../crypto/recover.js';
+import { sameState, type Xorshift128State } from '../crypto/xorshift128.js';
 import {
   bankPayloadSize,
   footerOffsetFor,
@@ -43,6 +44,7 @@ import {
 } from '../image/header.js';
 import { WINDOW_SIZE } from '../protocol/ops.js';
 import type { SeekDevice } from '../protocol/client.js';
+import { legacyUpgradeTargetBuild } from '../profiles/legacy-auth.js';
 import { detectProfile, requireCapability } from '../profiles/registry.js';
 import type {
   BootPrediction,
@@ -180,6 +182,36 @@ async function analyseSlot(slot: RawSlot, profile: FirmwareProfile): Promise<Ana
   };
 }
 
+/* ---- the 2014 plaintext chain ----------------------------------------- */
+
+/**
+ * The identity keystream. A slot whose GF(2) solve comes back in this state
+ * decrypts to itself: the stored bytes ARE the image, word for word.
+ */
+const IDENTITY_STATE: Xorshift128State = Uint32Array.of(0, 0, 0, 0);
+
+/**
+ * Is this slot stored PLAIN — the 2014 chain's at-rest form?
+ *
+ * The test is the identity keystream, NOT the acceptance sum: the solve reads
+ * the slot's own reserved vectors, so an all-zero state means the stored words
+ * there really are zero, i.e. nothing was XORed into the image. A cipher-chain
+ * slot can also produce a zero acceptance sum (the 1.0.3.x builds decrypt to
+ * 0) but its recovered state is a real key's, and staging its bytes verbatim
+ * would write ciphertext where the chain wants an image. The sum condition on
+ * top is the chain bootloader's own acceptance: stored words sum 0.
+ */
+function storedPlain(slot: AnalysedSlot): boolean {
+  return (
+    slot.present &&
+    slot.recovered !== null &&
+    slot.plainHeader !== null &&
+    slot.recovered.sane &&
+    sameState(slot.recovered.state, IDENTITY_STATE) &&
+    slot.recovered.checksum === 0
+  );
+}
+
 /**
  * Why a slot the running firmware's plan does not reach was not read.
  *
@@ -309,9 +341,11 @@ export async function readDeviceInfo(
   /* EVERY ARM BELOW COMES FROM THIS PLAN, and a block it has no window for is
    * reported as not readable on this firmware rather than armed some other
    * way: the boot config, the bootloader block, each slot, and the upgrade
-   * target, which must be a row of this build's table too. */
+   * target, which must be a row of this build's table too. `let` because the
+   * 2014 plaintext chain sets it from the build's own decoded mode-0 row once
+   * the chain has been identified from the slots. */
   const entries = plan.windows;
-  const updateTargetSubcmd = upgradeSelectorIn(plan, profile);
+  let updateTargetSubcmd = upgradeSelectorIn(plan, profile);
   warnIfRecipientFellBack(ctx);
 
   reporter.log('firmware info selectors ...', 'detail');
@@ -440,6 +474,18 @@ export async function readDeviceInfo(
   }
   reporter.progress(1, 1, 'Analysing ...');
 
+  /* ---- the 2014 plaintext chain -------------------------------------- */
+  const plainChain = analysed.some(storedPlain);
+  if (plainChain) {
+    reporter.log('');
+    reporter.log(
+      '2014 plaintext chain: a bank is stored plain — the keystream solve returns the ' +
+        'identity state and the stored words sum to 0 — so an upgrade stages the image ' +
+        'bytes verbatim and needs no key material',
+      'ok',
+    );
+  }
+
   /* ---- key table ---------------------------------------------------- */
   const states = analysed
     .map((slot) => slot.recovered?.state)
@@ -477,6 +523,11 @@ export async function readDeviceInfo(
         'error',
       );
     }
+  } else if (plainChain) {
+    /* Nothing to confirm: nothing on this chain is encrypted, so no step of an
+     * upgrade reads a key — not the arm, not the staging, not the commit. */
+    reporter.log('');
+    reporter.log('no key table — none is involved on the plaintext chain', 'detail');
   } else {
     reporter.log('');
     reporter.log("could not confirm this camera's key table — flashing is disabled", 'error');
@@ -562,13 +613,59 @@ export async function readDeviceInfo(
     }
   }
 
+  /* The 2014 plaintext chain has no replayable boot policy — and needs none.
+   * Its upgrade selector is mode 0, `fw_update_slot_address()`: the function
+   * reads the roots' active-slot word this read already carries and arms the
+   * OTHER bank. The camera's own word is therefore both halves of the
+   * prediction, and the write targets exactly what it names. Held to the
+   * builds whose own decoded table makes mode 0 that function, and refused
+   * with the reason on the rest. */
+  let chainReplay = false;
+  const chainBlocked: string[] = [];
+  if (plainChain && prediction === null) {
+    const chainBuild = legacyUpgradeTargetBuild(version);
+    const mode0Row = plan.selectors.find((row) => row.subcmd === 0);
+    if (chainBuild === null || mode0Row?.channel !== 'plain') {
+      chainBlocked.push(
+        `the 2014 plaintext chain's write is decoded only for builds whose own mode-0 row is ` +
+          `fw_update_slot_address() — ${version ?? 'the version did not read back'} is not one ` +
+          'of them, so the selector that arms the upgrade target is not known on this build',
+      );
+    } else if (activeSlotWord === null) {
+      chainBlocked.push(
+        "the camera's active-slot word (fw info roots, selector 10) could not be read — on " +
+          'the plaintext chain that word, not a boot-config replay, names the slot an ' +
+          'upgrade writes',
+      );
+    } else {
+      /* fw_update_slot_address(): active_slot 0 -> slot B, anything else ->
+       * slot A — the same mapping the modern replay trusts the word for. The
+       * BOOTED slot is the other one of the pair (a recovery record boots the
+       * recovery bank, but the upgrade still writes the A/B bank the word
+       * names). */
+      const target: SlotKey = activeSlotWord === 0 ? 'b' : 'a';
+      prediction = { booted: target === 'a' ? 'b' : 'a', target };
+      chainReplay = true;
+      updateTargetSubcmd = 0;
+      reporter.log('');
+      reporter.log(
+        `2014 plaintext chain: no boot replay — the camera's own active-slot word names ` +
+          `${byKey.get(target)?.name ?? target} as the slot an upgrade writes (mode 0, ` +
+          'fw_update_slot_address()); the booted bank stays untouched',
+        'detail',
+      );
+    }
+  }
+
   if (prediction !== null) {
-    reporter.log('');
-    reporter.log(
-      `boot config replay: booted ${byKey.get(prediction.booted)?.name ?? prediction.booted}, ` +
-        `so an upgrade would write ${byKey.get(prediction.target)?.name ?? prediction.target}`,
-      'detail',
-    );
+    if (!chainReplay) {
+      reporter.log('');
+      reporter.log(
+        `boot config replay: booted ${byKey.get(prediction.booted)?.name ?? prediction.booted}, ` +
+          `so an upgrade would write ${byKey.get(prediction.target)?.name ?? prediction.target}`,
+        'detail',
+      );
+    }
 
     /* The replay above is inference. These two are the camera's own answer:
      * active_slot is the word fw_update_slot_address() reads, and the upgrade
@@ -640,7 +737,7 @@ export async function readDeviceInfo(
 
   /* ---- family check and detection ------------------------------------ */
   const familyOk = slots.some((slot) => slot.accepts);
-  if (!familyOk) {
+  if (!familyOk && !plainChain) {
     reporter.log('');
     reporter.log(
       `no slot on this camera decrypts to the ${hexUp(profile.cipher.acceptanceSum)} acceptance ` +
@@ -690,12 +787,28 @@ export async function readDeviceInfo(
 
   /* ---- the flash gate ------------------------------------------------ */
   const blocked: string[] = [];
-  if (!keyTable) blocked.push("this camera's key table could not be confirmed");
-  if (!familyOk) {
+  /* The key table and the acceptance sum are the cipher chain's questions. On
+   * the 2014 plaintext chain nothing is encrypted — the arm, the staging and
+   * the commit read no key and sum no decrypted words — so the chain's own
+   * measurements (identity keystream, stored word sum 0) stand in for both. */
+  if (!keyTable && !plainChain) blocked.push("this camera's key table could not be confirmed");
+  if (!familyOk && !plainChain) {
     blocked.push(
       `no slot decrypts to ${profile.name}'s ${hexUp(profile.cipher.acceptanceSum)} acceptance sum`,
     );
   }
+  /* And the refusal that replaced the profile-level one: the line's write path
+   * is the plain chain's. Any other camera on the same protocol — the cipher
+   * chains and the builds whose mode 0 is not the upgrade target — is told
+   * exactly that, rather than being waved through a cipher-shaped staging. */
+  if (!plainChain && plan.selectors.some((row) => row.channel === 'auth')) {
+    blocked.push(
+      'the write path on this line is implemented only for the 2014 plaintext chain — banks ' +
+        'stored plain, word sum 0, no key material — and no bank this read opened is stored ' +
+        'that way',
+    );
+  }
+  blocked.push(...chainBlocked);
   if (prediction === null) blocked.push('the slot an upgrade would write could not be determined');
   if (keysBlock !== null) blocked.push(keysBlock);
   /* The original threw out of readDeviceInfo the moment any slot's window
@@ -793,6 +906,7 @@ export async function readDeviceInfo(
     updateTargetSubcmd,
     targetConfirmed,
     familyOk,
+    plainChain,
     canFlash: blocked.length === 0,
     flashBlockedBy: blocked,
   };

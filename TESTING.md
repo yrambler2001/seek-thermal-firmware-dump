@@ -4117,3 +4117,109 @@ Deliberate divergences from the porting brief, both measured rather than assumed
 | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | raw dump == the post-commit part                           | 0 diffs; sha256 `4685ed6029add05c242b02ba128c17bda2104edb555cf679f3cffd9b583e872e` — **byte for byte the doc 35.2.4 IP2 in-place run's dump sha** |
 | delivered dump (bank A swapped back) == the as-booted part | 0 diffs; sha256 `afa9800f8969e46a0d868b19bdd55a9514fec40cfd958de41d0f769eea5a6e7b` — the doc's own as-booted part sha (its IP3 restore target)    |
+
+## 27. The normal flash path on the 2014 plaintext chain: the gate scopes the write, not the profile (2026-10-01)
+
+### 27.1 What was broken
+
+Asked offline against the bench Compact's own dump (`101310HSNEA2`, sha `40447c7e...` — sec. 21.7's
+unit): would `seek-fw flash` work on the 2014 plaintext-chain camera today? It would not. The read
+under `legacy-auth` (the family the capability probe names: the plain arm of a protected bank is
+refused, the 18-byte arm works) turned flashing off with four reasons, none of them about this
+chain:
+
+```
+this camera's key table could not be confirmed
+no slot decrypts to Legacy locked firmware's 0x0000FFFF acceptance sum
+the slot an upgrade would write could not be determined
+Legacy locked firmware does not support flashing: ...
+```
+
+and `prepareImage` then refused with `profile/unsupported` before anything else. Every one of those
+is a CIPHER-chain question: the key table, the 0xFFFF sum, the boot replay that was never decoded.
+On this camera the answer to all three is "there is no such thing": the banks hold the image plain
+(the GF(2) solve on a bank returns the identity keystream), the stored words sum to 0, the slots
+keep no footer, and no step of the app's own upgrade reads a key. The camera had been left
+unflashable by a gate that was modelling a different family's at-rest form.
+
+### 27.2 The chain, and the path that now stages it
+
+The chain's facts, all measured (`test/firmware/facts.json`; the dump; the preservation campaign,
+secs. 23 and 26, whose `commitToBank` is the same arm → stage → commit on this very dump):
+
+- the bootloader accepts a slot that carries the magic `0xA1B2C3D4` at +0x200, a `header.length`
+  below 0x10000, and whose STORED words sum to 0. No key material anywhere in that test.
+- the staged form is the image, image length only, plain: the commit erases the whole 64 KiB block
+  and programs exactly the staged bytes, the descriptor's staging buffer holds 0xE000 at
+  0x20002000 + 0xE000, and the commit checks the u16 sum of the staged bytes. The as-shipped banks
+  end where the image ends (all 0xFF to the block edge) — no "CODE" footer, unlike the cipher
+  chains whose footer guard `assertBankPayload` exists for.
+- the upgrade target is mode 0, `fw_update_slot_address()`: every image from 0.9.0.2 on computes
+  mode 0 as "loads `0x10000200` (the roots' active-slot word) and `0x14060000`" (`facts.json`), and
+  FW-V1's reconstruction names the mapping — active_slot 0 → slot B, anything else → slot A. Mode 0
+  rides the PLAIN channel (the locked modes are 2..9), so the write arms it with the 2-byte payload
+  every other plain arm uses.
+
+The change (`plainChain` on `DeviceState`/`PreparedFlash`, `plain-chain-flash.test.ts`):
+
+- `readDeviceInfo` recognises the chain from the slots: a bank whose recovered keystream state is
+  the IDENTITY (the stored bytes are the image) with a zero stored word sum and a sane header. The
+  identity — not the zero sum — is the signature: the 1.0.3.x cipher chain also decrypts to a zero
+  sum, under a real key, and is refused (pinned by test).
+- on the chain the gate passes, saying so: "2014 plaintext chain: a bank is stored plain ... an
+  upgrade stages the image bytes verbatim and needs no key material". The key table is not
+  required (none is involved), the acceptance question is answered by the measured sum, and the
+  boot answer comes from the camera's own active-slot word — with the upgrade-target selector
+  taken from the build's own decoded mode-0 row (`legacyUpgradeTargetBuild`, which holds the write
+  to 0.9.0.2 and later: 0.8.0.0 computes mode 0 through the bootloader's config table instead and
+  nothing has measured where that lands).
+- `prepareImage` stages the chain plain: length-stamped, the adjust word at +0x238 balancing the
+  stored sum to 0, and nothing else — no cipher, no pad, no footer, no key retargeting, no
+  filename key suffix required. The payload guard is `assertPlainChainPayload`, the bootloader's
+  own three checks plus the 0xE000 staging cap.
+- `writeFirmware` uses the same arm → 64-byte stage → commit flow unchanged (the commit carries the
+  u16 sum), and the post-commit probe becomes byte equality: the slot must read back the staged
+  bytes with word sum 0. On the cipher chains the existing key-identity probe is untouched.
+- `legacy-auth.capabilities.flash` is now SUPPORTED, and the refusal it used to carry moved into
+  the gate where it can be scoped: every camera on this protocol that is NOT the plain chain gets
+  "the write path on this line is implemented only for the 2014 plaintext chain ..." plus the
+  cipher-chain reasons that still apply. `compact-2016`, `compact-2014` and `generic` keep their
+  capability refusals untouched.
+
+### 27.3 What stays refused
+
+- A bank stored under a real keystream that merely also sums to 0 (the 1.0.3.x generation): the
+  identity-keystream test excludes it, and the test pins it — that camera gets the chain refusal,
+  no upgrade-target selector, and a `prepareImage` refusal.
+- 0.8.0.0 and any build whose version did not decode to a known table: the write needs the build's
+  own mode-0 row, and the refusal says so.
+- A read that could not get the roots word, or that left a slot unread, still refuses exactly as
+  before; so does every camera whose evidence names a different family with confidence.
+
+### 27.4 Tests
+
+| test                                                                                                                                                                                                                                                                                                                                                                         | before                                         | after      |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- | ---------- |
+| `core/test/plain-chain-flash.test.ts` (new): the gate passes with the chain as the reason; plain staging (payload == image bytes, u16 sum of them, no footer, no keys); the commit lands the bytes in the mode-0 bank and leaves slot A, recovery and cfg[0] untouched; the keystream bank refuses; > 0xE000 refuses; the REAL dump's own slot A image rounds the whole path | 6 fail (canFlash false; `profile/unsupported`) | pass, ~2 s |
+| `core/test/workflows.test.ts`: the legacy-camera read still refuses, now with the gate's reasons (key table, sum, target, chain) instead of the capability line                                                                                                                                                                                                              | —                                              | pass       |
+| `core/test/profiles.test.ts`: `legacy-auth` declares flash; `compact-2016`/`generic` still refuse with their reasons                                                                                                                                                                                                                                                         | legacy-auth in the refusing list               | pass       |
+
+The emulator suites are untouched: the write mechanism this path emits (arm a bank with the token
+or mode 0, stage image length only, commit the u16 sum) is what secs. 23 and 26 already proved
+against the real dump's emulator rows.
+
+### 27.5 What this changes for the hardware round-trip
+
+- The shape that flashes is the SLOT IMAGE — the 47,768 B at dump offset 0x50000 — not the whole
+  4 MiB dump: a whole-dump file is refused by the shared length cap (`header.length >= 0x10000`
+  would never boot), which is also the honest answer, since the app's upgrade path takes an image.
+  The infrastructure check is therefore "flash the camera its own slot A content", which the new
+  test runs verbatim offline.
+- Expected shape: `seek-fw flash <slot-a-image.bin> --yes` acts under `legacy-auth`, shows the plan
+  (target "App image bank 0x14060000", staged verbatim, no key retargeting), takes the rescue dump,
+  arms mode 0, streams 47,768 B in 64-byte chunks, commits the u16 sum, reads the bank back and
+  reports "stored verbatim".
+- The 2014 commit does NOT rewrite the boot record: the camera keeps booting whatever cfg[0]
+  names. On the bench unit (blank record → boots A, slot B erased) the round-trip writes the empty
+  bank B and the camera's running firmware is untouched by construction; the proof is the
+  read-back plus a fresh `dump` of mode 8 compared against the staged bytes.

@@ -91,7 +91,7 @@ import type {
   WindowEntry,
   WindowPlan,
 } from './types.js';
-import { SUPPORTED, unsupported } from './types.js';
+import { SUPPORTED } from './types.js';
 import { agreedRows, buildWindowPlan } from './plan.js';
 import { primaryVersion, versionSource } from './version.js';
 import { FLASH_BASE, FLASH_SIZE, HDR_HI, HDR_LO, WINDOW_SIZE } from './modern-4x.js';
@@ -185,7 +185,8 @@ function legacyRows(traits: LegacyTraits): readonly SelectorRow[] {
       note:
         traits.modeOne === 'boot-config'
           ? "reads entry 1 or 2 of the bootloader's config block at run time"
-          : 'picks 0x14050000 or 0x14060000 at run time, from the image id in the boot record',
+          : 'fw_update_slot_address(): arms 0x14050000 or 0x14060000 — the slot the roots' +
+            ' active-slot word does not name (the upgrade target)',
     },
     traits.modeOne === 'literal'
       ? { subcmd: 1, address: 0x14020000, channel: 'plain', note: 'config/factory area' }
@@ -340,6 +341,24 @@ function normalisedVersion(version: string | null): string | null {
     .slice(1, 5)
     .map((n) => String(Number.parseInt(n, 10)))
     .join('.');
+}
+
+/**
+ * The builds of this line whose own decoded mode-0 row is the upgrade target —
+ * `fw_update_slot_address()` over the roots' active-slot word. Every image from
+ * 0.9.0.2 on computes mode 0 the same way (loads `0x10000200`, the roots word
+ * GetFirmwareInfo selector 10 reports, and `0x14060000`;
+ * `test/firmware/facts.json`), and FW-V1's reconstruction of the function names
+ * it: active_slot 0 -> slot B, anything else -> slot A. 0.8.0.0 computes mode 0
+ * through the bootloader's own config table instead, and nothing has measured
+ * where that lands, so the plaintext-chain write path is decoded for these
+ * builds and refuses the rest.
+ */
+export function legacyUpgradeTargetBuild(version: string | null): string | null {
+  const v = normalisedVersion(version);
+  if (v === null) return null;
+  const traits = LEGACY_BUILDS.get(v);
+  return traits !== undefined && traits.modeOne !== 'boot-config' ? v : null;
 }
 
 /** The first build with a read handler for GetFeaturedFirmwareData (see `compact-2014`). */
@@ -504,26 +523,27 @@ export const LEGACY_SLOTS: readonly SlotDescriptor[] = [
  */
 export const LEGACY_SWEEP_RANGE: readonly [number, number] = [0, 0x41];
 
-const FLASH_REFUSAL =
-  "this profile's write path was never validated against hardware and its selector map " +
-  'differs from the 4.x one (0x14050000/0x14060000/0x14070000 are subcommands 7/8/9 here, ' +
-  'and the protected banks answer only on the authenticated channel). Refusing is the only ' +
-  'answer that cannot brick a camera.';
-
 /**
- * No boot policy: the legacy bootloader's boot-config block was never decoded.
+ * No replayable boot policy: this generation's `select_boot_slot()` has not
+ * been reconstructed into this profile, so `selectBootSlot` refuses rather than
+ * replaying the 4.x one over a bootloader it was not read from — a fabricated
+ * "booted A, would write B" is exactly the kind of confident wrong answer that
+ * costs someone a camera.
  *
- * `describeCfg0` stays safe to call so a UI can always print something, but
- * `selectBootSlot` refuses rather than replaying the 4.x `select_boot_slot()`
- * over a bootloader it was not read from — a fabricated "booted A, would write B"
- * is exactly the kind of confident wrong answer that costs someone a camera.
- * Callers reach this only on the flash path, which `capabilities.flash` already
- * refuses.
+ * THE WRITE PATH DOES NOT NEED THE REPLAY. On the 2014 plaintext chain the
+ * camera answers for itself: `fw_update_slot_address()` — mode 0, the selector
+ * `readDeviceInfo` confirms on the wire — reads the roots' active-slot word and
+ * arms the OTHER bank, so the device-info read names the booted and target
+ * slots from that word and never replays cfg[0] (`legacyUpgradeTargetBuild`
+ * holds this to the builds whose own decoded table says so).
  */
 export const LEGACY_BOOT: BootPolicy = {
-  /* A deliberate non-selector. There is no known subcommand that arms an upgrade
-   * target on this generation, and -1 cannot be encoded as a uint16 subcommand,
-   * so a stray write fails loudly instead of arming bank 0. */
+  /* A deliberate non-selector in the PROFILE POLICY: `upgradeSelectorIn` only
+   * arms the profile's number when the running build's own table carries it,
+   * and this profile's number is used by no generic path. The plaintext chain's
+   * write sets the state's selector itself, from the build's decoded mode-0 row
+   * and the chain gate — never from this field. -1 cannot be encoded as a
+   * uint16 subcommand, so a stray write fails loudly instead of arming bank 0. */
   updateTargetSubcmd: -1,
 
   describeCfg0(cfg0: number): string {
@@ -533,9 +553,10 @@ export const LEGACY_BOOT: BootPolicy = {
   selectBootSlot(): BootPrediction {
     throw new SeekError(
       'profile/unsupported',
-      "Legacy locked firmware: the bootloader's slot-selection logic was never decoded, " +
-        'so the booted slot cannot be predicted. ' +
-        FLASH_REFUSAL,
+      "Legacy locked firmware: this generation's select_boot_slot() has not been " +
+        'reconstructed, so the booted slot cannot be replayed from cfg[0]. On the 2014 ' +
+        "plaintext chain the write path does not replay it — the camera's own active-slot " +
+        'word names both ends of an upgrade (mode 0, fw_update_slot_address()).',
       { detail: { profile: 'legacy-auth', capability: 'flash' } },
     );
   },
@@ -546,7 +567,18 @@ const CAPABILITIES: ProfileCapabilities = {
   sweep: SUPPORTED,
   decrypt: SUPPORTED,
   deviceInfo: SUPPORTED,
-  flash: unsupported(FLASH_REFUSAL),
+  /* The write path is the preservation campaign's, measured against the real
+   * 1.3.0.0 dump's chain (TESTING.md sec.23): BeginFirmwareUpgrade(0) arms
+   * fw_update_slot_address(), SetFeaturedFirmwareData stages IMAGE LENGTH ONLY
+   * (the descriptor's staging buffer holds 0xE000), CompleteMemoryUpgrade
+   * checks the u16 sum of the staged bytes and programs exactly those bytes.
+   * THE GATE is what keeps it off everything else: only the 2014 plaintext
+   * chain — banks stored plain, word sum 0, no key material — passes it, and
+   * every other build of the line is refused with that reason. Where the
+   * refusal lived before, per profile, it now lives per chain, because the
+   * line's own decoded tables and the v1 campaign settled what is and is not
+   * staged on it. */
+  flash: SUPPORTED,
 };
 
 /* ---- detection ---------------------------------------------------------- */
@@ -680,7 +712,9 @@ export const legacyAuth: FirmwareProfile = {
     'have one), and there is no selector above 0x141fffff. Each build is dumped with its own ' +
     'selector table: 31 blocks on the 2016-2017 builds (25 of the modern map answer plain), ' +
     'and on the 2014 builds 0x140C0000 is out of reach because their table gives subcommand ' +
-    '0x0E the address of 0x0D. Read-only: the write path was never validated on this generation.',
+    '0x0E the address of 0x0D. Flashing works on the 2014 plaintext chain — banks stored ' +
+    'plain, word sum 0, no keys, the staged bytes verbatim — and the device-info gate ' +
+    'refuses every other build of the line with that reason.',
   cipher: LEGACY_CIPHER,
   memory: LEGACY_MEMORY,
   capabilities: CAPABILITIES,

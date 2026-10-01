@@ -16,10 +16,20 @@
  *                             programs, verifies, and rewrites cfg[0] to point
  *                             at that slot.
  *
+ * THE 2014 PLAINTEXT CHAIN is the one line where that description is not the
+ * whole story, and it is spelled out where it branches: its banks hold the
+ * image with no cipher and no "CODE" footer, its bootloader accepts a slot on
+ * magic + length + stored-word-sum-0 alone, and its commit programs the staged
+ * bytes exactly as sent. `prepareImage` stages that chain plain (below), and
+ * the guard becomes `assertPlainChainPayload` — the bootloader's own three
+ * checks — instead of the footer guard, which the chain's slots would fail by
+ * design.
+ *
  * The two structural facts that make this dangerous, and the two guards that
- * answer them, live in `image/bank.ts`: a bank is image + 0xFF pad + a "CODE"
- * footer (`buildBankPayload`), and anything else must not be streamed
- * (`assertBankPayload`). What lives HERE is everything that is about a
+ * answer them, live in `image/bank.ts`: a cipher bank is image + 0xFF pad + a
+ * "CODE" footer (`buildBankPayload`), and anything else must not be streamed
+ * (`assertBankPayload`); a plain-chain bank is the image alone
+ * (`assertPlainChainPayload`). What lives HERE is everything that is about a
  * particular camera: its key table, its target slot, its footer.
  * ==================================================================== */
 
@@ -34,7 +44,14 @@ import {
   parseKeyFilenameSuffix,
 } from '../crypto/keys.js';
 import { recoverState } from '../crypto/recover.js';
-import { assertBankPayload, buildBankPayload, transferSum16 } from '../image/bank.js';
+import {
+  assertBankPayload,
+  assertPlainChainPayload,
+  buildBankPayload,
+  setAcceptSum,
+  transferSum16,
+  wordSum32,
+} from '../image/bank.js';
 import {
   FOOTER_TAG,
   HEADER_OFFSET,
@@ -115,7 +132,10 @@ export function prepareImage(
   }
   const keyTable = state.keyTable;
   const target = targetSlot(state);
-  if (keyTable === null || target === null) {
+  /* The key table is a cipher-chain requirement: on the 2014 plaintext chain
+   * nothing on the write is encrypted, so the analysis owes the write only the
+   * target slot. */
+  if (target === null || (keyTable === null && !state.plainChain)) {
     throw new SeekError(
       'flash/refused',
       "the device analysis does not name this camera's key table and target slot",
@@ -171,6 +191,87 @@ export function prepareImage(
   }
 
   const declaredBefore = dv.getUint32(LENGTH_OFFSET, true);
+
+  /* ---- the 2014 plaintext chain: stage the bytes verbatim ----------------
+   *
+   * The chain's staged form is the image itself — length-stamped, the free
+   * adjust word at +0x238 balancing the STORED word sum to the bootloader's 0,
+   * and nothing else: no cipher (the camera programs the staged bytes as
+   * sent), no 0xFF pad, no "CODE" footer (the chain's slots hold the image
+   * alone; measured on the real dump, whose banks end where the image ends).
+   * No key is read or written on any step, so there is nothing to retarget and
+   * no filename to trust. The commit below carries the u16 sum of exactly
+   * these bytes. */
+  if (state.plainChain) {
+    const balanced = setAcceptSum(bytes, { ...state.profile.cipher, acceptanceSum: 0 });
+    if (balanced.sum !== 0) {
+      throw new SeekError('image/malformed', 'could not balance the stored word sum to 0');
+    }
+    assertPlainChainPayload(balanced.image);
+    const mine = parseImageHeader(balanced.image);
+    if (mine === null) {
+      throw new SeekError('image/malformed', 'the stamped image no longer parses as one');
+    }
+    const running = bootedSlot(state);
+    const now = running?.plainHeader ?? null;
+    const compare: ComparisonRow[] =
+      now === null
+        ? []
+        : (
+            [
+              ['Firmware version', now.versionStr, mine.versionStr],
+              ['Image id', hexUp(now.imageId), hexUp(mine.imageId)],
+              ['Initial SP', hexUp(now.sp), hexUp(mine.sp)],
+              ['Reset vector', hexUp(now.entry), hexUp(mine.entry)],
+              ['Size', `${String(now.length)} B`, `${String(balanced.length)} B`],
+            ] as const
+          )
+            .filter(([, a, b]) => a !== b)
+            .map(([field, onCamera, inImage]) => ({ field, onCamera, inImage }));
+    return {
+      compare,
+      layoutMoved: now !== null && (now.sp !== mine.sp || now.entry !== mine.entry),
+      plainChain: true,
+      keyPatch: {
+        offsetA: 0,
+        offsetB: 0,
+        adjacent: false,
+        where: 'none — the 2014 plaintext chain stores no key material',
+        fromA: '',
+        fromB: '',
+        toA: '',
+        toB: '',
+        changed: false,
+      },
+      carriesMine: false,
+      rekeyRisk: false,
+      targetName: target.name,
+      bootedName: running?.name ?? null,
+      runningSlot: running?.name ?? null,
+      fileName,
+      originalSize: bytes.length,
+      declaredBefore,
+      lengthStamped: declaredBefore !== balanced.image.length,
+      length: balanced.length,
+      adjust: balanced.adjust,
+      header: mine,
+      keyA: keyTable?.keyA ?? new Uint8Array(16),
+      payload: balanced.image,
+      footerOffset: 0,
+      footer: null,
+      footerFrom: null,
+      sum16: transferSum16(balanced.image),
+    };
+  }
+
+  /* The cipher path below needs the table; the guard above let a chain state
+   * through without one, and the chain branch returned. */
+  if (keyTable === null) {
+    throw new SeekError(
+      'flash/refused',
+      "the device analysis does not name this camera's key table and target slot",
+    );
+  }
   const myKeyA = keyTable.keyA;
   const myKeyB = keyTable.keyB;
 
@@ -331,6 +432,7 @@ export function prepareImage(
   return {
     compare,
     layoutMoved,
+    plainChain: false,
     keyPatch,
     carriesMine,
     rekeyRisk,
@@ -420,7 +522,10 @@ export async function writeFirmware(
     );
   }
 
-  assertBankPayload(prep.payload); /* last gate before anything is sent */
+  /* Last gate before anything is sent — the cipher chain's footer guard, or
+   * the plaintext chain's own three acceptance checks. */
+  if (prep.plainChain) assertPlainChainPayload(prep.payload);
+  else assertBankPayload(prep.payload);
 
   reporter.log(
     `target: ${target.name} at ${hex(target.address, 8)} (selector ${hex(subcmd)} — the camera ` +
@@ -527,57 +632,95 @@ export async function writeFirmware(
   /* Not a readback compare — a 576-byte read of the vector table, which is all
    * the GF(2) solve needs to name the key the camera just stored it under. That
    * answers the only question that matters: will the bootloader take this slot?
-   * Committing without an error does NOT imply it. */
+   * Committing without an error does NOT imply it. On the plaintext chain the
+   * same question is answered with the whole payload: the slot must read back
+   * the staged bytes verbatim and sum to the bootloader's 0 — no key names
+   * anything there. */
   try {
     await device.armWindow({ subcmd, address: target.address, note: 'upgrade target' });
-    const probeLen = HEADER_OFFSET + HEADER_SIZE;
-    const head = await device.readArmed(DEFAULT_READ_CHUNK, probeLen);
-    if (head.data.length < probeLen) throw new SeekError('device/window', 'short read');
-    const hv = viewOf(head.data);
-    if (hv.getUint32(HEADER_OFFSET, true) !== IMAGE_MAGIC) {
-      throw new SeekError('image/malformed', 'no image header in the slot');
-    }
-    const identity = identifyKey(
-      { state: recoverState(hv, 0), accepts: true },
-      state.keyTable,
-      state.storeKey,
-      state.keyWhiteningK,
-    );
-    if (identity.bootable) {
-      reporter.log(
-        `stored under ${identity.name ?? 'a known key'} — the bootloader will accept this slot`,
-        'ok',
-      );
+    if (prep.plainChain) {
+      const back = await device.readArmed(DEFAULT_READ_CHUNK, prep.payload.length);
+      const verbatim =
+        back.data.length === prep.payload.length &&
+        equalBytes(back.data, prep.payload) &&
+        wordSum32(back.data, back.data.length) === 0;
+      if (verbatim) {
+        reporter.log(
+          'stored verbatim — the slot reads back the staged bytes and their stored word sum ' +
+            'is 0, so the bootloader will accept this slot',
+          'ok',
+        );
+      } else {
+        reporter.log(
+          `the slot does not read back the staged bytes (${String(back.data.length)}/` +
+            `${String(prep.payload.length)} B came back) — re-read the device info before ` +
+            'trusting what landed',
+          'error',
+        );
+      }
     } else {
-      reporter.log(
-        `the camera stored it under a key the bootloader does not know (${identity.name ?? 'unknown key'})`,
-        'error',
+      const probeLen = HEADER_OFFSET + HEADER_SIZE;
+      const head = await device.readArmed(DEFAULT_READ_CHUNK, probeLen);
+      if (head.data.length < probeLen) throw new SeekError('device/window', 'short read');
+      const hv = viewOf(head.data);
+      if (hv.getUint32(HEADER_OFFSET, true) !== IMAGE_MAGIC) {
+        throw new SeekError('image/malformed', 'no image header in the slot');
+      }
+      const identity = identifyKey(
+        { state: recoverState(hv, 0), accepts: true },
+        state.keyTable,
+        state.storeKey,
+        state.keyWhiteningK,
       );
-      reporter.log(
-        '  it will be SKIPPED at boot and the camera will keep running whatever else is ' +
-          'bootable. This is a property of the firmware currently running on the camera, not of ' +
-          'the image you chose. Use an SPI programmer or SWD/J-Link to change what this camera runs.',
-        'error',
-      );
+      if (identity.bootable) {
+        reporter.log(
+          `stored under ${identity.name ?? 'a known key'} — the bootloader will accept this slot`,
+          'ok',
+        );
+      } else {
+        reporter.log(
+          `the camera stored it under a key the bootloader does not know (${identity.name ?? 'unknown key'})`,
+          'error',
+        );
+        reporter.log(
+          '  it will be SKIPPED at boot and the camera will keep running whatever else is ' +
+            'bootable. This is a property of the firmware currently running on the camera, not of ' +
+            'the image you chose. Use an SPI programmer or SWD/J-Link to change what this camera runs.',
+          'error',
+        );
+      }
     }
   } catch (error) {
     if (error instanceof CancelledError) throw error;
     reporter.log(
-      `could not check which key the camera stored it under: ${errorMessage(error)} — re-read ` +
-        'the device info after replugging',
+      prep.plainChain
+        ? `could not read the slot back (${errorMessage(error)}) — re-read the device info ` +
+            'after replugging'
+        : `could not check which key the camera stored it under: ${errorMessage(error)} — re-read ` +
+            'the device info after replugging',
       'warn',
     );
   }
 
   reporter.log('');
   reporter.log('NOW UNPLUG AND REPLUG THE CAMERA.', 'warn');
-  reporter.log(
-    'Proven so far: the payload streamed, the camera accepted its checksum, and the commit ' +
-      'returned no error. NOT proven: that the bootloader will select this slot, or that the ' +
-      'image runs. The bank switch only takes effect on a real power cycle, so replug and read ' +
-      'the device info again — the running version it reports is the only thing that settles it.',
-    'detail',
-  );
+  if (prep.plainChain) {
+    reporter.log(
+      'Proven: the payload streamed, the commit returned no error, and the slot reads back the ' +
+        "staged bytes with word sum 0 — the 2014 bootloader's own acceptance test. NOT done: " +
+        "this chain's commit does not rewrite the boot record, so the camera keeps booting the " +
+        'bank cfg[0] names. Replug, re-read, and compare the written bank against a fresh dump.',
+      'detail',
+    );
+  } else {
+    reporter.log(
+      'Proven so far: the payload streamed, the camera accepted its checksum, and the commit ' +
+        'returned no error. NOT proven: that the bootloader will select this slot, or that the ' +
+        'image runs. The bank switch only takes effect on a real power cycle, so replug and read ' +
+        'the device info again — the running version it reports is the only thing that settles it.',
+      'detail',
+    );
+  }
   reporter.progress(
     1,
     1,

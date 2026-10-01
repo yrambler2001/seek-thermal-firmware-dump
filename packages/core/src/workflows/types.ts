@@ -297,7 +297,13 @@ export interface DeviceState {
   readonly slots: readonly SlotState[];
   readonly byKey: ReadonlyMap<SlotKey, SlotState>;
 
-  /** The bootloader's own replayed choice, or null when it could not be replayed. */
+  /**
+   * The slot an upgrade would write and the one running, or null when neither
+   * could be named. On the cipher chains this is the bootloader's own replayed
+   * choice; on the 2014 plaintext chain there is no replay, and the camera's
+   * own active-slot word — the word its mode-0 upgrade selector reads — names
+   * both ends instead.
+   */
   readonly boot: BootPrediction | null;
   /**
    * The upgrade-target selector, as the running firmware's own table carries
@@ -311,6 +317,17 @@ export interface DeviceState {
 
   /** At least one slot decrypts to this profile's acceptance sum. */
   readonly familyOk: boolean;
+  /**
+   * The 2014 plaintext chain is this camera's at-rest form: a bank's GF(2)
+   * keystream solve came back as the identity state and the stored words sum
+   * to the bootloader's 0 — the slot bytes ARE the image, there is no footer,
+   * and no key material is involved on any step of an upgrade. On this chain
+   * the flash gate needs no key table, no cipher target and no boot replay:
+   * the target comes from the camera's own active-slot word, and the staged
+   * bytes go to the camera verbatim. False on every cipher chain, where the
+   * ordinary gate reasons apply in full.
+   */
+  readonly plainChain: boolean;
   readonly canFlash: boolean;
   /** Why `canFlash` is false, for a UI that has to explain the greyed-out button. */
   readonly flashBlockedBy: readonly string[];
@@ -360,6 +377,13 @@ export interface PreparedFlash {
   readonly compare: readonly ComparisonRow[];
   /** The SP or reset vector moved: a differently linked build. */
   readonly layoutMoved: boolean;
+  /**
+   * The payload is the 2014 plaintext chain's staged form: the image bytes
+   * themselves (length-stamped, word sum balanced to 0), no cipher, no pad,
+   * no footer, no key table. The commit carries the u16 sum of exactly these
+   * bytes, and the camera programs them as sent.
+   */
+  readonly plainChain: boolean;
   readonly keyPatch: KeyPatchRecord;
   /** The image (after patching) carries this camera's key pair. */
   readonly carriesMine: boolean;

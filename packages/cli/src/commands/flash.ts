@@ -73,6 +73,7 @@ function planJson(prep: PreparedFlash, payloadSha256: string): Record<string, un
     targetSlot: prep.targetName,
     bootedSlot: prep.bootedName,
     runningSlot: prep.runningSlot,
+    plainChain: prep.plainChain,
     keyPatch: {
       where: prep.keyPatch.where,
       changed: prep.keyPatch.changed,
@@ -121,9 +122,11 @@ function renderPlan(ctx: CommandContext, prep: PreparedFlash, payloadSha256: str
       ['  acceptance sum', `balanced with adjust ${hexUp(prep.adjust)} at +0x238`],
       [
         '  key retargeting',
-        prep.keyPatch.changed
-          ? `rewritten at ${prep.keyPatch.where}: ${prep.keyPatch.fromA} -> ${prep.keyPatch.toA}`
-          : `none needed — the image already carries this camera's keys (${prep.keyPatch.where})`,
+        prep.plainChain
+          ? 'none — the 2014 plaintext chain stores no key material and nothing is encrypted'
+          : prep.keyPatch.changed
+            ? `rewritten at ${prep.keyPatch.where}: ${prep.keyPatch.fromA} -> ${prep.keyPatch.toA}`
+            : `none needed — the image already carries this camera's keys (${prep.keyPatch.where})`,
       ],
       [
         '  target slot',
@@ -133,9 +136,11 @@ function renderPlan(ctx: CommandContext, prep: PreparedFlash, payloadSha256: str
       ],
       [
         '  payload',
-        `${String(prep.payload.length)} B, footer at ${hexUp(prep.footerOffset)}${
-          prep.footerFrom === null ? '' : ` carried over from ${prep.footerFrom}`
-        }`,
+        prep.plainChain
+          ? `${String(prep.payload.length)} B, staged verbatim (plain chain: no cipher, no footer)`
+          : `${String(prep.payload.length)} B, footer at ${hexUp(prep.footerOffset)}${
+              prep.footerFrom === null ? '' : ` carried over from ${prep.footerFrom}`
+            }`,
       ],
       ['  footer model', prep.footer?.model ?? '(none)'],
       ['  transfer checksum', hexUp(prep.sum16, 4)],
@@ -169,7 +174,7 @@ function renderPlan(ctx: CommandContext, prep: PreparedFlash, payloadSha256: str
         'rebuild of what the camera runs',
     );
   }
-  if (!prep.carriesMine) {
+  if (!prep.carriesMine && !prep.plainChain) {
     warnings.push(
       "the image does not carry this camera's key pair even after patching — later upgrades " +
         'may land under a key this bootloader cannot try',

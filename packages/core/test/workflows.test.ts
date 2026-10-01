@@ -25,6 +25,7 @@ import { SeekDevice } from '../src/protocol/client.js';
 import { OP, OP_DIRECTION, READ_ONLY_OPS, WINDOW_SIZE, type Opcode } from '../src/protocol/ops.js';
 import { compact2014 } from '../src/profiles/compact-2014.js';
 import { compact2016 } from '../src/profiles/compact-2016.js';
+import { generic } from '../src/profiles/generic.js';
 import {
   buildLegacyWindowMap,
   legacyAuth,
@@ -336,6 +337,7 @@ function makeDeviceState(keyA: Uint8Array, keyB: Uint8Array): DeviceState {
     updateTargetSubcmd: 0,
     targetConfirmed: null,
     familyOk: true,
+    plainChain: false,
     canFlash: true,
     flashBlockedBy: [],
   };
@@ -892,7 +894,9 @@ describe('prepareImage', () => {
   });
 
   it('refuses outright on a profile that does not support flashing', () => {
-    const state: DeviceState = { ...makeDeviceState(myKeyA, myKeyB), profile: legacyAuth };
+    /* legacy-auth now declares flash — the gate, not the capability, scopes it
+     * to the plain chain — so the capability refusal left is generic's. */
+    const state: DeviceState = { ...makeDeviceState(myKeyA, myKeyB), profile: generic };
     const image = makePlainImage(srcKeyA, srcKeyB, modern4x);
     const suffix = keyFilenameSuffix(srcKeyA, srcKeyB);
     expectRefusal(() => prepareImage(state, image, `fw${suffix}.bin`), 'profile/unsupported');
@@ -958,10 +962,13 @@ describe('prepareImage', () => {
  * ==================================================================== */
 
 describe('readDeviceInfo', () => {
-  it('reports everything it can on a non-flashable profile and refuses to flash', async () => {
+  it('reports everything it can on a camera off the plain chain and refuses to flash', async () => {
     /* legacy-auth deliberately throws from selectBootSlot: its bootloader was
      * never decoded, so it will not fabricate a boot prediction. A device-info
-     * run must still complete and say why flashing is off. */
+     * run must still complete and say why flashing is off — the profile's
+     * capability no longer refuses for it, so the reasons are the gate's: no
+     * key table, no acceptance sum, no target, and no bank stored plain (the
+     * only form this line's write path stages). */
     const camera = cameraFor(legacyAuth);
     const reporter = collectingReporter();
     const ctx = await contextFor(legacyAuth, camera, reporter);
@@ -970,8 +977,13 @@ describe('readDeviceInfo', () => {
 
     expect(state.profile.id).toBe('legacy-auth');
     expect(state.boot).toBeNull();
+    expect(state.plainChain).toBe(false);
     expect(state.canFlash).toBe(false);
-    expect(state.flashBlockedBy.join(' ')).toContain('does not support flashing');
+    const blocked = state.flashBlockedBy.join(' ');
+    expect(blocked).toContain('key table could not be confirmed');
+    expect(blocked).toContain('acceptance sum');
+    expect(blocked).toContain('the slot an upgrade would write could not be determined');
+    expect(blocked).toContain('implemented only for the 2014 plaintext chain');
     expect(state.slots).toHaveLength(legacyAuth.slots.length);
     /* the emulated flash holds no firmware image, so no slot is present */
     expect(state.slots.every((s) => !s.present)).toBe(true);

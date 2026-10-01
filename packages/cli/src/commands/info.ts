@@ -105,6 +105,7 @@ export function stateJson(state: DeviceState): Record<string, unknown> {
     },
     slots: state.slots.map(slotJson),
     familyOk: state.familyOk,
+    plainChain: state.plainChain,
     canFlash: state.canFlash,
     flashBlockedBy: [...state.flashBlockedBy],
   };

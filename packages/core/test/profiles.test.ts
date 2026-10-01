@@ -740,13 +740,23 @@ describe('detection', () => {
 });
 
 describe('capabilities', () => {
-  const REFUSING: readonly FirmwareProfile[] = [legacyAuth, compact2016, generic];
+  /* legacy-auth no longer refuses at the capability level: its write path is
+   * the preservation campaign's, measured on the real 1.3.0.0 dump's chain,
+   * and the device-info gate keeps it off every build of the line but the
+   * 2014 plaintext chain (see plain-chain-flash.test.ts). */
+  const REFUSING: readonly FirmwareProfile[] = [compact2016, generic];
 
   it('lets modern-4x flash', () => {
     expect(() => {
       requireCapability(modern4x, 'flash');
     }).not.toThrow();
     expect(modern4x.capabilities.flash.supported).toBe(true);
+  });
+
+  it('lets legacy-auth declare flash — the gate, not the capability, scopes it to the chain', () => {
+    expect(() => {
+      requireCapability(legacyAuth, 'flash');
+    }).not.toThrow();
   });
 
   for (const profile of REFUSING) {

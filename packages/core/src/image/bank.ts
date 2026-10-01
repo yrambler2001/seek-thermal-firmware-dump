@@ -10,9 +10,15 @@
  * so a bare-image upload destroys the footer, the bootloader falls into its
  * segmented loader, and the camera bricks. `buildBankPayload` always emits the
  * full bank, and `assertBankPayload` refuses to stream anything else.
+ *
+ * THE 2014 PLAINTEXT CHAIN is the exception, and it is stated where it is
+ * guarded (below): that generation's bootloader accepts a slot on the magic, a
+ * length below 0x10000 and a zero STORED word sum alone — no footer, no key —
+ * and its banks hold the image alone. `assertPlainChainPayload` is that
+ * chain's guard, and nothing on it is encrypted.
  * ==================================================================== */
 
-import { hex, viewOf } from '../bytes.js';
+import { hex, hexUp, viewOf } from '../bytes.js';
 import { SeekError } from '../errors.js';
 import { cryptBytes } from '../crypto/cipher.js';
 import { stateFromKey } from '../crypto/keys.js';
@@ -23,6 +29,7 @@ import {
   FOOTER_TAG,
   HEADER_OFFSET,
   HEADER_SIZE,
+  IMAGE_MAGIC,
   LENGTH_OFFSET,
   bankPayloadSize,
   footerOffsetFor,
@@ -192,6 +199,76 @@ export function assertBankPayload(payload: Uint8Array): void {
       `footer length ${hex(footerLength)} != header.length ${hex(length)} — the bootloader would ` +
         'reject this slot',
       { detail: { footerLength, length } },
+    );
+  }
+}
+
+/* ==================================================================== *
+ * The 2014 plaintext chain's bank form.
+ * ==================================================================== */
+
+/**
+ * How much the upgrade descriptor stages. The modern chain's cap is the whole
+ * 64 KiB window; the v1 chain's descriptor stages into 0x20002000 + 0xE000,
+ * so a payload of image length must stay at or under 0xE000 — measured on the
+ * real chain (FW-V1 doc 34; the preservation pipeline stages image length
+ * only, and a full 64 KiB stage overruns the buffer).
+ */
+export const PLAIN_CHAIN_STAGE_MAX = 0xe000;
+
+/**
+ * The 2014 plaintext chain's acceptance test, applied to a payload BEFORE it
+ * is streamed — the three checks the chain's bootloader itself makes on a
+ * slot: the magic at +0x200, a header.length under 0x10000 that matches the
+ * payload, and a stored word sum of 0. No footer and no key enter into it:
+ * the chain's slots hold the image alone, and nothing on this path is
+ * encrypted. (`assertBankPayload` is the cipher chain's guard and demands a
+ * "CODE" footer the chain does not keep.)
+ */
+export function assertPlainChainPayload(payload: Uint8Array): void {
+  if (payload.length < HEADER_OFFSET + HEADER_SIZE) {
+    throw new SeekError(
+      'flash/refused',
+      `payload is ${String(payload.length)} B — too small to hold an image header at ${hex(
+        HEADER_OFFSET,
+      )}`,
+    );
+  }
+  if (payload.length > PLAIN_CHAIN_STAGE_MAX) {
+    throw new SeekError(
+      'image/unsupported',
+      `image is ${String(payload.length)} B; the upgrade descriptor's staging buffer holds ` +
+        `${hexUp(PLAIN_CHAIN_STAGE_MAX)} B (0x20002000 + 0xE000), so the stream would stop ` +
+        'part-way and the commit would program a truncated image',
+      { detail: { length: payload.length, max: PLAIN_CHAIN_STAGE_MAX } },
+    );
+  }
+  const dv = viewOf(payload);
+  const magic = dv.getUint32(HEADER_OFFSET, true);
+  if (magic !== IMAGE_MAGIC) {
+    throw new SeekError(
+      'flash/refused',
+      `no image header at ${hexUp(HEADER_OFFSET)} (magic ${hexUp(magic)}, expected ` +
+        `${hexUp(IMAGE_MAGIC)}) — this must be the image as stored, not a flash dump`,
+      { detail: { magic, expected: IMAGE_MAGIC } },
+    );
+  }
+  const length = dv.getUint32(LENGTH_OFFSET, true);
+  if (length !== payload.length) {
+    throw new SeekError(
+      'image/malformed',
+      `header.length ${hexUp(length)} != payload length ${hexUp(payload.length)} — the ` +
+        'bootloader sums exactly header.length words, so the two must agree',
+      { detail: { length, payloadLength: payload.length } },
+    );
+  }
+  const sum = wordSum32(payload, payload.length);
+  if (sum !== 0) {
+    throw new SeekError(
+      'flash/refused',
+      `the stored word sum is ${hexUp(sum)}, not 0 — the 2014 bootloader accepts a slot only ` +
+        'when its stored words sum to 0',
+      { detail: { sum } },
     );
   }
 }
