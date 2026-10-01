@@ -291,10 +291,13 @@ async function resumeCommand(ctx: CommandContext, runDir: string): Promise<Comma
     state.steps.commit?.status !== 'done'
   ) {
     ctx.reporter.log(
-      'WARNING: starting at or past the drain, and this run has no COMPLETED commit step. ' +
-        'The camera is expected to be in the PATCHED state (the commit may have landed ' +
-        'without its checkpoint being written). If it is not, stop: re-run the commit step ' +
-        'instead (--resume without --from-step) and it will detect what the bank holds.',
+      'WARNING: this jump goes past an INCOMPLETE commit — the camera is expected to be in ' +
+        'the PATCHED state (the commit may have landed without its checkpoint being written). ' +
+        'The jump is granted because you asked for it explicitly; the protections that remain ' +
+        "are the steps' own: the restore detects an already-original bank, and the verify " +
+        'refuses any diff against the backup. If the camera is NOT patched, stop and re-run ' +
+        'the commit instead (--resume without --from-step) — its pre-check reads the bank ' +
+        'before writing.',
       'warn',
     );
   }
@@ -325,6 +328,10 @@ async function resumeCommand(ctx: CommandContext, runDir: string): Promise<Comma
       ...(ctx.options.chunk === null ? {} : { drainChunk: ctx.options.chunk }),
     },
     image,
+    /* An explicit --from-step is the one loud way a jump past an incomplete
+     * write step is granted; core relaxes only the ordering gates, never the
+     * file gates, and the wire-side pre-checks stay in the steps. */
+    fromStep !== null,
   );
   return runResult(ctx, runDir, finalState, ctx.file === null ? null : basename(ctx.file));
 }
@@ -347,6 +354,7 @@ async function runSteps(
   runDir: string,
   initialState: PreserveRunState,
   image: Uint8Array | null,
+  allowJump = false,
 ): Promise<PreserveRunState> {
   /* A fresh session per step boundary. After a wire-89 the camera
    * re-enumerates, so open() retries until the camera is back (or the run is
@@ -393,7 +401,15 @@ async function runSteps(
     ctx.reporter.log(`— ${step} —`, 'info');
     let outcome;
     try {
-      outcome = await runPreserveStep(step, opener, state, loadArtifact, ctx.reporter, ctx.signal);
+      outcome = await runPreserveStep(
+        step,
+        opener,
+        state,
+        loadArtifact,
+        ctx.reporter,
+        ctx.signal,
+        allowJump ? { allowJump: true } : {},
+      );
     } catch (error) {
       if (isCancellation(error)) throw error;
       /* The failure is checkpointed; --print-state reports it, and the step

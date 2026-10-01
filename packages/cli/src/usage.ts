@@ -188,10 +188,12 @@ power, keep the run directory.
   --yes                  skip the confirmation (required when stdin is not a tty)
   --resume <dir>         continue the run in <dir> from its next step
   --from-step <id>       with --resume: start at a chosen step. Refused when the
-                         step's prerequisites are missing from the run directory
-                         (commit without the backup files; drain before commit);
-                         warns loudly when jumping past the commit, because the
-                         camera is then expected to be in the patched state.
+                         step's files are missing from the run directory (commit
+                         without the backup files) or the step already completed;
+                         jumping past an incomplete commit warns loudly and then
+                         runs on your explicit assertion that the camera is in the
+                         patched state (the restore and verify keep their own
+                         wire-side checks).
   --print-state <dir>    print the run's state, its next step, and whether the
                          checkpoint files still match what was recorded.
 

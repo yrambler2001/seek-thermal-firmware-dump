@@ -347,7 +347,7 @@ describe('preserve — resume from a run the drain killed', () => {
   );
 
   it(
-    '--from-step refuses when the step it names has no completed commit under it',
+    '--from-step past an incomplete commit warns loudly, and the run recovers safely',
     { timeout: 180_000 },
     async () => {
       const plain = await writePlainFile();
@@ -357,7 +357,9 @@ describe('preserve — resume from a run the drain killed', () => {
         testIo({ backend: backendOf(camera) }).io,
         signal(),
       );
-      /* Rewind the on-disk state to just after the backup: patch not done. */
+      /* Rewind the on-disk state to just after the backup: patch/commit not
+       * on record, while the camera is fact RESTORED (the full run above put
+       * it back). Exactly the ambiguous state a lost checkpoint can leave. */
       const state = await loadState();
       const rewound: PreserveRunState = { ...state, nextStep: 'patch' };
       delete rewound.steps.patch;
@@ -370,14 +372,26 @@ describe('preserve — resume from a run the drain killed', () => {
         `${JSON.stringify(rewound, null, 2)}\n`,
       );
 
-      const refused = testIo({ backend: backendOf(camera) });
+      const jumped = testIo({ backend: backendOf(camera) });
       const code = await run(
         ['preserve', '--resume', runDir(), '--from-step', 'drain', '--yes'],
-        refused.io,
+        jumped.io,
         signal(),
       );
-      expect(code).toBe(EXIT_FAILED);
-      expect(refused.stderr.text).toMatch(/no completed commit/);
+      expect(code).toBe(EXIT_OK);
+      expect(jumped.stdout.text).toMatch(
+        /WARNING: jumping from patch to drain, skipping: patch, commit/,
+      );
+      expect(jumped.stdout.text).toMatch(/past an INCOMPLETE commit .* expected to be in the/);
+      /* The wire-side protections held: the drain read the (original) part,
+       * the restore detected an already-original bank, the verify proved
+       * 0 diffs — and the camera was never written. */
+      const after = await loadState();
+      expect(after.nextStep).toBe('done');
+      expect(after.steps.restore?.notes).toMatch(/already held the original content/);
+      expect(after.verify).toEqual({ diffBytes: 0, windowsRead: 31, badWindows: [] });
+      const expectedFlash = new Uint8Array(v1Camera(plain).flash);
+      expect(await sha256hex(camera.flash)).toBe(await sha256hex(expectedFlash));
     },
   );
 

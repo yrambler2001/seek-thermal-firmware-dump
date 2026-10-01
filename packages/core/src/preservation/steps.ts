@@ -353,11 +353,23 @@ const isDone = (state: PreserveRunState, id: PreserveStepId): boolean =>
  * the patched part; and the restore exists before the verify that proves it.
  * A step that is already `done` always refuses — re-running a completed step
  * is never what a resume wants.
+ *
+ * `options.allowJump` relaxes exactly the three ORDERING gates past the
+ * commit (drain/restore without a completed commit, verify without a
+ * completed restore) — nothing else. The operator who jumps explicitly is
+ * asserting the writes landed without their checkpoints; the artifact and
+ * file gates stay absolute (a jump cannot fabricate a restore source), the
+ * commit step's own gates never relax, and the wire stays protected by the
+ * step-level checks that remain (the commit pre-check, the restore
+ * already-original detection, verify's 0-diff proof). Both front ends gate
+ * the override behind their loudest interaction — the CLI's `--from-step`
+ * with its WARNING line, the web's danger dialog.
  */
 export async function describeStepGate(
   step: PreserveStepId,
   state: PreserveRunState,
   loadArtifact: PreserveArtifactLoader,
+  options: { readonly allowJump?: boolean } = {},
 ): Promise<string | null> {
   if (state.nextStep === 'done') {
     return `this run is done — every step completed (run ${state.runId})`;
@@ -370,6 +382,7 @@ export async function describeStepGate(
     );
   }
 
+  const jump = options.allowJump === true;
   const doneSteps = PRESERVE_STEP_IDS.filter((id) => isDone(state, id));
   switch (step) {
     case 'backup': {
@@ -412,11 +425,12 @@ export async function describeStepGate(
       return null;
     }
     case 'drain': {
-      if (!isDone(state, 'commit')) {
+      if (!isDone(state, 'commit') && !jump) {
         return (
           'drain reads the PATCHED part through the widened window, and this run has no ' +
           'completed commit — the drain would stall on a stock camera. Run (or resume at) ' +
-          'the commit first.'
+          'the commit first, or jump explicitly (allowJump) if the commit landed without ' +
+          'its checkpoint.'
         );
       }
       if (state.detection === undefined) {
@@ -431,10 +445,11 @@ export async function describeStepGate(
       return null;
     }
     case 'restore': {
-      if (!isDone(state, 'commit')) {
+      if (!isDone(state, 'commit') && !jump) {
         return (
           'restore puts the original bank back over the patch, and this run has no completed ' +
-          'commit — there is nothing it can be reverting. Run (or resume at) the commit first.'
+          'commit — there is nothing it can be reverting. Run (or resume at) the commit ' +
+          'first, or jump explicitly (allowJump) to restore an already-patched camera.'
         );
       }
       if (state.detection === undefined) {
@@ -452,10 +467,11 @@ export async function describeStepGate(
       return null;
     }
     case 'verify': {
-      if (!isDone(state, 'restore')) {
+      if (!isDone(state, 'restore') && !jump) {
         return (
           'verify compares a fresh boot against the backup, and this run has no completed ' +
-          'restore — a patched bank would show as diffs. Run (or resume at) the restore first.'
+          'restore — a patched bank would show as diffs. Run (or resume at) the restore ' +
+          'first, or jump explicitly (allowJump) if the restore landed without its checkpoint.'
         );
       }
       if ((await loadArtifact(PRESERVE_BACKUP_FILE)) === null) {
@@ -498,8 +514,9 @@ export async function runPreserveStep(
   loadArtifact: PreserveArtifactLoader,
   reporter: Reporter,
   signal?: AbortSignal,
+  options: { readonly allowJump?: boolean } = {},
 ): Promise<PreserveStepOutcome> {
-  const refusal = await describeStepGate(step, state, loadArtifact);
+  const refusal = await describeStepGate(step, state, loadArtifact, options);
   if (refusal !== null) throw new SeekError('pipeline/refused', refusal);
 
   const startedAt = new Date().toISOString();
