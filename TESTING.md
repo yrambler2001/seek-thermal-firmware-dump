@@ -4223,3 +4223,151 @@ against the real dump's emulator rows.
   names. On the bench unit (blank record → boots A, slot B erased) the round-trip writes the empty
   bank B and the camera's running firmware is untouched by construction; the proof is the
   read-back plus a fresh `dump` of mode 8 compared against the staged bytes.
+  **Corrected by measurement the same day — sec. 28.1: the upgrade-path write DOES touch the
+  boot-config block (cfg[0] and word 7). The no-boot-record claim survives only for the
+  preservation pipeline's in-place commit (sec. 28.2), where the byte-level proof is exact.**
+
+## 28. The hardware campaign: the round trip moves the boot record, the 512 ask never completes on silicon, and the exhausted reader stalls the restore (2026-10-01)
+
+Every prior proof of the preservation pipeline ran on emulators and on real DUMPS (secs. 23-26).
+On 2026-10-01 it met the camera: the bench Compact `101310HSNEA2` (the sec. 21.7 unit, 32K board
+profile, JEDEC `010215`), J-Link on SWD as ground truth (FW-V1_copy,
+`make T=compact_32k_1_3_0_8 jlink-run CMD=dump-spifi-4m`, ~22 s), USB behind the RP2040 port
+switch. Two campaigns, one day, same unit. Phase 1 round-tripped the sec. 27 upgrade path on
+hardware and produced the boot-config errata; Phase 2 ran the six-step preserve and measured the
+two things the emulator had left open — the drain's 512 default (23.3's bet) and the exhausted
+reader's afterlife (23.3's second consequence). Stock ground truth throughout: the 4 MiB dump
+sha `40447c7e...`, the factory slot A plaintext (47,768 B) sha `862717a8...`; every J-Link and
+USB sha below is against those.
+
+### 28.1 Phase 1: the sec. 27 upgrade path on hardware, and the boot-config errata
+
+The round trip flashed the camera its own slot A image (the 47,768 B plaintext,
+`seek-fw flash`, target App image bank 0x14060000) and took J-Link dumps before, after the write
+and after the restore. Measured, not inferred:
+
+- **Bank B staged verbatim, image length only.** The write-side diff against stock is
+  47,061 changed bytes running 0x14060000..0x1406BA97 — the staged image's own span (47,768 B
+  from the bank's first byte to its last, erased tail untouched) — and nothing else inside the
+  bank. The USB read-back of slot B afterwards hashed to the image's own sha (`862717a8...`).
+- **The errata: the upgrade write is NOT slot-confined.** The same diff holds two changes
+  outside bank B, both in the boot-config block at 0x14010000: word 0 — cfg[0] itself —
+  0x00000000 → **0x00000001** (the freshly written slot made active), and word 7 (+0x1C)
+  0x00000000 → **0xFFFFFFFF** (erased). Sec. 27.5's "the 2014 commit does NOT rewrite the boot
+  record" is wrong for the upgrade path: whatever emits that write (the host's commit chain
+  and/or the camera's own upgrade handler — the byte evidence does not say which) names its
+  slot in cfg[0] and clears word 7. A camera that boots "whatever cfg[0] names" boots the NEW
+  slot after an upgrade write, full stop. Slot-confinement claims are wrong for upgrade writes.
+- **The restore put every byte back.** The post-restore J-Link dump is byte-identical to the
+  pre-write one (sha `40447c7e...` again), cfg[0] and word 7 included.
+
+The preservation pipeline's in-place commit is the deliberate contrast (sec. 28.2): ten bytes,
+all inside the active bank's image, cfg block untouched — measured at byte level on the same
+hardware the same day.
+
+### 28.2 Phase 2: the six steps on the camera
+
+`seek-fw preserve /tmp/slotA_1300.bin --out /tmp/phase2_run --yes` against the pre-verified
+stock camera (info: 1.3.0.0, booted 0x14050000, cfg[0]=0, bank B blank; J-Link dump
+== `40447c7e...`). The plan print named the expected shape — four instruction edits
+(0x3DB4, 0x3C1C, 0x3C68, 0x3C70), the rebalance word `0x30006240` at 0x238, "10 byte(s)
+differ", 747 chunks — and, the run sheet's stop-watchpoint, no boot-selector step anywhere in
+the plan or the commit's notes. The steps, timed from the run state's own stamps:
+
+| step    | duration | what it did                                                                                                                |
+| ------- | -------- | -------------------------------------------------------------------------------------------------------------------------- |
+| backup  | 46.7 s   | 31 windows (2,031,616 B), bank capture verified, dump archive (2 slots)                                                    |
+| patch   | 5 ms     | offline: 10 bytes, 747 chunks, sha `78d693d6...`                                                                           |
+| commit  | 2.1 s    | 747 chunks staged, image length only, commit status 0, sum16 `5fcb`, read-back verified against the backup first, no reset |
+| drain   | 80.4 s   | at the 64-byte ask (28.3): reset, fresh boot, 4 MiB on one widened-window arm                                              |
+| restore | 2.2 s    | boot-config read, pre-check saw the patched head, 47,768 B capture staged verbatim, commit, reset (28.4's re-boot first)   |
+| verify  | 44.9 s   | fresh boot re-read 31/31 windows: **0 differing bytes**                                                                    |
+
+The four assertions the run set out to prove, all green:
+
+- **a. delivered dump == stock.** `preserve_dump_original.bin` (the active bank swapped back
+  from the backup) sha `40447c7e...` — byte-identical to the as-booted 4 MiB.
+- **b. the part changed by EXACTLY ten bytes.** `preserve_dump_postwrite.bin` (the raw 4 MiB as
+  drained, patched camera) vs the pre-run J-Link dump: ten differing bytes, all inside bank A's
+  image, inside the enumerated sites — file 0x50238 `00→40`, 0x50239 `00→62`, 0x5023B `00→30`
+  (word 0x238 → `0x30006240`; byte +0x23A is 0 on both sides), 0x53C1C `A9→E9`, 0x53C1D
+  `89→68`, 0x53C68 `A2→E2`, 0x53C69 `89→68`, 0x53C70 `A3→E3`, 0x53C71 `81→60`, 0x53DB7
+  `33→03`. The shape is worth reading once: the `mov.w` site moves ONE byte (the imm12
+  re-encode keeps `79 F4 80`), the rebalance word moves three of its four; the builder's "10"
+  is the true diff count, not the sum of the enumerated ranges.
+- **c. the camera is physically back to stock.** Post-run J-Link dump sha `40447c7e...`,
+  `cmp`-identical to the pre-run dump.
+- **d. it boots as it did.** info: running 1.3.0.0 (Oct 21 2014), booted App image bank
+  0x14050000, cfg[0] 0x00000000, bank 0x14060000 blank (magic 0xFFFFFFFF).
+
+Artifact shas (run directory `/tmp/phase2_run`): backup windows `983a7010...`, bank capture
+`5cbbdd0f...`, patched plaintext `78d693d6...`, raw postwrite dump `7ada1be6...`, delivered
+dump `40447c7e...`.
+
+### 28.3 The drain's 512 default is dead on silicon; 64 is the shape on both sides now
+
+23.3 left the drain's ask size standing on a bet: its emulator short-served 512-byte asks
+(histogram 512×438, 256×4,644, 192×3,110) because the usbip bridge's soft poll budget truncated
+data stages, and the reasoning went that a real host NAKs a late packet instead of ending the
+stage, so a real camera's serves would be full where the model's were not. Hardware says the
+opposite. Two independent runs — each the sanctioned `PostResetWedgeError` remedy, a fresh boot
+of the committed state — four attempts in all: **armWindow (control-OUT) succeeded, the version
+gate succeeded, and the FIRST `GET_FEATURED_FIRMWARE_DATA` control-IN at ask=512 never
+completed within its 20 s deadline. 0/4,194,304 B served, every attempt.** Silicon does not
+short-serve the oversize ask; it does not serve it at all. Every wire-79 ask observed to work
+on this camera is ≤ 64 B — `DEFAULT_READ_CHUNK`'s value, one EP0 packet, serve == ask — which
+is now the proven-exact shape on both sides of the bridge, not just in the emulator.
+
+The deadline's own machinery then compounded the failure, and the reported text is worth
+decoding for the next person: a transfer still pending at its deadline makes the transport
+close and reopen the device (`withDeadline` → `reopen`); on a macOS host whose camera has just
+re-enumerated, the `claimInterface` of that reopen is refused with `kIOReturnExclusiveAccess`
+(0xe00002c5) — the close-after-churn leaves the OS's user client in the way — so the transport
+stays closed and the remaining tries report `the USB transport is not open` instantly. The
+attempt errors read "wire-79 read failed at 0/4194304 B after 6 tries: the USB transport is not
+open"; the camera was never the thing refusing. Each 512 run burned ~46 s (2 attempts × ~20 s
+deadline + reopen) before the pipeline said so.
+
+The fallback ran exactly the resumed shape, no code change: the CLI's global `--chunk` already
+maps to `PipelineOptions.drainChunk` (`preserve --resume /tmp/phase2_run --from-step drain
+--chunk 64 --yes`; the step reads `state.drainChunk ?? READ_CHUNK`). Measured on hardware:
+65,536 asks, the whole 4 MiB on one arm, the dump itself 78.3 s — 52.3 KiB/s, ~1.2 ms per ask —
+no retry, no short serve, sha below in 28.2. The 512 default is left in the tree untouched; the
+measurement is this section's, and every hardware caller now has `--chunk 64` as the proven
+form. (Changing `READ_CHUNK` is a one-line decision for the owner, not taken here.)
+
+### 28.4 The exhausted reader stalls the restore's boot-config read; re-boot clears it
+
+One second after the drain finished — its 65,536 asks having consumed exactly the 4 MiB arm
+budget, cursor 0x400000, remaining 0 — the restore opened a fresh wire session and stalled:
+the boot-config read (`armWindow(cfgWindow())`, then 28 B at 3 retries / 5 s) returned
+`control IN 0x4f -> stall` four times in a row, while the same session's version read worked.
+This is 23.3's second consequence, met on silicon: **an exhausted reader stays dead — every
+later wire-79 read stalls at its first read, until the part is re-booted.** The emulator suites
+never saw it in this order because their restore servers boot past READY before serving
+(23.4); hardware orders the steps drain → restore against the SAME booted image, exhausted arm
+still armed.
+
+The remedy was the one 23.3 names. A power cycle through the port switch (the power equivalent
+of the pipeline's own plain reset, 0x59 with u16 0, with no USB traffic of its own) re-booted
+the patched image; the resumed restore's boot-config read then succeeded, its pre-check saw the
+patched head, it staged the 47,768 B capture verbatim, committed and reset — 2.2 s — and verify
+ran green. Nothing about the checkpoint design needed to change: `--resume` re-enters restore
+from its start, and the pre-check's "the bank already holds the original content" branch keeps
+a re-run idempotent. The operational note for future hardware runs is one line: after the
+drain, expect the restore's first boot-config read to stall, and re-boot before resuming.
+
+### 28.5 What the campaign changes
+
+- The ten-bytes-only claim for the preservation commit is now a HARDWARE fact, byte-proven on
+  the part the run patched (28.2b) — and the upgrade path's boot-config write is the measured
+  errata against 27.5 (28.1). The two write paths differ by exactly the thing the pipeline was
+  built to avoid: the upgrade names a new slot in cfg[0]; the in-place commit does not touch
+  the block.
+- The drain's ask-size question is settled: 512 never completes on this silicon, 64 is exact
+  on both sides of the bridge (28.3).
+- The exhausted-reader rule has a hardware confirmation and a one-line operational remedy (28.4).
+- The camera ended where it started: stock bytes (`cmp`-identical J-Link dumps, four shas
+  agreeing), booting 1.3.0.0 from bank A, cfg[0]=0, bank B blank. The repo took no diff: the
+  `--chunk` flag the campaign needed already existed, and the run's deviations were carried by
+  the checkpoint/resume machinery the six-step design shipped with.
