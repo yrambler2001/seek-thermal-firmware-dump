@@ -242,6 +242,61 @@ describe('v1 patch builder — the cipher algebra', () => {
 });
 
 /* ==================================================================== *
+ * the zero-keystream case — the 2014 plaintext banks (synthetic)
+ * ==================================================================== */
+
+describe('v1 patch builder — the zero-keystream case (the 2014 plaintext banks)', () => {
+  /** The 2014 bootloader has no cipher: a bank is the image AS STORED. In the
+   *  algebra that is the keystream being all-zero, and every function here
+   *  must reduce to its plaintext form. */
+  it('a zero keystream is the identity: the stored bank IS the plaintext', () => {
+    const plain = syntheticPlain();
+    const zeros = new Uint32Array(plain.length >> 2);
+    const stored = xorWindowVerbatim(plain, zeros);
+    expect(bytesToHex(stored)).toBe(bytesToHex(plain));
+    /* The as-stored word sum stays 0 — the 2014 bootloader's acceptance gate
+     * reads the bytes as they lie on the part. */
+    expect(wordSum(stored)).toBe(0);
+  });
+
+  it('the conjugation on a plaintext capture: the staged payload IS the patched image', () => {
+    const plain = syntheticPlain();
+    const patch = buildV1Patch(plain);
+    const payload = conjugateCapture(plain, patch); /* the capture is the plaintext itself */
+    expect(bytesToHex(payload)).toBe(bytesToHex(patch.patched));
+    /* Exactly the ten enumerated bytes move — the wire-80 payload differs
+     * from the capture by the mask and nothing else. */
+    const applied: number[] = [];
+    for (let i = 0; i < payload.length; i++) {
+      if (payload[i] !== plain[i]) applied.push(i);
+    }
+    expect(applied).toEqual(EXPECTED_DIFF_OFFSETS);
+  });
+
+  it('verifyCapture with the plaintext as the expected prefix: the whole-image gate', () => {
+    const plain = syntheticPlain();
+    const patch = buildV1Patch(plain);
+    /* The form the pipeline uses on the 2014 banks: the factory plaintext is
+     * the expected prefix, so the gate compares every byte and needs no key. */
+    expect(verifyCapture(plain, plain, plain)).toEqual({ ok: true, reason: null });
+    const bad = verifyCapture(patch.patched, plain, plain);
+    expect(bad.ok).toBe(false);
+    expect(bad.reason).toMatch(/does not hold the factory image/);
+  });
+
+  it('the rebalance word still applies with no cipher: patched words sum to 0 as stored', () => {
+    const plain = syntheticPlain();
+    const patch = buildV1Patch(plain);
+    const zeros = new Uint32Array(plain.length >> 2);
+    const stored = xorWindowVerbatim(patch.patched, zeros);
+    expect(wordSum(stored)).toBe(0);
+    expect(new DataView(stored.buffer).getUint32(REBALANCE_WORD_OFFSET, true)).toBe(
+      patch.rebalanceWord,
+    );
+  });
+});
+
+/* ==================================================================== *
  * the corpus plaintext (gated: needs the emulator directory's corpus)
  * ==================================================================== */
 
@@ -316,6 +371,40 @@ describe('v1 patch builder — the Compact 1.3.0.0 corpus plaintext', () => {
         if (payload[i] !== capture[i]) applied.push(i);
       }
       expect(applied).toEqual(EXPECTED_DIFF_OFFSETS);
+    },
+  );
+
+  /* ---- the real 2014 dump's active bank, as stored -------------------------- */
+
+  /** The jlink dump of the corpus camera, from FW-V1's targets tree beside the
+   *  emulator — the ground truth the preservation suite boots. */
+  function corpusCameraDump(): Uint8Array | null {
+    if (EMU === null) return null;
+    const file = path.resolve(EMU, '..', 'targets', 'compact_32k_1_3_0_8', 'jlink_dumps', '6.bin');
+    return existsSync(file) ? new Uint8Array(readFileSync(file)) : null;
+  }
+
+  const dump6 = corpusCameraDump();
+
+  it.skipIf(plain === null || dump6 === null)(
+    '6.bin slot A holds the corpus plaintext AS STORED, and passes the 2014 acceptance',
+    () => {
+      const at = 0x50000; /* the active bank (cfg[0]=0 -> slot A) */
+      const stored = dump6!.subarray(at, at + plain!.length);
+      /* Byte-identical to the factory plaintext — the plaintext-bank fact the
+       * whole pipeline runs on. */
+      let diffs = 0;
+      for (let i = 0; i < plain!.length; i++) {
+        if (stored[i] !== plain![i]) diffs++;
+      }
+      expect(diffs).toBe(0);
+      /* The 2014 bootloader's own acceptance, read off the stored bytes:
+       * magic 0xA1B2C3D4 at +0x200, length under 0x10000 at +0x204, and the
+       * stored words summing to 0 over header.length. */
+      const dv = new DataView(dump6!.buffer, dump6!.byteOffset + at, plain!.length);
+      expect(hexUp(dv.getUint32(0x200, true))).toBe(hexUp(0xa1b2c3d4));
+      expect(dv.getUint32(0x204, true)).toBe(plain!.length);
+      expect(wordSum(stored)).toBe(0);
     },
   );
 });
