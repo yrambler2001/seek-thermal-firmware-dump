@@ -3673,3 +3673,115 @@ plus the reset server's boot and the post-reset retry that the shape of 23.4 spe
   run; the check's wall time moves with the machine, the results do not (every deadline is on
   the camera's clock).
 - **The commit's real flash time on silicon** is still not emulated (sec.22.7); unchanged.
+
+---
+
+## 25. The preserve wizard, in the web package: six gated steps, a run file as the only memory, and a round trip (2026-10-01)
+
+Web-only scope, built beside core's checkpoint-step API (`packages/core/src/preservation/steps.ts`,
+its own record): the browser gets the pipeline as a WIZARD — pick the image, read the plan, walk
+the six steps one at a time, keep a run file that is rebuilt and downloaded after every completed
+step. This section covers what the web package adds and what its own tests prove; nothing here
+re-runs the wire proofs of §23, which the wizard inherits from core untouched.
+
+### 25.1 What was built
+
+| file                                     | what it is                                                                                                                                        |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib/routing.ts`, `AppHeader`, `App` | the third route `#/preserve`, nav entry, intro prose; the panel lives at `App` level so a tab switch mid-run disturbs nothing                     |
+| `src/lib/preserve/types.ts`              | the contract's types re-exported from `@seek-fw/core` under one roof, plus UI metadata: the step list, the write sets, `preserve-run-<runId>.zip` |
+| `src/lib/preserve/gating.ts`             | `canRunStep` — a synchronous projection of core's `describeStepGate` (which `runPreserveStep` enforces authoritatively)                           |
+| `src/lib/preserve/client.ts`             | the one import site for the core API, plus two web-side conveniences: the plan-screen summary and the checkpoint loader                           |
+| `src/lib/preserve/run-file.ts`           | build (`buildZip` layout) and parse of the run ZIP; CRC-32-verified, store-only, version-gated                                                    |
+| `src/hooks/usePreservePanel.ts`          | the wizard's state machine: one runner task per STEP, per-step reporters, the opener ladder, the run-file saves                                   |
+| `src/views/PreserveView.tsx`             | plan → confirm → step list → run file → final sha screen, with the danger dialog for the two writes                                               |
+
+The wiring rules, and why: **one `runner.start()` per step, never per run** — the app-wide mutual
+exclusion and `beforeunload` guard (`useRunner`) then cover every step without new policy; **a
+fresh transport per session attempt**, closed in `finally`; **per-step `useReporter`** so each row
+of the step list is its own bar/status/log triplet (`RunPanel`, unchanged); a **generation guard**
+that stops the active step when the camera changes on the bus; and **no browser storage at all** —
+state and checkpoint bytes live in memory, and their one durable copy is the run ZIP. After every
+completed step (and after a failed one, recorded via core's `recordStepFailure`) the wizard
+rebuilds the ZIP — `preserve_run.json` first, then every checkpoint produced so far, then any
+files another writer put in the run — and downloads it. A cancelled step is NOT recorded: the
+previous checkpoint stands, which is core's rule and the right one for an interrupted run.
+
+The opener ladder is the CLI's post-reset shape, 60 attempts 1 s apart. The first failed open
+logs once and retitles the status line "Camera rebooting — waiting for it to come back …" — the
+~9-11 s silence after the drain step's wire-89 is progress text, never an error. The drain step
+owns the reset (the commit session stays reset-free, per core); the restore resets after its
+commit lands.
+
+### 25.2 The gating table, as the buttons show it
+
+`canRunStep` mirrors core's gate so a button is enabled exactly when `runPreserveStep` will accept
+the call. `pastCommit` is the loud context flag — a step that concerns the patched part while the
+commit is not on record — and the step list carries a standing alert while it applies: the wizard
+refuses those steps (core refuses them), says why at length, and points at the recovery (the
+commit step's pre-check reads the bank back and refuses a blind replay). `confirm` marks the two
+writes, which open the danger dialog before anything is armed.
+
+| state                                   | backup | patch | commit     | drain | restore    | verify |
+| --------------------------------------- | ------ | ----- | ---------- | ----- | ---------- | ------ |
+| no run                                  | —      | —     | —          | —     | —          | —      |
+| fresh (plan created, nextStep `backup`) | ✓      | —     | —          | — ¹   | — ¹        | — ¹    |
+| backup done, image attached             | done   | ✓     | —          | — ¹   | — ¹        | — ¹    |
+| backup+patch done (capture in memory)   | done   | done  | ✓ (dialog) | — ¹   | — ¹        | — ¹    |
+| commit done                             | done   | done  | done       | ✓     | ✓ (dialog) | —      |
+| drain done                              | done   | done  | done       | done  | ✓ (dialog) | —      |
+| restore done                            | done   | done  | done       | done  | done       | ✓      |
+| run done (`nextStep: 'done'`)           | —      | —     | —          | —     | —          | —      |
+
+¹ refused AND flagged `pastCommit`: the commit is not on record and this step concerns the patched
+part. A failed commit behaves the same way — a failed step is not a done step, but the reads past
+it stay shut until the commit is on record. The backup, patch and commit steps additionally need
+the run's factory plaintext attached (core reads it through `loadArtifact` and sha-checks it
+against `state.imageSha256`), so a resumed run shows a "Re-attach the run's image" picker until
+the file is chosen again; the picker refuses any file whose sha256 is not the run's.
+
+The eleven gating tests (`gating.test.ts`) walk this table row by row, including the
+past-commit flag, the confirm set, and the done-run refusal.
+
+### 25.3 The run-file round trip
+
+`run-file.test.ts` builds a run ZIP and parses it back:
+
+- **state equality** — `buildRunFile(state, checkpoints)` → `parseRunFile` → the same
+  `PreserveRunState`, JSON-identical, and the same checkpoint bytes, each entry verified against
+  its stored CRC-32 with core's `crc32`;
+- **entry order** — `preserve_run.json` first, then the checkpoints in step order, only the ones
+  produced so far;
+- **foreign entries survive** — unknown files ride in `extra` and are still there after a
+  rebuild, so a save-again never drops another writer's files;
+- **refusals** — an archive with no `preserve_run.json`; a state whose `version` is not 1 (checked
+  on the untyped parse, because the typed shape cannot even hold a foreign version); a truncated
+  archive; a flipped byte (CRC-32, named, "do not resume from it"); a deflated entry (run files
+  are store-only — this wizard's own writer's layout, which core's `buildZip` also emits).
+
+The reader is deliberately small: core ships the ZIP writer and this is the first reader in the
+repo, written to the store-only, descriptor-free, UTF-8-named shape that writer emits, with the
+CRC check before any byte is trusted.
+
+### 25.4 What is proven, and what is not
+
+- **Proven here (web suite, 148 tests, all green; eslint and `tsc` on the package clean):** the
+  gating table incl. the past-commit context and the dialog set; the round trip above; the
+  adapter against the REAL core exports (the suite calls `createPreserveRun`/`runPreserveStep`
+  from `@seek-fw/core` with a synthetic v1 plaintext — the same recipe core's `patch.test.ts`
+  uses — and asserts the patch step files the patched plaintext and advances `nextStep`); the
+  view's rendering of all of it (fresh run, armed commit behind its dialog, refused
+  past-commit rows, resumed-without-image, finished run's sha screen).
+- **Not proven here:** no camera was attached. The wizard's wire behavior is core's steps API,
+  whose emulator proofs live in §23 and in `packages/core/test/preservation/`; the browser adds
+  orchestration only. The first hardware run of the wizard is still owed — with the bench unit's
+  known habit (a USB flash it adopts but its bootloader refuses to boot) kept in mind.
+- **Deliberate web-side divergences, both loud in the UI:** a resumed run must re-attach the
+  image before the backup/patch/commit steps arm (core refuses without it anyway); and the
+  interrupted-commit deadlock — a run whose commit is not on record against a camera that may be
+  patched — is refused end to end, with the standing alert pointing at the commit step's pre-check
+  as the way forward. The wizard does NOT offer a past-commit jump: core's gate refuses it, and
+  mirroring the gate is the whole point of `canRunStep`.
+- **A11y floors:** the parity tests pin the two older views' floors; the wizard reuses the same
+  audited components (real tables, `aria-live` per step, labelled dialogs) but has no floor entry
+  yet — adding one is the follow-up when the wizard's markup settles.

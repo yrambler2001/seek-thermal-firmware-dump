@@ -18,6 +18,7 @@ import { useDevice } from './hooks/useDevice';
 import { useDumpPanel } from './hooks/useDumpPanel';
 import { useFlashPanel } from './hooks/useFlashPanel';
 import { useOfflineDecrypt } from './hooks/useOfflineDecrypt';
+import { usePreservePanel } from './hooks/usePreservePanel';
 import { useRunner } from './hooks/useRunner';
 import type { ProfileChoice } from './lib/identify';
 import { DEFAULT_OPTIONS_FORM, type OptionsFailure, type OptionsForm } from './lib/options';
@@ -25,6 +26,7 @@ import { useRoute } from './lib/routing';
 import { detectSupport, readBrowserEnvironment, type SupportStatus } from './lib/support';
 import { DumpView } from './views/DumpView';
 import { FlashView } from './views/FlashView';
+import { PreserveView } from './views/PreserveView';
 
 export interface AppProps {
   /** Injectable so the render tests can drive every environment. */
@@ -84,9 +86,16 @@ export function App({ support }: AppProps = {}): ReactElement {
     onOptionsFailure,
   });
 
+  const preserve = usePreservePanel({ runner, device, form: options });
+
   /* The original routed the Connect panel's own log lines into whichever
    * view's main panel was showing. Same rule. */
-  const viewReporter = route === 'flash' ? flash.infoReporter : dump.reporter;
+  const viewReporter =
+    route === 'flash'
+      ? flash.infoReporter
+      : route === 'preserve'
+        ? preserve.planReporter
+        : dump.reporter;
   const { testing, test } = useConnectionTest({
     runner,
     device,
@@ -127,7 +136,7 @@ export function App({ support }: AppProps = {}): ReactElement {
               uploaded anywhere. <strong>Read-only:</strong> this view issues no flash write, erase,
               upload, commit, or reset command.
             </p>
-          ) : (
+          ) : route === 'flash' ? (
             <p>
               Shows what firmware the camera is running right now, and writes a new{' '}
               <em>plaintext</em> firmware image to it over WebUSB using the camera&apos;s own
@@ -135,6 +144,15 @@ export function App({ support }: AppProps = {}): ReactElement {
               <strong>This view writes to flash.</strong> A bad image can leave the camera
               unbootable, and the bootloader has no USB — recovery would need SWD/J-Link or an SPI
               programmer.
+            </p>
+          ) : (
+            <p>
+              Runs the v1 preservation pipeline <strong>one step at a time</strong>: back up the
+              reachable flash, patch the active slot in place, dump the whole part, restore the
+              original bank, verify. Every completed step re-issues a downloadable run file — the
+              run&apos;s only memory — so the wizard can be stopped after any step and resumed, or
+              started at a non-first step, from that file.{' '}
+              <strong>Two of the six steps write the active boot slot.</strong>
             </p>
           )}
         </Prose>
@@ -169,7 +187,7 @@ export function App({ support }: AppProps = {}): ReactElement {
             optionsInvalidField={optionsFailure?.field ?? null}
             optionsErrorMessage={optionsFailure?.message ?? null}
           />
-        ) : (
+        ) : route === 'flash' ? (
           <FlashView
             flash={flash}
             connected={device.device !== null}
@@ -177,6 +195,8 @@ export function App({ support }: AppProps = {}): ReactElement {
             profileChoice={profileChoice}
             onProfileChoice={setProfileChoice}
           />
+        ) : (
+          <PreserveView preserve={preserve} connected={device.device !== null} busy={runner.busy} />
         )}
       </main>
     </div>

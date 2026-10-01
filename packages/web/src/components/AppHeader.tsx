@@ -7,7 +7,7 @@
  */
 
 import type { ReactElement } from 'react';
-import { FlameKindling, Radar, Thermometer } from 'lucide-react';
+import { Archive, FlameKindling, Radar, Thermometer } from 'lucide-react';
 import { ROUTE_HREF, type Route } from '@/lib/routing';
 import { cn } from '@/lib/utils';
 
@@ -32,6 +32,12 @@ const NAV: readonly NavItem[] = [
     icon: <FlameKindling className="size-4" />,
     danger: true,
   },
+  {
+    route: 'preserve',
+    label: 'Preserve (stepwise)',
+    icon: <Archive className="size-4" />,
+    danger: true,
+  },
 ];
 
 export function AppHeader({ route, connected, canUseUsb }: AppHeaderProps): ReactElement {
@@ -42,7 +48,7 @@ export function AppHeader({ route, connected, canUseUsb }: AppHeaderProps): Reac
         aria-hidden="true"
         className={cn(
           'absolute inset-x-0 top-0 h-0.5',
-          route === 'flash' ? 'bg-destructive' : 'bg-primary/70',
+          route === 'flash' || route === 'preserve' ? 'bg-destructive' : 'bg-primary/70',
         )}
       />
       <div className="mx-auto w-full max-w-[64rem] px-4 pt-5 pb-0 sm:px-6">

@@ -50,6 +50,13 @@ iOS.
 Nothing to install — [open the page](https://yrambler2001.github.io/seek-thermal-firmware-dump/).
 WebUSB needs Chrome, Edge, or another Chromium browser on Windows, macOS, Linux or Android.
 
+The **Preserve (stepwise)** view runs the [v1 preservation pipeline](#the-v1-full-flash-preservation-pipeline)
+one step at a time: six gated steps (backup → patch → commit → drain → restore → verify), each
+with its own progress bar and log, and a downloadable run file rebuilt after every completed step.
+The run file is the run's only memory — the page keeps no browser storage — so a run can be
+resumed from it, or started at a non-first step after an issue. The backup step's archive is taken
+before the patched firmware is ever flashed.
+
 ### CLI
 
 The packages are not published to npm, so the CLI runs from a clone:
@@ -267,7 +274,14 @@ seek-fw preserve plain-1.3.0.0.bin --out ./preserve-run --yes
 Artifacts in `--out`: `preserve_backup_windows.bin` (the P1 backup, assembled at its flash
 addresses), `preserve_bank_capture.bin`, `preserve_dump_postwrite.bin` (the part as patched),
 `preserve_dump_original.bin` (the delivered image — the camera's original content) and
-`preserve_run.json` (per-phase records with sha256 of everything).
+`preserve_run.json` (per-step records with sha256 of everything).
+
+In the browser, the **Preserve (stepwise)** view drives the same checkpoint-step API one step at a
+time: the plan is built offline from the image before anything is armed, each completed step
+re-issues a downloadable `preserve-run-<runId>.zip` (the run state plus every checkpoint produced
+so far), and resuming from that file continues the run — or starts at an earlier-or-equal step the
+gates allow. The commit session never resets; the drain step owns the wire-89 and waits out the
+~10 s reboot by itself ("camera rebooting…").
 
 ## Operation mode 0, and why a cold camera used to hang
 
