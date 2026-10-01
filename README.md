@@ -211,11 +211,37 @@ command set. Nothing in the dump view reaches it.
 ## The v1 full-flash preservation pipeline
 
 `packages/core/src/preservation/` and `seek-fw preserve <image>` implement a full-flash
-preservation pipeline for the v1 "locked line" cameras — Compact 1.0.0.0, 1.2.0.0 and 1.3.0.0
-(derived and wire-proven against the FW-V1 emulator; FW-V1 docs 33 sec. 11.7 and 34). These are
-the builds whose write path the profiles refuse, and that refusal is still right for the general
-`flash` command; this pipeline is a separate, explicit, operator-invoked route that exists because
-in-place preservation cannot be done read-only.
+preservation pipeline for the v1 "locked line" cameras. These are the builds whose write path the
+profiles refuse, and that refusal is still right for the general `flash` command; this pipeline is
+a separate, explicit, operator-invoked route that exists because in-place preservation cannot be
+done read-only. It started with Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0 (FW-V1 docs 33 sec. 11.7 and 34) and now covers eight builds across three cipher/acceptance families — `seek-fw preserve`
+detects the build from the image's bytes and prints what it will do before asking.
+
+### The supported builds
+
+| Build                                   | Family       | Patch                                                              | Staged form                        | Restore                 | Drain (whole part)                                                                                                                   |
+| --------------------------------------- | ------------ | ------------------------------------------------------------------ | ---------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0     | v1-2014      | widen + the 3-halfword reader trio, word 142 rebalanced            | plain (the capture, conjugated)    | capture verbatim        | yes — one widened-window arm; byte-exact at the 64-byte ask                                                                          |
+| Compact 1.3.0.8 (8 Hz "insecure")       | v1-2014      | widen only (the 2017 reader is already 32-bit; no guard), `0x3000` | plain                              | capture verbatim        | yes — proven in-place on the 2014 donor                                                                                              |
+| Compact 1.3.0.8 FF (16 Hz)              | v1-2014-ff   | guard + widen, word 142 := `0x485523E8` (the accept solve)         | plain ⊕ ks0 ⊕ ksD (two keystreams) | **refused** (see below) | commit + drain proven **through the recovery slot only**; the in-place variant is derived, not run                                   |
+| Compact Pro 1.0.3.0 (9 Hz)              | compact-2016 | guard + widen (by shape), `0xF1003000`                             | plain ⊕ ks(block 0)                | factory image, staged   | yes — the doc-33 chain                                                                                                               |
+| Compact Pro 1.0.3.2 (9 Hz and 18 Hz FF) | compact-2016 | guard + widen + the arm-tail hook nop, `0x29FD6B0F`                | plain ⊕ ks(block 0)                | factory image, staged   | **refused** — 128 B is the lossless read unit and the EP0 sessions die at ~64–81 KB; backup → patch → commit → restore → verify only |
+
+Two build-specific facts the plan print states and the gates enforce:
+
+- **The 1.3.0.8-FF build boots its patch from the RECOVERY slot only.** Its raw word sum is the
+  0xFFFF sentinel, which the 2014 bootloader rejects at slots A/B — it boots the recovery bank
+  unchecked. The run refuses a commit into A/B, and a run whose detection names A/B (the factory
+  chimera's blank cfg) refuses before any write. The restore is refused too, for a measured
+  reason: no staged form of the factory image passes the running app's own acceptance while
+  transforming back to the original slot bytes (accept1 reads sum(P ⊕ ksD); the factory carries
+  `0xB7AB9D17` there, not `0xFFFF`). The FF run ends with the delivered dump in hand and the
+  patch in place; the original content can only go back with a full-flash programmer.
+- **1.3.0.8 and 1.3.0.8-FF report the same version string.** The build is chosen from image
+  properties — the 0xFFFF word-sum sentinel and the key blocks (located by value), never the
+  version alone. A 2018-or-later build (4.x, Compact XR, Nano 200/300, Mosaic) is refused at the
+  desk with a pointer at the standard dump workflow: no widening patch is needed, the modern
+  stock plan already reads 63 of the 64 flash windows.
 
 ### What it does — the four phases
 

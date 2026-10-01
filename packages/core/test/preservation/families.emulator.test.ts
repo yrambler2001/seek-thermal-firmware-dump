@@ -220,10 +220,37 @@ function singleServerOpener(emu: Emulator): SessionOpener {
   };
 }
 
+/**
+ * The doc 35.4 first-session shape, as the doc-34 retry shape does it: open
+ * a session, touch wire 53 twice, read the version. A freshly booted
+ * server's FIRST session can stall its first vendor INs while the guest
+ * settles; the touched second session is the one that works. Failures here
+ * are surface noise — the step's own gate re-checks everything.
+ */
+async function warmServer(server: Emulator, label: string): Promise<void> {
+  try {
+    const session = await attach(server, `${label} warm-up`);
+    try {
+      await session.seek.getErrorCode();
+      await session.seek.getErrorCode();
+      const version = await readVersion(session.seek);
+      process.stderr.write(`[families] ${label}: warm, reports ${version}\n`);
+    } finally {
+      await session.close();
+    }
+  } catch (error) {
+    process.stderr.write(
+      `[families] ${label}: warm-up failed (the step's own gate will decide): ` +
+        `${error instanceof Error ? error.message : String(error)}\n`,
+    );
+  }
+}
+
 /** The drain step's opener — the measured ladder: call 1 the reset's own
  *  session, call 2 back to the reset server after the reboot wait, call 3 a
  *  FRESH server booted from the committed part. The reset belongs to the
- *  step; the commit is never replayed. */
+ *  step; the commit is never replayed. Every freshly booted server is
+ *  warmed first (the doc 35.4 shape). */
 function drainOpener(row: RowEmulators, bootOptions: BootOptions): SessionOpener {
   let resetServer: Emulator | null = null;
   let visitsOnResetServer = 0;
@@ -232,6 +259,7 @@ function drainOpener(row: RowEmulators, bootOptions: BootOptions): SessionOpener
     open: async () => {
       if (resetServer === null) {
         resetServer = await boot(row, bootOptions);
+        await warmServer(resetServer, 'drain reset server');
         current = await attach(resetServer, 'drain reset session');
         return current.seek;
       }
@@ -242,6 +270,7 @@ function drainOpener(row: RowEmulators, bootOptions: BootOptions): SessionOpener
           return attach(resetServer, 'drain attempt on the reset server');
         }
         const fresh = await boot(row, bootOptions);
+        await warmServer(fresh, 'drain fresh server');
         return attach(fresh, 'drain on a fresh server');
       })();
       return current.seek;
@@ -488,31 +517,56 @@ async function runFullInPlace(spec: {
     return;
   }
 
-  /* ---- SERVER C: the restore step ----------------------------------------- */
+  /* ---- SERVER C: the restore step -----------------------------------------
+   * The same first-session shape as everywhere else: warm the freshly
+   * booted server (doc 35.4), and retry the step ONCE on a fresh server if
+   * the version gate stalls BEFORE anything was written. A restore that
+   * landed without its checkpoint is safe either way — the step's own
+   * already-original detection marks it done instead of rewriting. The
+   * server that restored gets the polite-stop treatment (a post-reset
+   * touch, then a stop), so its `.final` lands for the whole-run offline
+   * proof. */
   const restoreRow = new RowEmulators(`${spec.label} C (restore)`);
   const restoredPath = scratchFile(`families_${spec.label}_restored.bin`);
   {
-    const emu = await boot(restoreRow, { flash: truthPath, flashOut: restoredPath });
-    try {
-      const outcome = await runPreserveStep(
-        'restore',
-        singleServerOpener(emu),
-        state,
-        store.load,
-        silentReporter,
-      );
-      store.keep(outcome);
-      state = outcome.state;
-    } catch (error) {
-      process.stderr.write(`--- emulator log tail after the restore failure ---\n${emu.log(80)}\n`);
-      throw error;
+    let restoreServer: Emulator | null = null;
+    for (let attempt = 0; attempt < 2 && restoreServer === null; attempt++) {
+      const emu = await boot(restoreRow, { flash: truthPath, flashOut: restoredPath });
+      try {
+        await warmServer(emu, `${spec.label} restore server`);
+        const outcome = await runPreserveStep(
+          'restore',
+          singleServerOpener(emu),
+          state,
+          store.load,
+          silentReporter,
+        );
+        store.keep(outcome);
+        state = outcome.state;
+        restoreServer = emu;
+      } catch (error) {
+        const stalledBeforeWrite =
+          error instanceof Error && error.message.includes('control IN 0x4e -> stall');
+        await emu.stop(120_000);
+        if (!stalledBeforeWrite || attempt === 1) {
+          process.stderr.write(
+            `--- emulator log tail after the restore failure ---\n${restoreRow.lastLog(80)}\n`,
+          );
+          throw error;
+        }
+        process.stderr.write(
+          `[families] ${spec.label} restore attempt ${String(attempt)} stalled at the ` +
+            'version gate (nothing was written); retrying on a fresh server\n',
+        );
+      }
     }
+    if (restoreServer === null) throw new Error('the restore step never ran');
     expect(state.nextStep).toBe('verify');
     /* The polite-stop treatment: a post-reset touch, then a stop, so the
      * `.final` lands. */
     await new Promise((resolve) => setTimeout(resolve, 5000));
     try {
-      const session = await attach(emu, 'restore post-reset touch');
+      const session = await attach(restoreServer, 'restore post-reset touch');
       try {
         expect(await readVersion(session.seek)).toBe(spec.version);
       } finally {
@@ -521,33 +575,46 @@ async function runFullInPlace(spec: {
     } catch {
       /* the post-reset window can wedge; the verify runs on a fresh server */
     }
-    await emu.stop(120_000);
+    await restoreServer.stop(120_000);
     await assertDelivery(restoreRow);
   }
 
-  /* ---- SERVER D: the verify step, on a fresh boot -------------------------- */
+  /* ---- SERVER D: the verify step, on a fresh boot --------------------------
+   * Warm (doc 35.4), then run; read-only, so a stalled attempt just reruns
+   * on a fresh server. */
   const restoredFinal = `${restoredPath}.final`;
   const verifySource = existsSync(restoredFinal) ? restoredFinal : asbootedPath;
   const verifyRow = new RowEmulators(`${spec.label} D (verify)`);
   {
-    const emu = await boot(verifyRow, { flash: verifySource });
-    let finalState: PreserveRunState;
-    try {
-      const outcome = await runPreserveStep(
-        'verify',
-        singleServerOpener(emu),
-        state,
-        store.load,
-        progressReporter('verify'),
-      );
-      store.keep(outcome);
-      finalState = outcome.state;
-    } catch (error) {
-      process.stderr.write(`--- last emulator log after the verify failure ---\n${emu.log(120)}\n`);
-      throw error;
-    } finally {
-      await emu.stop();
+    let finalState: PreserveRunState | null = null;
+    for (let attempt = 0; attempt < 2 && finalState === null; attempt++) {
+      const emu = await boot(verifyRow, { flash: verifySource });
+      try {
+        await warmServer(emu, `${spec.label} verify server`);
+        const outcome = await runPreserveStep(
+          'verify',
+          singleServerOpener(emu),
+          state,
+          store.load,
+          progressReporter('verify'),
+        );
+        store.keep(outcome);
+        finalState = outcome.state;
+      } catch (error) {
+        await emu.stop();
+        if (attempt === 1) {
+          process.stderr.write(
+            `--- last emulator log after the verify failure ---\n${verifyRow.lastLog(120)}\n`,
+          );
+          throw error;
+        }
+        process.stderr.write(
+          `[families] ${spec.label} verify attempt ${String(attempt)} failed ` +
+            `(${error instanceof Error ? error.message : String(error)}); retrying\n`,
+        );
+      }
     }
+    if (finalState === null) throw new Error('the verify step never ran');
     await assertDelivery(verifyRow);
     expect(finalState.nextStep).toBe('done');
     expect(finalState.verify).toEqual({ diffBytes: 0, windowsRead: 31, badWindows: [] });

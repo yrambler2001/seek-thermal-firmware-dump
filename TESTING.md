@@ -3946,3 +3946,174 @@ CRC check before any byte is trusted.
 - **A11y floors:** the parity tests pin the two older views' floors; the wizard reuses the same
   audited components (real tables, `aria-live` per step, labelled dialogs) but has no floor entry
   yet — adding one is the follow-up when the wizard's markup settles.
+
+---
+
+## 26. The patch table: five new firmware families in the preservation pipeline (2026-10-01)
+
+§23–§24's pipeline drove one family: the four-site 2014 chain (1.0.0.0 / 1.2.0.0 / 1.3.0.0).
+The FW-V1 session that derived the two 1.3.0.8 builds (doc 35) and packaged the 1.0.3.x family
+(`V1_WIDENING_1032` + its JSON) left both ready to port. This round ports them as a PER-BUILD
+TABLE (`BUILD_PATCH_PROFILES` in `preservation/patch.ts`), extends the six steps to drive the new
+staged forms, and proves what the emulator can prove. The grounding rule from the RE docs is
+kept absolute: sites are matched by SHAPE with before-byte gates, key blocks are located BY
+VALUE, and version strings alone never select a patch — 1.3.0.8 and 1.3.0.8-FF report the same
+wire version and are told apart by the 0xFFFF word-sum sentinel and the key blocks.
+
+### 26.1 The table, as it landed
+
+| buildId                                 | family       | sites (all shape-located, before-byte gated)                                                                                | rebalance word 142                                                                                                | staged form                    | acceptance                                | route              | restore               | drain capability                                                                                           |
+| --------------------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------ | ----------------------------------------- | ------------------ | --------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `v1-2014` (1.0.0.0 / 1.2.0.0 / 1.3.0.0) | v1-2014      | widen + the reader trio at the doc-34 offsets (the table keeps its exact gates)                                             | `-wordSum`                                                                                                        | plain (the conjugated capture) | raw sum 0                                 | active bank        | capture verbatim      | wholePart yes; lossless unit 64 B                                                                          |
+| `compact-1.3.0.8-8hz`                   | v1-2014      | widen ONLY — `4ff48033 6360 e360` (no guard: mode 2 arms with the token; no reader trio: the 2017 cursor is already 32-bit) | `0x00003000`                                                                                                      | plain                          | raw sum 0                                 | active bank        | capture verbatim      | wholePart yes; lossless unit 64 B                                                                          |
+| `compact-1.3.0.8-ff`                    | v1-2014-ff   | guard `06d1→06e0` + widen (the 2014 tail shape)                                                                             | `0x485523E8` — SOLVED, not a raw-sum rebalance: it spends the free header word on the collapsed staged acceptance | plain ⊕ ks0 ⊕ ksD              | the collapsed gate sum(S ⊕ ks0) == 0xFFFF | recovery slot ONLY | **none** (26.4)       | wholePart yes (commit+drain); the in-place variant is derived, not run                                     |
+| `compact-pro-1.0.3.0`                   | compact-2016 | guard + widen (the `6163 f44f3380 60a3 6123` tail)                                                                          | `0xF1003000`                                                                                                      | plain ⊕ ks(block 0)            | DECRYPTED word sum 0                      | active bank        | factory image, staged | wholePart yes (doc 33 sec. 11)                                                                             |
+| `compact-pro-1.0.3.2-9hz` / `-18hzff`   | compact-2016 | guard + widen + the arm-tail hook nop                                                                                       | `0x29FD6B0F`                                                                                                      | plain ⊕ ks(block 0)            | decrypted sum 0                           | active bank        | factory image, staged | **wholePart NO** — refused with the documented reason; lossless unit 128 B; proven reach 0x13c00 / 0x17500 |
+
+The shape locators, and why they are honest:
+
+- Everything is scoped to the update machinery by ONE anchor: the literal-pool window ladder
+  head `14060000 14050000 14020000 14000000` (exactly one per image; the Begin bodies live
+  within 0x800 bytes before it).
+- The guard is the 6-byte `02 2b 06 d1 04 20` (cmp r3,#2 / bne.n +6 / movs r0,#4) — unique
+  image-wide where present; the patched byte is the `06 d1` at shape + 2.
+- The two widen tails are the 2014 8-byte `4ff48033 6360 e360` and the 2016 10-byte
+  `6361 4ff48033 a360 2361`; each occurs exactly once in its window (the bare `4ff48033`
+  constant occurs twice in every image — the shape, not the constant, is the site).
+- The 1.0.3.2 arm-tail hook is gated on WHAT THE CALL NAMES: the tail `…; mov r0,r5; pop` is
+  found, the BL before it is decoded, and the site applies only when the callee's `ldr r3,=…`
+  literal at callee+0x18 is `0x10003028` — the FSM/op-mode struct the measured wedge drives.
+  1.0.3.0's same-shaped call drives `0x10003128` and is harmless. (The docs' "stub vs real"
+  phrasing decodes to exactly this; the probe that found it is in the table test.)
+- Key blocks are found by value, each occurring exactly once, at the offsets the RE records
+  carry (`0xB484/0xB494` FF; `0xBE3C/0xBE4C` 1.0.3.0; `0xBEAC/0xBEBC` 1.0.3.2 both variants).
+
+### 26.2 The algebra, pinned to the RE records (families.test.ts)
+
+Synthetic images (deterministic fill + the shapes + the real key values) run everywhere and
+prove the two NEW staged forms end to end: `xor-ks0` staged bytes go through the app's
+two-stream transform to exactly the conjugated capture predicts; `xor-ks0-ksD` satisfies
+sum(S ⊕ ks0) == 0xFFFF and transforms to the plaintext slot content; nudging the FF build's
+solved rebalance word off its value breaks the acceptance. When the emulator corpus is present,
+every derived value of the five real builds is pinned to its RE record:
+
+| build          | rebalance    | diff bytes                                        | staged sum16          | staged sha256 (prefix)                                  |
+| -------------- | ------------ | ------------------------------------------------- | --------------------- | ------------------------------------------------------- |
+| 1.3.0.8 8 Hz   | `0x3000`     | 2 — 0x239, 0x3CBD                                 | `0x5A21`              | `2a1814eed01ef861…`                                     |
+| 1.3.0.8-FF     | `0x485523E8` | 6 — 0x238..0x23B, 0x3D69, 0x3E71                  | `0x9F58` (771 chunks) | `b31c19aa8b8b02d8…` (patched plain `52ed5611ed43dc72…`) |
+| 1.0.3.0        | `0xF1003000` | 4 — 0x239, 0x23B, 0x352F, 0x3639 (the doc-33 set) | —                     | —                                                       |
+| 1.0.3.2 (both) | `0x29FD6B0F` | 10 — 0x238..0x23B, 0x3597, 0x36A1, 0x36B6..0x36B9 | —                     | —                                                       |
+
+Detection refusals: the FF bytes through the 8 Hz profile's detect refuse; a synthetic 4.x
+image with none of the shapes refuses pointed at the standard dump workflow ("no widening patch
+is needed — the modern stock plan already reads 63 of the 64 flash windows"); a foreign image
+keeps the pinned refusal order (the 3.bin shape still refuses on the word sum first, then the
+legacy site gate, both now carrying the guidance).
+
+### 26.3 The steps drive the table
+
+The run state records the build (`buildId`, `stagedForm`, `restoreForm`, `route`, `capability`)
+beside the family, and the steps act on it: the commit stages the family's form (the conjugated
+capture on the plaintext banks; patched ⊕ ks0 on the 2016 chain; patched ⊕ ks0 ⊕ ksD on the FF
+build, with the collapsed acceptance asserted before anything is armed); the pre-commit
+read-back compares SLOT bytes (the conjugated capture) in every family; the restore stages the
+factory image in the build's staged form on the cipher families — the commit's own transform
+reproduces the original slot bytes — and keeps the verbatim capture on the plaintext ones. The
+drain gate consults the capability table BEFORE any wire traffic, and the CLI plan print names
+the build, the staged form, the commit route, the restore line, and the drain capability.
+
+### 26.4 The FF build: the recovery route, and why the RESTORE refuses
+
+Two measured facts shape the FF run, both new records:
+
+- **The running bank is recovery, whatever the record says.** The factory FF image's raw word
+  sum is the 0xFFFF sentinel; the 2014 bootloader rejects it at A/B and boots the recovery bank
+  unchecked. A part whose record EXPLICITLY selects recovery (cfg[0]=2, the byte-exact layout
+  of the proven 4.bin record) does NOT boot: the donor bootloader faults at PC 0x140005E0
+  (unmapped write) — the explicit-record path validates the slot's word sum, which the FF image
+  fails. The PROVEN route is the blank-record one, where recovery runs through the A→B→C
+  fallthrough — so the pipeline re-points the detection at recovery for a recovery-only family
+  (`effectiveDetection`): the capture, the commit, the delivered-dump swap-back and any restore
+  act on 0x14070000 and never on A/B. The route gate still refuses an A/B write if a detection
+  ever names one.
+- **The restore is refused, with arithmetic.** The running FF app's types-7..9 commit runs TWO
+  accepts around the two-stream transform, and both read ONE constraint: sum(S ⊕ ks0) == 0xFFFF.
+  For the restore to land the ORIGINAL slot bytes, S must be plain ⊕ ks0 ⊕ ksD of the factory
+  image — and the factory image carries `0xB7AB9D17` in that sum, not `0xFFFF` (its own
+  acceptance was the RAW 0xFFFF word sum its bootloader generation checks at boot). No staged
+  form of the factory image both passes the app and transforms back to the backup's bytes, so
+  `restoreForm: 'none'`: the FF run ends with the delivered dump in hand and the patch in
+  place, and the gate refuses the restore with that number.
+
+### 26.5 The emulator runs (families.emulator.test.ts)
+
+Three focused runs, on the boots the RE records used, through the six steps with the §24
+choreography (reset-free commit sessions, the drain ladder at 64-byte asks, the delivery audit
+with the reset's one tolerated orphan). A per-step session ladder covers the doc 35.4 first
+session shape (the first session on a freshly booted server can stall its first vendor INs;
+close, reopen, retry — the doc's forge runs each needed exactly one retry, and the 8 Hz run
+below needed exactly one too), with the commit's landed case recognized, never replayed.
+
+**1.3.0.8-FF through the recovery route — GREEN (the doc's chimeras, blank record):** backup →
+patch → commit (51.0 s of wire; the app's TWO accepts passed the two-stream staged form, commit
+status 0x0 — the end-to-end crypto proof, now through the pipeline) → the whole 4 MiB drained on
+one arm through the patched guard (106.4 s at 64-byte asks) → the restore gate refused with
+0xB7AB9D17 and nothing wrote:
+
+| proof                                                                        | result                                                                                                                                                                                 |
+| ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| commit moved                                                                 | EXACTLY the 6 patch bytes inside recovery 0x14070000 (0x238..0x23B, 0x3D69, 0x3E71 + the 0x70000 base); A, B, the bootloader block and the boot-config record untouched                |
+| raw dump == the post-commit part                                             | 0 diffs; sha256 `28d50575dd30971a19c1732ab87c53d30a4f8f0d00323677a3a3f0e293777291` — **byte for byte the doc 35.3.3 forge run's dump sha**, across sessions, choreography and codebase |
+| delivered dump (recovery swapped back from the backup) == the as-booted part | 0 diffs; sha256 `dd935b331c2149199235e9c20739d2a821706626530639364b8cab2a9eab1d29` — the doc's own as-booted chimera sha                                                               |
+| detection                                                                    | the run's state names RECOVERY (the effectiveDetection override), and the commit, swap-back and refusal all act on 0x14070000                                                          |
+
+**1.0.3.0 on the native 2016 dump — GREEN (the doc-33 sec. 11.7 route):** backup → patch →
+commit (the staged form plain ⊕ ks0 passed the app's key-seeded acceptance on the wire, commit
+0x0) → the whole 4 MiB drained on one arm → restore through the app's own two-stream transform →
+verify:
+
+| proof                                                      | result                                                                                                                                                                                     |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| commit moved                                               | EXACTLY the four doc-33 bytes inside bank A (0x50239, 0x5023B, 0x5352F, 0x53639)                                                                                                           |
+| raw dump == the post-commit part                           | 0 diffs; sha256 `59e3f4469891b6be434bf018fcd70deb77ad382239d1201dd81c4b28a5a92562`                                                                                                         |
+| delivered dump (bank A swapped back) == the as-booted part | 0 diffs; sha256 `db4efc84f5338815ef9e4fa8b8242d9d8fdfad7f118d97aaa0180cbbddae4dee` — **the vendored dump's own sha, the doc-33 IP3 pair side**                                             |
+| restore (factory image staged as plain ⊕ ks0)              | committed 0x0 while the patched image ran; the restored `.final` == the as-booted part over the whole 4 MiB, 0 diffs — **`db4efc84…` both sides, the doc-33 pair closed by this pipeline** |
+| verify                                                     | 31/31 windows, 0 diffs on a fresh boot of the restored part                                                                                                                                |
+
+### 26.6 The limits the table encodes, and what stays unproven
+
+Encoded in the capability table (and surfaced by the gates and the plan print), never promised
+beyond the record:
+
+- **1.0.3.2 (both variants): no whole-part drain.** 128 B is the lossless read unit (larger
+  asks silently lose bytes); the EP0 sessions die at ~64–81 KB and the upgrade descriptors
+  reset on re-enumeration; the widened reach is proven byte-exact only to 0x13c00 (9 Hz) /
+  0x17500 (FF). The drain gate refuses with that text before arming anything; the run supports
+  backup → patch → commit → restore → verify.
+- **1.3.0.8-FF: recovery route only, restore refused, in-place derived not run.** The commit
+  and the whole-part drain are proven through the recovery bank (26.5); the doc's in-place
+  VARIANT (patching the running recovery bank in place) stays derived-but-not-run, and the
+  run's restore gate refuses with the 0xB7AB9D17 arithmetic (26.4).
+- **The lossless read unit on the proven-drain builds is the 64-byte ask** — one EP0 packet,
+  serve == ask (TESTING.md 23.3); no larger ask is claimed lossless anywhere.
+
+Deliberate divergences from the porting brief, both measured rather than assumed:
+
+- The brief's "verify the FF route against a cfg that selects recovery" does not boot: a
+  cfg[0]=2 part built byte-exactly on the proven 4.bin record layout faults the donor
+  bootloader at PC 0x140005E0 because the explicit-record path validates the slot's word sum,
+  which the 0xFFFF image fails. The route the RE record actually proved (the blank-record
+  chimera booting recovery through the A→B→C fallthrough) is what the run drives, and the
+  detection override is what makes every step act on the bank that truly runs.
+- The brief's "refuse a factory-FF run whose active bank is A/B" holds as the route gate's rule
+  (unit-pinned), and is unreachable in practice because the FF detection names recovery by the
+  build's own boot chain — the state a refusal would be needed for cannot arise from the
+  corrected detection.
+  **1.3.0.8 8 Hz, full in-place on the 2014 donor chimera — the drain GREEN (105.5 s at 64-byte
+  asks):** the commit moved exactly the two patch bytes inside bank A; the whole 4 MiB drained on
+  one arm through the widened window of the PATCHED image:
+
+| proof                                                      | result                                                                                                                                            |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| raw dump == the post-commit part                           | 0 diffs; sha256 `4685ed6029add05c242b02ba128c17bda2104edb555cf679f3cffd9b583e872e` — **byte for byte the doc 35.2.4 IP2 in-place run's dump sha** |
+| delivered dump (bank A swapped back) == the as-booted part | 0 diffs; sha256 `afa9800f8969e46a0d868b19bdd55a9514fec40cfd958de41d0f769eea5a6e7b` — the doc's own as-booted part sha (its IP3 restore target)    |
