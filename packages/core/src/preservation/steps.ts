@@ -86,10 +86,15 @@ import {
   type WindowBytes,
 } from './pipeline.js';
 import {
-  V1_2014_PATCH_SITES,
   buildV1Patch,
   conjugateCapture,
+  stagedAcceptanceSum,
+  stagedFormOf,
   verifyCapture,
+  type CommitRouteId,
+  type DrainCapability,
+  type PreserveFamilyId,
+  type StagedFormId,
   type V1Patch,
 } from './patch.js';
 import {
@@ -158,7 +163,8 @@ export interface PreserveRunState {
   version: 1;
   /** Timestamped (`preserve-2026-10-01T09-30-00Z`); names nothing on disk. */
   runId: string;
-  buildFamily: 'v1-2014';
+  /** The cipher/acceptance family the detected build belongs to. */
+  buildFamily: PreserveFamilyId;
   /** The factory plaintext sha the patch derives from — what a resumed image
    *  file is checked against before anything runs. */
   imageSha256: string;
@@ -174,6 +180,17 @@ export interface PreserveRunState {
   rawDumpSha256?: string;
   deliveredSha256?: string;
   /* ---- additive extensions (still version 1; readers may ignore) --------- */
+  /** The detected build's id in the patch table (`compact-1.3.0.8-8hz`, ...). */
+  buildId?: string;
+  /** How the wire-80 staged bytes relate to the patched plaintext. */
+  stagedForm?: StagedFormId;
+  /** Which bank the patch may be committed into (`recovery-only` for the
+   *  1.3.0.8-FF build). */
+  route?: CommitRouteId;
+  /** Why, as text a person can act on (the recovery-slot bootloader fact). */
+  routeNote?: string | null;
+  /** What the drain step may promise on this build, as measured. */
+  capability?: DrainCapability;
   /** The wire-79 read size the drain asks for, in bytes. Default READ_CHUNK
    *  (512 — the hardware default); the emulator suite drains at 64 asks. */
   drainChunk?: number;
@@ -244,9 +261,15 @@ export interface CreatedPreserveRun {
  * as `preserve_run.json` BEFORE the first step, so even a crash during the
  * backup leaves a resumable run.
  *
- * Throws (SeekError `pipeline/refused`) when the image does not carry the v1
- * 2014 update machinery, is not word-sum balanced, or has no header to derive
- * the expected version from and none was given.
+ * The build is detected from the image's bytes (the patch table dispatches on
+ * properties, never the version string alone), and the patch is built here so
+ * a wrong image fails on the desk, before any run directory exists.
+ *
+ * Throws (SeekError `pipeline/refused`) when no build in the patch table
+ * matches the image — including the modern/nano builds, which need no
+ * widening patch and are pointed at the standard dump workflow — when the
+ * image fails its build's before-byte or acceptance gates, or when it has no
+ * header to derive the expected version from and none was given.
  */
 export async function createPreserveRun(
   plain: Uint8Array,
@@ -265,12 +288,19 @@ export async function createPreserveRun(
   const state: PreserveRunState = {
     version: 1,
     runId: options.runId ?? `preserve-${isoStamp(now())}`,
-    buildFamily: 'v1-2014',
+    buildFamily: patch.family,
     imageSha256: await sha256hex(plain),
     expectedVersion: version,
     createdAt: now().toISOString(),
     nextStep: 'backup',
     steps: {},
+    /* The build the detection named — the plan print, the gates and the
+     * capability table all read the run state, not the image, after this. */
+    buildId: patch.buildId,
+    stagedForm: patch.stagedForm,
+    route: patch.route,
+    routeNote: patch.routeNote,
+    capability: patch.capability,
     ...(options.drainChunk === undefined ? {} : { drainChunk: options.drainChunk }),
     ...(options.expectedSlotPrefix === undefined
       ? {}
@@ -345,6 +375,23 @@ const isDone = (state: PreserveRunState, id: PreserveStepId): boolean =>
   state.steps[id]?.status === 'done';
 
 /**
+ * The route refusal, shared by the three steps that would touch the patch's
+ * bank: a build whose route is recovery-only must never be written into a
+ * slot the bootloader would reject at boot. Recovery itself — the bank the
+ * route names — passes.
+ */
+function routeRefusal(state: PreserveRunState): string | null {
+  if (state.route !== 'recovery-only') return null;
+  if (state.detection?.bank === 'r') return null;
+  const bank = state.detection?.bank ?? '(no detection)';
+  return (
+    `this build's patch boots from the RECOVERY slot only (mode 9): ${state.routeNote ?? ''} — ` +
+    `the backup's detection named bank ${bank}, and the bootloader would not boot the ` +
+    'patch from there, so the run refuses'
+  );
+}
+
+/**
  * Why `step` cannot run against `state` right now, or null when it can.
  *
  * The run's rule, in gate order: the available regions are dumped and
@@ -412,6 +459,8 @@ export async function describeStepGate(
       if (state.detection === undefined) {
         return 'commit needs the slot detection the backup step recorded, and the state has none';
       }
+      const route = routeRefusal(state);
+      if (route !== null) return route;
       const missing: string[] = [];
       for (const name of [PRESERVE_BACKUP_FILE, PRESERVE_BANK_CAPTURE_FILE]) {
         if ((await loadArtifact(name)) === null) missing.push(name);
@@ -436,6 +485,17 @@ export async function describeStepGate(
       if (state.detection === undefined) {
         return 'drain needs the slot detection the backup step recorded, and the state has none';
       }
+      /* The capability table, consulted where it bites: a build with no
+       * whole-part drain gets the documented reason, not a stall on the wire
+       * (the 1.0.3.2 builds' EP0 sessions die at ~64-81 KB). */
+      if (state.capability !== undefined && !state.capability.wholePart) {
+        return (
+          `the drain step refuses on ${state.buildId ?? state.buildFamily}: ` +
+          state.capability.note
+        );
+      }
+      const route = routeRefusal(state);
+      if (route !== null) return route;
       if ((await loadArtifact(PRESERVE_BANK_CAPTURE_FILE)) === null) {
         return (
           `drain needs ${PRESERVE_BANK_CAPTURE_FILE} (the delivered dump is post-processed ` +
@@ -455,8 +515,24 @@ export async function describeStepGate(
       if (state.detection === undefined) {
         return 'restore needs the slot detection the backup step recorded, and the state has none';
       }
+      const route = routeRefusal(state);
+      if (route !== null) return route;
       if (state.patch === undefined) {
         return 'restore needs the patch summary (for the staged length) — run the patch step first';
+      }
+      /* A cipher family's restore stages the FACTORY image in the build's
+       * staged form (the commit's own transform turns it back into the
+       * original slot bytes) — so it needs the plaintext, which the 'plain'
+       * families never do (they stage the capture verbatim). */
+      if (state.stagedForm !== undefined && state.stagedForm !== 'plain') {
+        if ((await loadArtifact(PRESERVE_PLAIN_NAME)) === null) {
+          return (
+            `restore stages the original image in this build's staged form ` +
+            `(${state.stagedForm}), which is derived from the factory plaintext — pass the ` +
+            'image path to the CLI, or the bytes to the runner (loadArtifact ' +
+            `'${PRESERVE_PLAIN_NAME}')`
+          );
+        }
       }
       if ((await loadArtifact(PRESERVE_BANK_CAPTURE_FILE)) === null) {
         return (
@@ -771,7 +847,7 @@ async function runPatchStep(
 
   const patchedSha = await sha256hex(patch.patched);
   const summary: PreservePatchSummary = {
-    sites: V1_2014_PATCH_SITES.map((site) => ({
+    sites: patch.sites.map((site) => ({
       name: site.what.split(' (')[0] ?? site.what,
       offset: site.offset,
       before: [...site.before],
@@ -869,7 +945,26 @@ async function runCommitStep(
         `${check.reason ?? 'unknown'} — the restore source is not trustworthy`,
     );
   }
-  const payload = conjugateCapture(capture, patch);
+  /* THE STAGED PAYLOAD, per family. On the plaintext 2014 banks it is the
+   * conjugated capture (the keystream is zero, so the conjugation is its own
+   * identity). On the cipher families the wire-80 bytes are the STAGED form
+   * of the PATCHED PLAINTEXT — the commit's own two-stream transform, not the
+   * host, produces the slot bytes — and the conjugated capture is what the
+   * bank is expected to hold AFTER the write (the pre-check below). */
+  const payload =
+    patch.stagedForm === 'plain'
+      ? conjugateCapture(capture, patch)
+      : stagedFormOf(patch, patch.patched);
+  if (patch.family === 'v1-2014-ff' && stagedAcceptanceSum(patch, payload) !== 0xffff) {
+    fail(
+      'the staged payload does not satisfy the FF build collapsed acceptance ' +
+        '(sum(staged ^ ks0) must be 0xFFFF) — refusing to stage a payload the app would ' +
+        'reject after the erase',
+    );
+  }
+  /* What the bank will hold once the commit lands, in every family: the
+   * capture with the plaintext diff folded through — the keystream cancels. */
+  const patchedSlot = conjugateCapture(capture, patch);
 
   const commit = await withSession(opener, async (device) => {
     assertLive(signal);
@@ -881,13 +976,16 @@ async function runCommitStep(
      * transfer and its checkpoint leaves this run at nextStep `commit`;
      * re-running it must never stage a second commit blind. The head carries
      * the rebalance word (0x238), which is 0 on the original and the nonzero
-     * rebalance on the patched bytes — enough to tell the two apart. */
+     * rebalance on the patched bytes — enough to tell the two apart. The
+     * comparison is against SLOT bytes (what the reader serves): the patched
+     * expectation is the conjugated capture, which is the payload itself on
+     * the plaintext families. */
     const live = await readBankHead(
       device,
       detection.bank,
       'commit pre-check (the active bank head as it lies)',
     );
-    if (equalBytes(live, payload.subarray(0, BANK_HEAD_BYTES))) {
+    if (equalBytes(live, patchedSlot.subarray(0, BANK_HEAD_BYTES))) {
       fail(
         'the active bank already holds the patched bytes — the commit landed in a previous ' +
           'attempt and must not be replayed. Resume at the drain step (--resume), which ' +
@@ -1050,7 +1148,19 @@ async function runRestoreStep(
   const stagedLength = state.patch?.stagedLength;
   if (stagedLength === undefined) fail('the run state carries no patch summary (staged length)');
   if (capture.length < stagedLength) fail('the bank capture is shorter than the staged length');
+  /* The bank's ORIGINAL content, as the reader serves it (slot bytes) — the
+   * pre-check compares against this, and the 'plain' families stage it back
+   * verbatim. */
   const original = capture.subarray(0, stagedLength);
+  /* A cipher family stages the FACTORY image in the build's staged form: the
+   * commit's own two-stream transform turns it back into the original slot
+   * bytes. Staging the slot bytes themselves would fail the app's acceptance
+   * (they are not a valid staged form). */
+  let payload = original;
+  if (state.stagedForm !== undefined && state.stagedForm !== 'plain') {
+    const plain = await loadPlain(state, loadArtifact);
+    payload = stagedFormOf(buildV1Patch(plain), plain);
+  }
 
   const restored = await withSession(opener, async (device) => {
     assertLive(signal);
@@ -1087,7 +1197,7 @@ async function runRestoreStep(
         'over it (the backup is the authority this run restores from)',
       'detail',
     );
-    await commitToBank(device, detection.bank, original, {
+    await commitToBank(device, detection.bank, payload, {
       label: 'preserve restore',
       reporter,
       ...(signal === undefined ? {} : { signal }),
@@ -1097,7 +1207,11 @@ async function runRestoreStep(
   });
 
   const notes = restored
-    ? `original bank content staged verbatim (${String(stagedLength)} B) and committed; reset sent`
+    ? `original bank content staged back (${String(payload.length)} B${
+        payload === original
+          ? ', the capture verbatim'
+          : `, the ${state.stagedForm ?? ''} staged form`
+      }) and committed; reset sent`
     : 'the bank already held the original content (a previous restore landed) — nothing ' +
       'staged, no reset sent';
   const nextState: PreserveRunState = {
