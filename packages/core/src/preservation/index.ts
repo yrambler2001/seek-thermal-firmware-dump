@@ -8,6 +8,13 @@
  * preservation means. The general flash workflow refuses this generation for
  * good reason and is untouched; this directory is an operator-invoked tool
  * with its own gates, its own backups and its own honest risk note.
+ *
+ * Two shapes of the same operation:
+ *  - `pipeline.ts` — the four phases in one call, for a process that stays
+ *    alive (`runPreservationPipeline`), plus the per-phase wire primitives.
+ *  - `steps.ts` — the same operation as six resumable steps with a JSON run
+ *    state and an artifact loader, for a run that must survive the process
+ *    that started it (`createPreserveRun`, `runPreserveStep`).
  */
 
 export {
@@ -70,3 +77,34 @@ export type {
   SessionOpener,
   WindowBytes,
 } from './pipeline.js';
+
+export {
+  PRESERVE_BACKUP_FILE,
+  PRESERVE_BANK_CAPTURE_FILE,
+  PRESERVE_DUMP_MANIFEST_FILE,
+  PRESERVE_DUMP_POSTWRITE_FILE,
+  PRESERVE_DUMP_ORIGINAL_FILE,
+  PRESERVE_DUMP_README_FILE,
+  PRESERVE_PATCHED_FILE,
+  PRESERVE_PLAIN_NAME,
+  PRESERVE_RUN_STATE_FILE,
+  PRESERVE_STEP_IDS,
+  assembleBackupImage,
+  backupResultFromImage,
+  createPreserveRun,
+  describeStepGate,
+  isPreserveStepId,
+  nextStepAfter,
+  recordStepFailure,
+  runPreserveStep,
+} from './steps.js';
+export type {
+  CreatePreserveRunOptions,
+  CreatedPreserveRun,
+  PreserveArtifactLoader,
+  PreservePatchSummary,
+  PreserveRunState,
+  PreserveStepId,
+  PreserveStepOutcome,
+  PreserveStepRecord,
+} from './steps.js';

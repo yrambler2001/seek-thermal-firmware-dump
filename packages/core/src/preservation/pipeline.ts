@@ -37,6 +37,14 @@
  *       running code), reset, then re-read the 31 windows and compare every
  *       one against the P1 backup.
  *
+ * The same operation also exists as SIX RESUMABLE STEPS (`steps.ts`), and
+ * `runPreservationPipeline` at the bottom of this file is composed from them.
+ * The one behavioural difference: the wire-89 reset that boots the patched
+ * image belongs to the drain step's own first session — the commit session
+ * stays reset-free, so it can stop politely and its post-commit flash state
+ * is the ground truth (TESTING.md sec. 23.8). Use the steps when a run must
+ * survive the process that started it; use this when one call is enough.
+ *
  * ---- The honest risk -------------------------------------------------------
  *
  * P2 and P4 write the ACTIVE slot on whatever camera runs them. On real
@@ -49,14 +57,26 @@
  * copy-on-write overlay is a safety net real flash does not have.
  */
 
-import { hexUp, sha256hex } from '../bytes.js';
-import { errorMessage } from '../errors.js';
+import { hexUp, isoStamp, sha256hex } from '../bytes.js';
+import { CancelledError, errorMessage } from '../errors.js';
 import type { Reporter } from '../events.js';
 import type { SeekDevice } from '../protocol/client.js';
 import { u16Payload } from '../protocol/client.js';
 import { OP, EP0_BUF, USB_COMMIT_TIMEOUT_MS } from '../protocol/ops.js';
 import { FLASH_SIZE } from '../profiles/modern-4x.js';
-import { buildV1Patch, conjugateCapture, sum16, verifyCapture } from './patch.js';
+import {
+  PRESERVE_BACKUP_FILE,
+  PRESERVE_BANK_CAPTURE_FILE,
+  PRESERVE_DUMP_ORIGINAL_FILE,
+  PRESERVE_DUMP_POSTWRITE_FILE,
+  backupResultFromImage,
+  createPreserveRun,
+  runPreserveStep,
+  type PreserveArtifactLoader,
+  type PreserveRunState,
+  type PreserveStepId,
+} from './steps.js';
+import { sum16 } from './patch.js';
 import {
   BACKUP_WINDOW_COUNT,
   bankWindow,
@@ -91,6 +111,12 @@ export function resetOpPayload(): Uint8Array {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The caller's stop request, checked at every loop boundary alongside the
+ *  device's own — a device constructed without a signal still stops. */
+function assertLive(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw new CancelledError();
 }
 
 /**
@@ -132,12 +158,14 @@ export async function backupWindows(
   device: SeekDevice,
   reporter: Reporter,
   chunk: number = READ_CHUNK,
+  signal?: AbortSignal,
 ): Promise<BackupResult> {
   const windows = preservationWindows();
   const out: WindowBytes[] = [];
   const byAddress = new Map<number, Uint8Array>();
   let index = 0;
   for (const entry of windows) {
+    assertLive(signal);
     device.assertNotCancelled();
     reporter.progress(
       index,
@@ -190,7 +218,7 @@ export async function commitToBank(
   device: SeekDevice,
   bank: BankKey,
   payload: Uint8Array,
-  options: { label: string; reporter: Reporter; commitTimeoutMs?: number },
+  options: { label: string; reporter: Reporter; commitTimeoutMs?: number; signal?: AbortSignal },
 ): Promise<{ chunks: number; sum16: number; status: number; ms: number }> {
   const { label, reporter } = options;
   await device.armWindow(bankWindow(bank));
@@ -199,6 +227,7 @@ export async function commitToBank(
   let done = 0;
   let chunks = 0;
   while (done < payload.length) {
+    assertLive(options.signal);
     device.assertNotCancelled();
     const end = Math.min(done + STAGE_CHUNK, payload.length);
     await device.setFeaturedFirmwareData(payload.subarray(done, end));
@@ -285,6 +314,7 @@ export async function drainExact(
     retries?: number;
     timeoutMs?: number;
     onChunk?: (got: number) => void;
+    signal?: AbortSignal;
   } = {},
 ): Promise<Uint8Array> {
   const chunk = options.chunk ?? READ_CHUNK;
@@ -293,6 +323,7 @@ export async function drainExact(
   const parts: Uint8Array[] = [];
   let got = 0;
   while (got < bytes) {
+    assertLive(options.signal);
     device.assertNotCancelled();
     const want = Math.min(chunk, bytes - got);
     let blk: Uint8Array | null = null;
@@ -335,7 +366,7 @@ export async function drainExact(
 export async function drainWholePart(
   device: SeekDevice,
   reporter: Reporter,
-  options: { chunk?: number; timeoutMs?: number } = {},
+  options: { chunk?: number; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<Uint8Array> {
   await device.armWindow(widenedWindow());
   const startedAt = Date.now();
@@ -343,6 +374,7 @@ export async function drainWholePart(
   const data = await drainExact(device, FLASH_SIZE, 'P3 full dump', {
     chunk: options.chunk ?? READ_CHUNK,
     timeoutMs: options.timeoutMs ?? 20000,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
     onChunk: (got) => {
       if (got - last >= 0x40000) {
         last = got;
@@ -459,6 +491,7 @@ export async function verifyAgainstBackup(
   backup: BackupResult,
   reporter: Reporter,
   chunk: number = READ_CHUNK,
+  signal?: AbortSignal,
 ): Promise<{ diffBytes: number; windowsRead: number; badWindows: readonly number[] }> {
   const windows = preservationWindows();
   let diffBytes = 0;
@@ -467,6 +500,7 @@ export async function verifyAgainstBackup(
   let index = 0;
   for (const entry of windows) {
     index++;
+    assertLive(signal);
     device.assertNotCancelled();
     reporter.progress(
       index,
@@ -541,16 +575,48 @@ export interface PipelineOptions {
   readonly reporter: Reporter;
   /** P3/P4 post-reset probe attempts per phase before the wedge is declared. */
   readonly postResetAttempts?: number;
+  /** Threaded through every step's loops: the CLI's interrupt path and the
+   *  web runner both stop a run this way. */
+  readonly signal?: AbortSignal;
+  /** The wire-79 read size the drain asks for. Default READ_CHUNK (512, the
+   *  hardware default); the emulator suite drains at 64 asks. */
+  readonly drainChunk?: number;
 }
 
 /**
  * Run the pipeline end to end, phases in order, each on its own session.
  * Throws on the first phase whose proof fails.
+ *
+ * COMPOSED FROM THE SIX STEPS (`steps.ts`) — the same gates, the same proofs,
+ * the same session shape — with the step artifacts held in memory instead of
+ * on disk. The one deliberate change from the pre-step shape: the wire-89
+ * reset that boots the patched image now happens on the DRAIN step's own
+ * first session, not in the commit session. The commit session therefore
+ * stays reset-free and can stop politely — its post-commit flash state is
+ * the ground truth every offline proof reads (TESTING.md sec. 23.8) — and
+ * the reset's orphaned URB lands on the session that owns the reset.
  */
 export async function runPreservationPipeline(
   options: PipelineOptions,
 ): Promise<PipelineArtifacts> {
-  const { opener, plain, expectedVersion, reporter } = options;
+  const { opener, plain, reporter, signal } = options;
+  const { state: initialState } = await createPreserveRun(plain, {
+    expectedVersion: options.expectedVersion,
+    ...(options.expectedSlotPrefix === undefined
+      ? {}
+      : { expectedSlotPrefix: options.expectedSlotPrefix }),
+    ...(options.postResetAttempts === undefined
+      ? {}
+      : { postResetAttempts: options.postResetAttempts }),
+    ...(options.drainChunk === undefined ? {} : { drainChunk: options.drainChunk }),
+    runId: `pipeline-${isoStamp()}`,
+  });
+
+  /* The steps' artifacts, held where `loadArtifact` serves them from — the
+   * one-process stand-in for the run directory a checkpointing caller keeps. */
+  const store = new Map<string, Uint8Array>();
+  const loadArtifact: PreserveArtifactLoader = (name) => Promise.resolve(store.get(name) ?? null);
+
   const records: PipelineRecord[] = [];
   const record = (
     phase: PipelineRecord['phase'],
@@ -562,180 +628,72 @@ export async function runPreservationPipeline(
     reporter.log(`${phase} ${ok ? 'PASS' : 'FAIL'}: ${title} — ${detail}`, ok ? 'ok' : 'error');
   };
 
-  /* ---- P1 + P2: one session, backup then commit then reset --------------- */
-  let detection: SlotDetection;
-  let backup: BackupResult;
-  let bankCapture: Uint8Array;
-  {
-    const device = await opener.open();
-    try {
-      const version = await readVersion(device);
-      if (version !== expectedVersion) {
-        throw new Error(
-          `the camera reports firmware ${version}, want ${expectedVersion} — the patch is ` +
-            "derived from one build's bytes and must not be sent to another",
-        );
-      }
-      reporter.log(`camera reports firmware ${version}`, 'detail');
-
-      backup = await backupWindows(device, reporter);
-      record(
-        'P1',
-        '31-window backup complete',
-        true,
-        `${String(backup.windows.length)} windows, ${String(backup.bytes)} B`,
-      );
-
-      detection = await detectActiveSlot(device);
-      reporter.log(`slot: ${detection.verdict}`, 'detail');
-      const captured = backup.byAddress.get(detection.bankAddress);
-      if (captured === undefined) {
-        throw new Error(
-          `the P1 backup does not hold the active bank ${hexUp(detection.bankAddress, 8)}`,
-        );
-      }
-      bankCapture = captured;
-      const check = verifyCapture(bankCapture, plain, options.expectedSlotPrefix);
-      if (!check.ok) {
-        throw new Error(
-          `the bank capture does not match the factory image: ${check.reason ?? 'unknown'}`,
-        );
-      }
-
-      const patch = buildV1Patch(plain);
-      const payload = conjugateCapture(bankCapture, patch);
-      reporter.log(
-        `P2 payload: ${String(payload.length)} B (image length only); ` +
-          `${String(patch.diffOffsets.length)} conjugated byte(s)`,
-        'detail',
-      );
-      const commit = await commitToBank(device, detection.bank, payload, {
-        label: 'P2 in-place patch',
-        reporter,
-      });
-      const reset = await resetDevice(device);
-      record(
-        'P2',
-        'in-place patch committed into the active slot',
-        true,
-        `bank ${hexUp(detection.bankAddress, 8)} (mode ${String(detection.bankMode)}), ` +
-          `${String(commit.chunks)} chunks, commit status ${hexUp(commit.status)}, reset ${reset}` +
-          '; no bootcfg write, no other-slot write (the raw path writes no record)',
-      );
-    } finally {
-      await opener.close(device);
-    }
-  }
-
-  /* ---- P3: fresh session(s); the reset quirk means retry-once -------------
-   *
-   * DRAIN FIRST, on its own single arm: the reader's descriptor budgets every
-   * arm 0x400000 served bytes (d4, decremented per read), so anything consumed
-   * before the drain — the patch-live probe included — shortens the reach of
-   * the arm that follows (measured: probe-then-drain stalled deterministically
-   * 131,072 B short of the part's end, on fresh servers, twice). A full 4 MiB
-   * completion is itself the liveness proof:
-   * a stock 64 KiB window closes the descriptor long before 4 MiB. The
-   * explicit probe then runs afterwards on its own fresh arm. */
-  const probeBytes = backupSlice(backup, PROBE_OFFSET - READ_CHUNK, READ_CHUNK);
-  let rawDump: Uint8Array | null = null;
-  let lastError = 'not attempted';
-  const attempts = options.postResetAttempts ?? 2;
-  for (let n = 1; n <= attempts && rawDump === null; n++) {
-    const device = await opener.open();
-    try {
-      rawDump = await drainWholePart(device, reporter);
-      /* Advisory: the drain's completion is the liveness proof (only the
-       * widened window serves 4 MiB), and the descriptor's budget was spent
-       * by the drain anyway — a follow-up probe can stall without meaning
-       * anything is wrong. */
-      try {
-        const probe = await probeWidenedWindow(device, probeBytes);
-        reporter.log(`P3 probe, ${probe.detail}`, probe.live ? 'detail' : 'warn');
-      } catch {
-        reporter.log('P3 probe skipped (the drain already proves the widened window)', 'detail');
-      }
-    } catch (error) {
-      lastError = `attempt ${String(n)}: ${errorMessage(error)}`;
-      reporter.log(`P3 attempt failed: ${lastError}`, 'warn');
-    } finally {
-      await opener.close(device);
-    }
-  }
-  if (rawDump === null) {
-    throw new PostResetWedgeError(
-      'the commit landed but the post-reset read window never came up — the doc 33 sec. 11.6 ' +
-        'same-server wedge. The commit is NOT replayed; re-run the drain phase against a ' +
-        `fresh session/server booted from the committed state. Last attempt: ${lastError}`,
-      { records: records.length, lastError },
+  const runStep = async (step: PreserveStepId): Promise<PreserveRunState> => {
+    const outcome = await runPreserveStep(
+      step,
+      opener,
+      initialState,
+      loadArtifact,
+      reporter,
+      signal,
     );
+    for (const artifact of outcome.artifacts) store.set(artifact.name, artifact.data);
+    return outcome.state;
+  };
+
+  const afterBackup = await runStep('backup');
+  const detection = afterBackup.detection;
+  if (detection === undefined) throw new Error('the backup step recorded no slot detection');
+  const backupImage = store.get(PRESERVE_BACKUP_FILE);
+  if (backupImage === undefined) throw new Error('the backup step produced no backup image');
+  const backup = backupResultFromImage(backupImage);
+  const bankCapture = store.get(PRESERVE_BANK_CAPTURE_FILE);
+  if (bankCapture === undefined) throw new Error('the backup step produced no bank capture');
+  record(
+    'P1',
+    '31-window backup complete',
+    true,
+    `${String(backup.windows.length)} windows, ${String(backup.bytes)} B`,
+  );
+
+  await runStep('patch');
+  const afterCommit = await runStep('commit');
+  record(
+    'P2',
+    'in-place patch committed into the active slot',
+    true,
+    afterCommit.steps.commit?.notes ??
+      `bank ${hexUp(detection.bankAddress, 8)} (mode ${String(detection.bankMode)})` +
+        '; no bootcfg write, no other-slot write (the raw path writes no record)',
+  );
+
+  /* P3: the drain step sends the wire-89 reset on its own first session and
+   * then drains, DRAIN FIRST on its own single arm (the per-arm budget is
+   * consumed in asks — TESTING.md sec. 23.3), the patch-live probe afterwards
+   * as an advisory on what budget remains. */
+  const afterDrain = await runStep('drain');
+  const rawDump = store.get(PRESERVE_DUMP_POSTWRITE_FILE);
+  const processedDump = store.get(PRESERVE_DUMP_ORIGINAL_FILE);
+  if (rawDump === undefined || processedDump === undefined) {
+    throw new Error('the drain step produced no dumps');
   }
-  const processedDump = postProcessDump(rawDump, detection.bankAddress, bankCapture);
-  const rawSha = await sha256hex(rawDump);
-  const deliveredSha = await sha256hex(processedDump);
   record(
     'P3',
     'full 4 MiB drained through the widened window',
     true,
-    `raw sha256 ${rawSha}; delivered (bank swapped back) sha256 ${deliveredSha}`,
+    `raw sha256 ${afterDrain.rawDumpSha256 ?? 'unknown'}; delivered (bank swapped back) ` +
+      `sha256 ${afterDrain.deliveredSha256 ?? 'unknown'}`,
   );
 
-  /* ---- P4: restore the original bank, then re-read and compare ----------- */
-  {
-    const device = await opener.open();
-    let restoreDetection: SlotDetection;
-    try {
-      const version = await readVersion(device);
-      if (version !== expectedVersion) {
-        throw new Error(`after the patch the camera reports ${version}, want ${expectedVersion}`);
-      }
-      restoreDetection = await detectActiveSlot(device);
-      if (
-        restoreDetection.bank !== detection.bank ||
-        restoreDetection.bankAddress !== detection.bankAddress
-      ) {
-        throw new Error(
-          `the active slot changed between P2 (${hexUp(detection.bankAddress, 8)}) and P4 ` +
-            `(${hexUp(restoreDetection.bankAddress, 8)}) — refusing to restore over a ` +
-            'different bank than the one patched',
-        );
-      }
-      /* THE ORIGINAL BANK CONTENT, staged verbatim: the P1 capture's image
-       * prefix (ciphertext, as served — the v1 raw path programs verbatim). */
-      const payload = bankCapture.subarray(0, plain.length);
-      if (payload.length !== plain.length) {
-        throw new Error('the bank capture is shorter than the image — cannot restore');
-      }
-      const commit = await commitToBank(device, detection.bank, payload, {
-        label: 'P4 restore',
-        reporter,
-      });
-      const reset = await resetDevice(device);
-      record(
-        'P4',
-        'original bank content restored',
-        true,
-        `${String(commit.chunks)} chunks, commit status ${hexUp(commit.status)}, reset ${reset}`,
-      );
-    } finally {
-      await opener.close(device);
-    }
-  }
+  const afterRestore = await runStep('restore');
+  record('P4', 'original bank content restored', true, afterRestore.steps.restore?.notes ?? '');
 
-  let verify: { diffBytes: number; windowsRead: number; badWindows: readonly number[] } = {
+  const afterVerify = await runStep('verify');
+  const verify = afterVerify.verify ?? {
     diffBytes: -1,
     windowsRead: 0,
-    badWindows: [],
+    badWindows: [] as number[],
   };
-  for (let n = 1; n <= attempts; n++) {
-    const device = await opener.open();
-    try {
-      verify = await verifyAgainstBackup(device, backup, reporter);
-      if (verify.badWindows.length === 0) break;
-    } finally {
-      await opener.close(device);
-    }
-  }
   record(
     'P4',
     '31-window verify against the P1 backup',
