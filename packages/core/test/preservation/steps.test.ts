@@ -316,6 +316,46 @@ describe('describeStepGate — every prerequisite refusal', () => {
     }
   });
 
+  it('allowJump relaxes only the ordering gates past the commit — never the file gates', async () => {
+    const { state: throughPatch, store } = await stateThrough(['backup', 'patch']);
+    /* Without the override: drain/restore/verify refuse on the missing commit. */
+    for (const step of ['drain', 'restore', 'verify'] as const) {
+      expect(await describeStepGate(step, throughPatch, never)).toMatch(
+        /no completed (commit|restore)/,
+      );
+    }
+    /* With the explicit jump override: the ordering gates open... */
+    for (const step of ['drain', 'restore', 'verify'] as const) {
+      expect(
+        await describeStepGate(step, throughPatch, store.load, { allowJump: true }),
+      ).toBeNull();
+    }
+    /* ...but the FILE gates stay absolute — a jump cannot fabricate a
+     * restore source. */
+    for (const step of ['drain', 'restore'] as const) {
+      const refusal = await describeStepGate(step, throughPatch, never, { allowJump: true });
+      expect(refusal).toMatch(/preserve_bank_capture\.bin/);
+    }
+    expect(await describeStepGate('verify', throughPatch, never, { allowJump: true })).toMatch(
+      /verify needs preserve_backup_windows\.bin/,
+    );
+    /* The commit step's own gates never relax: throughPatch HAS the patch
+     * record, so the gate proceeds to the file check — and even under a jump
+     * the missing backup files refuse the write. */
+    expect(await describeStepGate('commit', throughPatch, never, { allowJump: true })).toMatch(
+      /commit requires the backup files .* missing/,
+    );
+    /* And a completed step still refuses under a jump. */
+    const { state: throughCommit, store: store2 } = await stateThrough([
+      'backup',
+      'patch',
+      'commit',
+    ]);
+    expect(
+      await describeStepGate('commit', throughCommit, store2.load, { allowJump: true }),
+    ).toMatch(/commit is already done/);
+  });
+
   it('a failed step does not block its own re-run', async () => {
     const { state } = await createPreserveRun(plain, { runId: 'gates' });
     const failed = recordStepFailure(state, 'backup', new Error('the camera came unplugged'));
