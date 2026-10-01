@@ -3469,3 +3469,207 @@ machine; load is the 1-minute average at the start and the end.
   (3.0 s, fed only from SysTick, which the USB interrupt blocks) against a commit whose erase and
   programming ran longer than that on a slow part was not run: the emulated part answers at once.
 - `sweep` through node-usb over the emulator is still not run (§21.9); `flash` now is (22.5).
+
+## 23. The preservation pipeline on the real 2014 dumps: five boots, the per-arm budget measured in asks, and the budget-flag decision (2026-10-01)
+
+The four-phase pipeline had run once, on the 2016 Compact PRO donor carrying the 1.3.0.0 image
+as a chimera (the suite's original boot, 2026-09-24). This rerun puts it on what it will
+actually meet: the REAL 4 MiB flash dumps of the 2014 Compact cameras — the corpus entry
+`compact/2014.10.21-14.58.29-1.3.0.0/101310HSNEA2/dump` (the 32K board profile, the
+bench-measured JEDEC id `010215` from the manifest), the byte-exact `--flash` cross-check of
+the same bytes (`6.bin`), two more reads of the same chain (`1.bin`, `2.bin`; cfg[0]=0, bank A),
+and the post-write `4.bin`, whose boot-config record names the RECOVERY slot (cfg[0]=2). The
+fifth read, `3.bin`, is a different boot chain and stays a negative. The dumps themselves —
+names, sha256s, and what each holds, read off the bytes — are FW-V1
+`docs/HARDWARE_BRINGUP.md` sec.19. The 2014 banks hold the factory image AS STORED (the
+Sep 29 2014 bootloader has no cipher), so every case runs the pipeline's plaintext form: the
+pre-write capture gate compares the whole image against the factory plaintext
+(`verifyCapture(capture, plain, plain)` — the strongest check, no keyless window fallback),
+and the conjugation reduces to the patched plaintext itself.
+
+### 23.1 The cases, and what each asserts
+
+Every positive case asserts the same four proofs: P3's raw dump equals the commit server's
+`.final` (0 diffs); the delivered dump — the ACTIVE bank swapped back from the P1 backup —
+equals the as-booted image (0 diffs); P4's fresh boot re-reads all 31 windows identical to the
+P1 backup (0 diffs) and, when the restore server stops politely, its `.final` equals the
+as-booted image over the whole 4 MiB; and the P2 ground truth — the part changed by exactly
+the ten enumerated patch bytes inside the active bank, with the bootloader block, the
+boot-config block, both other banks, everything above 0x14080000 and the bank's erased tail
+byte-identical. The as-booted image is additionally pinned to its dump's sha256 at the READY
+line (`emu.ready.flash_sha256`), so a swapped or edited file fails before any wire traffic.
+
+**4.bin needed no new code.** `parseBootConfig` already reads cfg[0]=2 as the recovery slot
+(bank r, 0x14070000, mode 9), the pipeline patches the bank the record names, and the
+delivered-dump swap-back uses `detection.bankAddress` — recovery's own P1 window. The
+recovery slot holds the factory plaintext, so the pre-write gate passes unchanged. Measured:
+the same ten bytes at 0x70000+, everything else byte-identical.
+
+**3.bin, the negative.** The four phases never run against it. Three refusals are asserted:
+`buildV1Patch` on its 42,680-byte slot image refuses at the balance gate first (stored words
+0x9AD27D5F — the sum gate predates the site bytes), and at the before-byte gate under a forced
+balance (offline algebra only; the site bytes do not match either); the pre-write capture gate
+(`verifyCapture` against the factory plaintext) refuses its bank; and on the wire, the camera
+does not report 1.3.0.0 — it reports **4.8.2.1** (the different chain's own build, measured) —
+so the pipeline's version gate refuses it before P1 reads a window, with the ledger proving no
+write-shaped request (0x52 / 0x50 / 0x81 / 0x59) ever went out.
+
+### 23.2 The flag decision: `--host-wait-budget` stays dead
+
+The suite's capability gate REQUIRED the flag, so on this emulator — which does not have it
+(it exists only in the older FW-V1_copy tree, `emu/seekemu/cli.py:77`, plumbed into
+`usb_host.py`'s `wait_budget`) — the whole preservation suite skipped. The decision rule was:
+try without it; if green, stop sending it rather than port dead code; port the ~5 lines only
+if measurements demand.
+
+Ran without it: green on every case. The reasons it is not needed are structural. FW-V1
+Phase 63 ends every long operation on EMULATED time with a wall-clock safety net
+(`UsbHost.attach_deadline`), and the emulated SPIFI completes erase and program at once, so
+the wire-81 commit URB retires in tens of ms of camera time (sec.22.3). This run: the whole
+`commitToBank` (747 staging writes + the commit) took 2.2-2.3 s of wall per case, with ZERO
+host give-ups and zero deadline expiries on every server of every row. The harness keeps the
+conditional `StartOptions.hostWaitBudget` plumbing for an emulator that has the flag; the
+preservation suite neither sends nor requires it. What the capability gate requires now is the
+device-time side channel (`--usbip-clock`): without it the transport's deadlines would run on
+the wall clock and the audit would fail the row anyway.
+
+### 23.3 The per-arm budget is consumed in asks, not bytes served (the new machine fact)
+
+The widened window's reader descriptor (`d4`) carries a per-arm budget, and the patch sets it
+to the whole part — that much was known, and it is why P3 drains first on its own single arm.
+The UNIT was not known. This run measured it by watching the 1.3.0.0 descriptor in RAM at
+0x10002CC0 (the cell FW-V1's sweep reads; fields +8 remaining, +12 cursor, +16 capacity):
+armed, remaining = 0x400000, cursor = 0, capacity = 0x400000 — the patch's value, landed —
+with source 0x14000000 and kind 7. Per wire-79 read: remaining −= wLength, cursor += wLength,
+and the serve is the READER's own — nothing obliges it to return wLength.
+
+On this machine the serve at a 512-ask varies. Measured over usbip: a 4 MiB drain at 512-ask
+made exactly 8,192 asks (8,192 × 0x200 = the whole 0x400000 budget), delivered 2,010,240 B,
+and stalled — deterministically, on three fresh servers, always at 2,010,240 — with the serve
+histogram 512 B ×438, 256 B ×4,644, 192 B ×3,110. At a 64-ask — one EP0 packet — serve ==
+ask every time, and the drain lands exactly: 65,536 asks, remaining 0 at cursor 0x400000, no
+short serve (the same measurement watched in-process through the emulator's own host, which
+does not truncate the data stage the way the bridge's soft poll budget can). So P3 in this
+suite drains at 64-byte asks; `drainWholePart` already took a chunk option, and the pipeline's
+512 default stands for hardware — a real host NAKs a late packet instead of ending the data
+stage, so its serves should be full where this model's are not.
+
+Two consequences worth writing down:
+
+- **The budget burns on a short serve.** A read that returns 192 B still costs 512 B of
+  budget and advances the cursor 512 B — the un-served bytes are gone (the cursor never
+  rewinds, and a retry asks the NEXT 512). This is the arithmetic behind the original
+  probe-before-drain measurement (the probe cost the drain 0x20000) and behind DRAIN FIRST
+  generally: nothing else may read through the drain's arm.
+- **An exhausted reader stays dead.** After the budget ran out, a fresh arm on the same server
+  did not restore reading: every later wire-79 stalled at its first read. A server that
+  exhausted its arm is done until it is re-booted. (The suite's post-drain probe therefore
+  always reports the stall, advisory only, and the drain's own completion remains the
+  liveness proof.)
+
+### 23.4 The post-reset shape on emu-corpus
+
+The wire-89 reset on a live server reboots the part in place. The next sessions on that same
+server fail in `GetOperationMode` (a STALL: the part is still booting) — the boot needs
+~9-11 s of camera time, the gated clock advances only while transfers are outstanding, so the
+15 s wall wait between sessions moves nothing, and each failed session's `ensureMode0` settle
+contributes up to 3 s (MODE_SETTLE_MS) of camera time toward the boot. The retry ladder
+absorbs it as written: round 0's two sessions stall, and round 1's fresh server — which boots
+past READY before serving — drains. Measured identically on every case. The reset's own
+orphaned URB is the delivery audit's one tolerated shape (one unanswered transfer, a wire-89
+on the ledger, no drops).
+
+### 23.5 What the rerun itself fixed: the suite's transports were on the wall clock
+
+The 2026-09-24 suite predated the wall-clock tripwire (§19/§20), and its audit tolerance was
+too loose to catch the consequence: it accepted any violation of a clean session, because
+`urbsAbandoned <= 1` and `sent >= 0` are both trivially true at zero. Tightening the tolerance
+to the reset's exact shape surfaced the real defect within one run: every one of the suite's
+transfers — 33,342 in the first row of the rerun — timed its deadlines on the WALL clock,
+because `withDevice` built its `WebUsbTransport` without `clock: device.deadlineClock`.
+Fixed there (as every other emulator suite has since §19); the tolerance now accepts exactly
+one shape, 23.4's, and everything else fails the row with its text.
+
+### 23.6 patch.test.ts: the zero-keystream case
+
+Four synthetic cases pin the plaintext reduction of the cipher machinery: a zero keystream is
+the identity (the stored bank IS the plaintext, and its word sum is 0 as stored); conjugating
+a plaintext capture stages exactly the patched image (the ten enumerated bytes, nothing else);
+`verifyCapture` with the factory plaintext as the expected prefix is the whole-image gate; and
+the rebalance word still applies with no cipher. A fifth, corpus-gated case reads the REAL
+bytes: 6.bin's active bank holds the factory 1.3.0.0 plaintext byte for byte and passes the
+2014 bootloader's own acceptance as stored — magic 0xA1B2C3D4 at +0x200, length 47,768 at
++0x204, stored words over `header.length` summing to 0.
+
+### 23.7 The runs
+
+Ran first alone (the corpus entry, twice — before and after the clock fix of 23.5), then the
+whole file. A desktop session and another session's emulator shared the machine from the
+second half of the full run (load 4-5); the results are on the camera's clock and do not move
+with it, the wall times do.
+
+| run                                                                                                                                                | load                                                              | exit | tests                | wall (vitest) |
+| -------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- | ---- | -------------------- | ------------- |
+| `npx vitest run packages/core/test/preservation/pipeline.emulator.test.ts -t "the corpus entry"` (first green, before 23.5's fix)                  | ~5                                                                | 0    | 5 / 5                | 274 s         |
+| the same, after the clock fix (the reference run)                                                                                                  | ~4                                                                | 0    | 5 / 5                | 254 s         |
+| the whole file — five cases + the negative                                                                                                         | 4 -> 12 (another session's emulator probe moved in; see the note) | 0    | 28 / 28              | 1,192 s       |
+| `npx vitest run packages/core/test/preservation/patch.test.ts`                                                                                     | ~4                                                                | 0    | 17 / 17              | 1 s           |
+| `npm run check` (format, lint, typecheck, all suites; macOS photo-analysis daemons at load 20-40 beside it; the camera.test.ts flake did not fire) | 9-42                                                              | 0    | 779 / 779 (45 files) | 1,270.7 s     |
+
+Per case (from the GREEN lines; the raw sha is the commit server's `.final`):
+
+| case                              | P3 raw (= the commit server's `.final`)                                                                                                      | delivered (= the as-booted image = the source dump)                |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| corpus entry                      | `7ada1be6b211329189ff3e87d109e9d5ac5f2fcb9e891d054127e72f53d499f9`                                                                           | `40447c7e6da5cbc84621f4694ffff5bda0f783e7807a45e80443383b19a8eb72` |
+| `--flash 6.bin`                   | `7ada1be6b211329189ff3e87d109e9d5ac5f2fcb9e891d054127e72f53d499f9` - the SAME post-commit part, byte for byte, through the second boot route | `40447c7e...` (as above)                                           |
+| `--flash 1.bin`                   | `7c3c3b48b9a9a0f9d1c0e4526dc74e0a920d21553723b6110434203d8fedffed`                                                                           | `37f5f983066e85c4007bb2b12e159d678d37647242d406451969cf3f81f7de78` |
+| `--flash 2.bin`                   | `496324431ed89fc62c4db7f07ecd0b9c519d1d7383770e4faf24acf1a2b3c85a`                                                                           | `6d94b0890635d5d8ee8bffeb0ad6a4c6c9ec07dd9bf2198aed12b46814515825` |
+| `--flash 4.bin` (recovery active) | `26c4810a5b2099052aee105b5d405710f9716f41071cc3cc08c3a03bd7e9b88c`                                                                           | `059931aa844587f3ba3d63671202af8c33a91956548a939925e793185c8df9fe` |
+
+Every case's P4 verify read 31 / 31 windows at 0 differing bytes, and every restore server that
+stopped politely wrote a `.final` equal to its as-booted image over the whole 4 MiB (all five
+did). The delivered sha IS the source dump's sha in every row — the delivered dump is the
+camera's own flash content, byte for byte, including 4.bin's, whose active bank was recovery.
+The `npm run check` row reproduced every sha above byte for byte: the run is deterministic
+across boots, routes and machine load.
+
+Per case, the phases' wall times (an idle machine gives these; the full-file run's later cases
+ran under the other session's load and none of them moved by more than a few seconds — the
+results are on the camera's clock):
+
+| case            | P1+P2 (whole `commitToBank` in parentheses) | P3 (reset server + reboot + drain) | P4 (restore + verify) |
+| --------------- | ------------------------------------------- | ---------------------------------- | --------------------- |
+| corpus entry    | 53.5 s (2,303 ms)                           | 125.0 s                            | 58.0 s                |
+| `--flash 6.bin` | 53.3 s (2,229 ms)                           | 123.9 s                            | 57.9 s                |
+| `--flash 1.bin` | 53.8 s (2,285 ms)                           | 123.4 s                            | 59.3 s                |
+| `--flash 2.bin` | 54.3 s (2,318 ms)                           | 127.2 s                            | 60.6 s                |
+| `--flash 4.bin` | 53.8 s (2,296 ms)                           | 126.5 s                            | 59.7 s                |
+
+The 4 MiB drain at 64-ask is ~85 s of those P3 rows — 65,536 asks at ~1.3 ms each over usbip,
+plus the reset server's boot and the post-reset retry that the shape of 23.4 spends.
+
+### 23.8 What this changes for the hardware run
+
+- **The phase order stands, and the commit session stays reset-free.** The commit is proven to
+  land without a reset in its session, and the polite stop's `.final` is the ground truth
+  every offline proof read here.
+- **The full dump's per-call size matters on this line** (23.3). The real camera's serve sizes
+  at a 512-ask are unknown until the hardware run; 64 B asks are the shape that cannot be
+  shortened by the budget arithmetic, and they are what the CLI's dump already defaults to.
+- **After a wire-89, expect silence for a full boot.** The emulator's boot is 9-11 s of camera
+  time; the CLI's opener (1 s between attempts, 60 of them) covers it, and a session that
+  fails in `GetOperationMode` should be retried, not diagnosed.
+- **A camera in 4.bin's state needs nothing new**: cfg[0]=2 names recovery, the shipped
+  detection follows it, and the same four proofs ran green on those bytes.
+
+### 23.9 Still open
+
+- **The serve-size law** (23.3): 438 of 8,192 512-asks fully served and the rest split
+  256/192 — what decides the serve is not modeled, and the 64-ask drain does not depend on
+  it. Whether real silicon serves 512-asks in full is exactly what the hardware run measures.
+- **The P3 test's ceiling is 60 min**, and the reason is measured: the drain's 65,536 asks are
+  separate round trips, and under `npm run check`'s own parallel suites (or any busy machine)
+  the same rows that run in ~2 min idle have run 30+ min. The standalone file is the reference
+  run; the check's wall time moves with the machine, the results do not (every deadline is on
+  the camera's clock).
+- **The commit's real flash time on silicon** is still not emulated (sec.22.7); unchanged.
