@@ -797,15 +797,35 @@ async function runPatchStep(
  * commit — the in-place patch; never reset, never replayed blind
  * ==================================================================== */
 
-/** The bank's first `length` bytes, as the stock window serves them. */
-async function readBankPrefix(
-  device: SeekDevice,
-  bank: BankKey,
-  length: number,
-  label: string,
-): Promise<Uint8Array> {
+/**
+ * How much of the bank's head the pre-checks read, and at what ask size —
+ * both measured constraints, not choices.
+ *
+ * THE ASK SIZE: 64 B, the shape where serve == ask on this reader (TESTING.md
+ * sec. 23.3). At a 512-ask the RE-ARMED bank window serves short (~192-256 B)
+ * while its cursor advances by the full ask, so the delivered stream is
+ * SPARSE — measured on the emulator: live vs capture heads byte-identical for
+ * 24 B, divergent within the first 1 KiB, and a 47,768 B sequential read
+ * stalled permanently at 28,544 B. At a 64-ask serve == ask always, and
+ * sixteen asks deliver a contiguous, byte-accurate 1 KiB.
+ *
+ * THE LENGTH: 1 KiB is ENOUGH — the rebalance word at 0x238 (568) is one of
+ * the ten patch bytes, 0 on the factory image (buildV1Patch refuses a busy
+ * rebalance word) and the nonzero rebalance on the patched one — so the head
+ * alone distinguishes original from patched, which is the only question the
+ * pre-checks exist to answer. The instruction-site bytes (0x3DB7..0x3C71) lie
+ * beyond it and are NOT checked live.
+ */
+const BANK_HEAD_BYTES = 0x400;
+const BANK_HEAD_ASK = 64;
+
+async function readBankHead(device: SeekDevice, bank: BankKey, label: string): Promise<Uint8Array> {
   await device.armWindow(bankWindow(bank));
-  return drainExact(device, length, label, { retries: 3, timeoutMs: 20000 });
+  return drainExact(device, BANK_HEAD_BYTES, label, {
+    chunk: BANK_HEAD_ASK,
+    retries: 3,
+    timeoutMs: 20000,
+  });
 }
 
 async function runCommitStep(
@@ -839,27 +859,29 @@ async function runCommitStep(
     const version = await gateVersion(device, state);
     reporter.log(`camera reports firmware ${version}`, 'detail');
 
-    /* THE PRE-COMMIT READ-BACK: what is in the bank RIGHT NOW decides what
-     * may be written. A crash between the commit transfer and its checkpoint
-     * leaves this run at nextStep `commit`; re-running it must never stage a
-     * second commit blind. */
-    const live = await readBankPrefix(
+    /* THE PRE-COMMIT READ-BACK (one ask at the bank's head): what is in the
+     * bank RIGHT NOW decides what may be written. A crash between the commit
+     * transfer and its checkpoint leaves this run at nextStep `commit`;
+     * re-running it must never stage a second commit blind. The head carries
+     * the rebalance word (0x238), which is 0 on the original and the nonzero
+     * rebalance on the patched bytes — enough to tell the two apart. */
+    const live = await readBankHead(
       device,
       detection.bank,
-      plain.length,
-      'commit pre-check (the active bank as it lies)',
+      'commit pre-check (the active bank head as it lies)',
     );
-    if (equalBytes(live, payload)) {
+    if (equalBytes(live, payload.subarray(0, BANK_HEAD_BYTES))) {
       fail(
         'the active bank already holds the patched bytes — the commit landed in a previous ' +
           'attempt and must not be replayed. Resume at the drain step (--resume), which ' +
           'boots the patched image and continues from there.',
       );
     }
-    if (!equalBytes(live, capture.subarray(0, plain.length))) {
+    if (!equalBytes(live, capture.subarray(0, BANK_HEAD_BYTES))) {
       fail(
-        'the active bank changed since the backup (it holds neither the original capture nor ' +
-          'the patched bytes) — refusing to write over an unknown bank state',
+        'the active bank head changed since the backup (it holds neither the original capture ' +
+          'nor the patched bytes) — refusing to write over an unknown bank state. Head hex: ' +
+          `live ${bytesToHex(live, 24)} vs capture ${bytesToHex(capture.subarray(0, 24))}`,
       );
     }
 
@@ -1027,13 +1049,14 @@ async function runRestoreStep(
       );
     }
 
-    const live = await readBankPrefix(
+    /* Head read (see BANK_HEAD_BYTES): the rebalance word at 0x238 is 0 on
+     * the original and the nonzero rebalance on the patched bytes. */
+    const live = await readBankHead(
       device,
       detection.bank,
-      stagedLength,
-      'restore pre-check (the active bank as it lies)',
+      'restore pre-check (the active bank head as it lies)',
     );
-    if (equalBytes(live, original)) {
+    if (equalBytes(live, original.subarray(0, BANK_HEAD_BYTES))) {
       /* A previous restore landed and its checkpoint did not: the recovery is
        * to mark the step done, not to erase and reprogram the same bytes. */
       reporter.log(
