@@ -44,6 +44,9 @@ describe('parseCli', () => {
       yes: false,
       rescueDump: true,
       probe: true,
+      resume: null,
+      fromStep: null,
+      printState: null,
     });
   });
 

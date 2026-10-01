@@ -172,42 +172,54 @@ async function step(
  * ==================================================================== */
 
 describe('createPreserveRun — the checkpoint document', () => {
-  it('builds the version-1 state from the image, and the patch beside it', async () => {
-    const plain = syntheticPlain();
-    const { state, patch } = await createPreserveRun(plain);
-    expect(state.version).toBe(1);
-    expect(state.buildFamily).toBe('v1-2014');
-    expect(state.expectedVersion).toBe(EXPECTED_VERSION);
-    expect(state.imageSha256).toBe(await sha256hex(plain));
-    expect(state.nextStep).toBe('backup');
-    expect(state.steps).toEqual({});
-    expect(state.runId).toMatch(/^preserve-\d{4}-\d{2}-\d{2}T/);
-    /* The patch is built here so a wrong image fails before any run exists. */
-    expect(patch.diffOffsets.length).toBe(10);
-    expect(wordSum(patch.patched)).toBe(0);
-  });
+  it(
+    'builds the version-1 state from the image, and the patch beside it',
+    { timeout: 120_000 },
+    async () => {
+      const plain = syntheticPlain();
+      const { state, patch } = await createPreserveRun(plain);
+      expect(state.version).toBe(1);
+      expect(state.buildFamily).toBe('v1-2014');
+      expect(state.expectedVersion).toBe(EXPECTED_VERSION);
+      expect(state.imageSha256).toBe(await sha256hex(plain));
+      expect(state.nextStep).toBe('backup');
+      expect(state.steps).toEqual({});
+      expect(state.runId).toMatch(/^preserve-\d{4}-\d{2}-\d{2}T/);
+      /* The patch is built here so a wrong image fails before any run exists. */
+      expect(patch.diffOffsets.length).toBe(10);
+      expect(wordSum(patch.patched)).toBe(0);
+    },
+  );
 
-  it('round-trips through JSON and still gates the round-tripped state', async () => {
-    const plain = syntheticPlain();
-    const { state } = await createPreserveRun(plain, { now: () => new Date(0) });
-    const restored: PreserveRunState = JSON.parse(JSON.stringify(state)) as PreserveRunState;
-    expect(restored).toEqual(state);
-    /* The gate runs against the restored document — the shape a resume gets. */
-    await expect(describeStepGate('backup', restored, never)).resolves.toBeNull();
-  });
+  it(
+    'round-trips through JSON and still gates the round-tripped state',
+    { timeout: 120_000 },
+    async () => {
+      const plain = syntheticPlain();
+      const { state } = await createPreserveRun(plain, { now: () => new Date(0) });
+      const restored: PreserveRunState = JSON.parse(JSON.stringify(state)) as PreserveRunState;
+      expect(restored).toEqual(state);
+      /* The gate runs against the restored document — the shape a resume gets. */
+      await expect(describeStepGate('backup', restored, never)).resolves.toBeNull();
+    },
+  );
 
-  it('refuses an image that does not carry the v1 update machinery', async () => {
-    const plain = syntheticPlain();
-    /* Flip a site byte, then re-balance through the scratch word so ONLY the
-     * before-byte gate fires (the sum gate predates it). */
-    plain[0x3db4] = (plain[0x3db4] ?? 0) ^ 0xff;
-    const dv = new DataView(plain.buffer);
-    dv.setUint32(0x3ff0, 0, true);
-    dv.setUint32(0x3ff0, (0 - wordSum(plain)) >>> 0, true);
-    await expect(createPreserveRun(plain)).rejects.toThrow(
-      /does not carry the v1 2014 update machinery/,
-    );
-  });
+  it(
+    'refuses an image that does not carry the v1 update machinery',
+    { timeout: 120_000 },
+    async () => {
+      const plain = syntheticPlain();
+      /* Flip a site byte, then re-balance through the scratch word so ONLY the
+       * before-byte gate fires (the sum gate predates it). */
+      plain[0x3db4] = (plain[0x3db4] ?? 0) ^ 0xff;
+      const dv = new DataView(plain.buffer);
+      dv.setUint32(0x3ff0, 0, true);
+      dv.setUint32(0x3ff0, (0 - wordSum(plain)) >>> 0, true);
+      await expect(createPreserveRun(plain)).rejects.toThrow(
+        /does not carry the v1 2014 update machinery/,
+      );
+    },
+  );
 });
 
 /* ==================================================================== *
@@ -237,36 +249,44 @@ describe('describeStepGate — every prerequisite refusal', () => {
     return { state, store };
   }
 
-  it('patch refuses before the backup — the run dumps the regions first', async () => {
-    const { state } = await createPreserveRun(plain, { runId: 'gates' });
-    const refusal = await describeStepGate('patch', state, never);
-    expect(refusal).toMatch(/patch runs after the backup/);
-    expect(refusal).toMatch(/the only.*copy of this camera/);
-  });
+  it(
+    'patch refuses before the backup — the run dumps the regions first',
+    { timeout: 120_000 },
+    async () => {
+      const { state } = await createPreserveRun(plain, { runId: 'gates' });
+      const refusal = await describeStepGate('patch', state, never);
+      expect(refusal).toMatch(/patch runs after the backup/);
+      expect(refusal).toMatch(/the only.*copy of this camera/);
+    },
+  );
 
-  it('commit refuses without the patch record, and without the backup files', async () => {
-    const { state: afterBackup, store } = await stateThrough(['backup']);
-    expect(await describeStepGate('commit', afterBackup, store.load)).toMatch(
-      /commit runs after the patch step/,
-    );
+  it(
+    'commit refuses without the patch record, and without the backup files',
+    { timeout: 120_000 },
+    async () => {
+      const { state: afterBackup, store } = await stateThrough(['backup']);
+      expect(await describeStepGate('commit', afterBackup, store.load)).toMatch(
+        /commit runs after the patch step/,
+      );
 
-    const withPatch: PreserveRunState = {
-      ...afterBackup,
-      nextStep: 'commit',
-      patch: patchSummary(plain.length),
-      steps: { ...afterBackup.steps, patch: { status: 'done', notes: 'patch built' } },
-    };
-    /* Satisfy the type checker the way the runtime already works: the gate
-     * reads `patch === undefined`, so absence — not an undefined value. */
-    expect(await describeStepGate('commit', withPatch, store.load)).toBeNull();
-    /* The same state against an EMPTY run directory: the commit's restore
-     * source is gone, so it refuses with the file names. */
-    expect(await describeStepGate('commit', withPatch, never)).toMatch(
-      /commit requires the backup files .* missing: .*preserve_backup_windows\.bin/,
-    );
-  });
+      const withPatch: PreserveRunState = {
+        ...afterBackup,
+        nextStep: 'commit',
+        patch: patchSummary(plain.length),
+        steps: { ...afterBackup.steps, patch: { status: 'done', notes: 'patch built' } },
+      };
+      /* Satisfy the type checker the way the runtime already works: the gate
+       * reads `patch === undefined`, so absence — not an undefined value. */
+      expect(await describeStepGate('commit', withPatch, store.load)).toBeNull();
+      /* The same state against an EMPTY run directory: the commit's restore
+       * source is gone, so it refuses with the file names. */
+      expect(await describeStepGate('commit', withPatch, never)).toMatch(
+        /commit requires the backup files .* missing: .*preserve_backup_windows\.bin/,
+      );
+    },
+  );
 
-  it('drain refuses before a completed commit', async () => {
+  it('drain refuses before a completed commit', { timeout: 120_000 }, async () => {
     const { state } = await stateThrough(['backup', 'patch']);
     /* Rewind the commit, as a crash before its checkpoint would leave it. */
     const rewound: PreserveRunState = { ...state };
@@ -274,89 +294,109 @@ describe('describeStepGate — every prerequisite refusal', () => {
     expect(await describeStepGate('drain', rewound, never)).toMatch(/no completed commit/);
   });
 
-  it('restore refuses before a completed commit, and without the patch summary', async () => {
-    const { state: throughPatch } = await stateThrough(['backup', 'patch']);
-    expect(await describeStepGate('restore', throughPatch, never)).toMatch(
-      /nothing it can be reverting/,
-    );
-
-    const { state: throughCommit, store } = await stateThrough(['backup', 'patch', 'commit']);
-    const noSummary: PreserveRunState = { ...throughCommit };
-    delete noSummary.patch; /* absence, not an undefined value */
-    expect(await describeStepGate('restore', noSummary, store.load)).toMatch(/patch summary/);
-    expect(await describeStepGate('restore', throughCommit, store.load)).toBeNull();
-  });
-
-  it('verify refuses before a completed restore, and without the backup file', async () => {
-    const { state: throughCommit, store } = await stateThrough(['backup', 'patch', 'commit']);
-    expect(await describeStepGate('verify', throughCommit, never)).toMatch(/no completed restore/);
-
-    const restored: PreserveRunState = {
-      ...throughCommit,
-      nextStep: 'verify',
-      steps: { ...throughCommit.steps, restore: { status: 'done', notes: 'restored' } },
-    };
-    expect(await describeStepGate('verify', restored, never)).toMatch(
-      /verify needs preserve_backup_windows\.bin/,
-    );
-    expect(await describeStepGate('verify', restored, store.load)).toBeNull();
-  });
-
-  it('a done step refuses; so does any step on a run that is done', async () => {
-    const { state: afterBackup, store } = await stateThrough(['backup']);
-    expect(await describeStepGate('backup', afterBackup, store.load)).toMatch(
-      /backup is already done/,
-    );
-    const jumped: PreserveRunState = { ...afterBackup, nextStep: 'drain' };
-    expect(await describeStepGate('backup', jumped, store.load)).toMatch(/backup is already done/);
-
-    const done: PreserveRunState = { ...afterBackup, nextStep: 'done' };
-    for (const step of PRESERVE_STEP_IDS) {
-      expect(await describeStepGate(step, done, store.load)).toMatch(/this run is done/);
-    }
-  });
-
-  it('allowJump relaxes only the ordering gates past the commit — never the file gates', async () => {
-    const { state: throughPatch, store } = await stateThrough(['backup', 'patch']);
-    /* Without the override: drain/restore/verify refuse on the missing commit. */
-    for (const step of ['drain', 'restore', 'verify'] as const) {
-      expect(await describeStepGate(step, throughPatch, never)).toMatch(
-        /no completed (commit|restore)/,
+  it(
+    'restore refuses before a completed commit, and without the patch summary',
+    { timeout: 120_000 },
+    async () => {
+      const { state: throughPatch } = await stateThrough(['backup', 'patch']);
+      expect(await describeStepGate('restore', throughPatch, never)).toMatch(
+        /nothing it can be reverting/,
       );
-    }
-    /* With the explicit jump override: the ordering gates open... */
-    for (const step of ['drain', 'restore', 'verify'] as const) {
-      expect(
-        await describeStepGate(step, throughPatch, store.load, { allowJump: true }),
-      ).toBeNull();
-    }
-    /* ...but the FILE gates stay absolute — a jump cannot fabricate a
-     * restore source. */
-    for (const step of ['drain', 'restore'] as const) {
-      const refusal = await describeStepGate(step, throughPatch, never, { allowJump: true });
-      expect(refusal).toMatch(/preserve_bank_capture\.bin/);
-    }
-    expect(await describeStepGate('verify', throughPatch, never, { allowJump: true })).toMatch(
-      /verify needs preserve_backup_windows\.bin/,
-    );
-    /* The commit step's own gates never relax: throughPatch HAS the patch
-     * record, so the gate proceeds to the file check — and even under a jump
-     * the missing backup files refuse the write. */
-    expect(await describeStepGate('commit', throughPatch, never, { allowJump: true })).toMatch(
-      /commit requires the backup files .* missing/,
-    );
-    /* And a completed step still refuses under a jump. */
-    const { state: throughCommit, store: store2 } = await stateThrough([
-      'backup',
-      'patch',
-      'commit',
-    ]);
-    expect(
-      await describeStepGate('commit', throughCommit, store2.load, { allowJump: true }),
-    ).toMatch(/commit is already done/);
-  });
 
-  it('a failed step does not block its own re-run', async () => {
+      const { state: throughCommit, store } = await stateThrough(['backup', 'patch', 'commit']);
+      const noSummary: PreserveRunState = { ...throughCommit };
+      delete noSummary.patch; /* absence, not an undefined value */
+      expect(await describeStepGate('restore', noSummary, store.load)).toMatch(/patch summary/);
+      expect(await describeStepGate('restore', throughCommit, store.load)).toBeNull();
+    },
+  );
+
+  it(
+    'verify refuses before a completed restore, and without the backup file',
+    { timeout: 120_000 },
+    async () => {
+      const { state: throughCommit, store } = await stateThrough(['backup', 'patch', 'commit']);
+      expect(await describeStepGate('verify', throughCommit, never)).toMatch(
+        /no completed restore/,
+      );
+
+      const restored: PreserveRunState = {
+        ...throughCommit,
+        nextStep: 'verify',
+        steps: { ...throughCommit.steps, restore: { status: 'done', notes: 'restored' } },
+      };
+      expect(await describeStepGate('verify', restored, never)).toMatch(
+        /verify needs preserve_backup_windows\.bin/,
+      );
+      expect(await describeStepGate('verify', restored, store.load)).toBeNull();
+    },
+  );
+
+  it(
+    'a done step refuses; so does any step on a run that is done',
+    { timeout: 120_000 },
+    async () => {
+      const { state: afterBackup, store } = await stateThrough(['backup']);
+      expect(await describeStepGate('backup', afterBackup, store.load)).toMatch(
+        /backup is already done/,
+      );
+      const jumped: PreserveRunState = { ...afterBackup, nextStep: 'drain' };
+      expect(await describeStepGate('backup', jumped, store.load)).toMatch(
+        /backup is already done/,
+      );
+
+      const done: PreserveRunState = { ...afterBackup, nextStep: 'done' };
+      for (const step of PRESERVE_STEP_IDS) {
+        expect(await describeStepGate(step, done, store.load)).toMatch(/this run is done/);
+      }
+    },
+  );
+
+  it(
+    'allowJump relaxes only the ordering gates past the commit — never the file gates',
+    { timeout: 120_000 },
+    async () => {
+      const { state: throughPatch, store } = await stateThrough(['backup', 'patch']);
+      /* Without the override: drain/restore/verify refuse on the missing commit. */
+      for (const step of ['drain', 'restore', 'verify'] as const) {
+        expect(await describeStepGate(step, throughPatch, never)).toMatch(
+          /no completed (commit|restore)/,
+        );
+      }
+      /* With the explicit jump override: the ordering gates open... */
+      for (const step of ['drain', 'restore', 'verify'] as const) {
+        expect(
+          await describeStepGate(step, throughPatch, store.load, { allowJump: true }),
+        ).toBeNull();
+      }
+      /* ...but the FILE gates stay absolute — a jump cannot fabricate a
+       * restore source. */
+      for (const step of ['drain', 'restore'] as const) {
+        const refusal = await describeStepGate(step, throughPatch, never, { allowJump: true });
+        expect(refusal).toMatch(/preserve_bank_capture\.bin/);
+      }
+      expect(await describeStepGate('verify', throughPatch, never, { allowJump: true })).toMatch(
+        /verify needs preserve_backup_windows\.bin/,
+      );
+      /* The commit step's own gates never relax: throughPatch HAS the patch
+       * record, so the gate proceeds to the file check — and even under a jump
+       * the missing backup files refuse the write. */
+      expect(await describeStepGate('commit', throughPatch, never, { allowJump: true })).toMatch(
+        /commit requires the backup files .* missing/,
+      );
+      /* And a completed step still refuses under a jump. */
+      const { state: throughCommit, store: store2 } = await stateThrough([
+        'backup',
+        'patch',
+        'commit',
+      ]);
+      expect(
+        await describeStepGate('commit', throughCommit, store2.load, { allowJump: true }),
+      ).toMatch(/commit is already done/);
+    },
+  );
+
+  it('a failed step does not block its own re-run', { timeout: 120_000 }, async () => {
     const { state } = await createPreserveRun(plain, { runId: 'gates' });
     const failed = recordStepFailure(state, 'backup', new Error('the camera came unplugged'));
     expect(failed.steps.backup?.status).toBe('failed');
@@ -379,238 +419,280 @@ describe('runPreserveStep — the recovery behaviours', () => {
   ];
   const inPatch = (i: number): boolean => patchRanges.some(([start, end]) => i >= start && i < end);
 
-  it('backup produces the assembled windows, the capture, and the dump archive', async () => {
-    const camera = v1Camera(plain);
-    const store = memoryStore(plain);
-    const created = await createPreserveRun(plain, { runId: 'steps' });
-    const state = await step('backup', camera, created.state, store);
+  it(
+    'backup produces the assembled windows, the capture, and the dump archive',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore(plain);
+      const created = await createPreserveRun(plain, { runId: 'steps' });
+      const state = await step('backup', camera, created.state, store);
 
-    expect(state.nextStep).toBe('patch');
-    expect(state.detection?.bank).toBe('a');
-    expect(state.detection?.blank).toBe(true);
-    expect(state.steps.backup?.status).toBe('done');
-    expect(state.steps.backup?.notes).toMatch(/31 windows/);
-    expect(state.steps.backup?.notes).toMatch(/dump archive/);
+      expect(state.nextStep).toBe('patch');
+      expect(state.detection?.bank).toBe('a');
+      expect(state.detection?.blank).toBe(true);
+      expect(state.steps.backup?.status).toBe('done');
+      expect(state.steps.backup?.notes).toMatch(/31 windows/);
+      expect(state.steps.backup?.notes).toMatch(/dump archive/);
 
-    /* The checkpoint files, loadable through the store the test keeps. */
-    const windows = await store.load(PRESERVE_BACKUP_FILE);
-    expect(windows?.length).toBe(FLASH_SIZE);
-    const capture = await store.load(PRESERVE_BANK_CAPTURE_FILE);
-    expect(capture?.length).toBe(0x10000);
-    /* The capture IS the factory plaintext (the 2014 banks hold the image). */
-    expect([...(capture?.subarray(0, plain.length) ?? [])]).toEqual([...plain]);
-    /* The archive came along: manifest, README, and a source sha that names
-     * the assembled backup. */
-    const manifestBytes = await store.load('manifest.json');
-    expect(manifestBytes).not.toBeNull();
-    expect(await store.load('README.md')).not.toBeNull();
-    const manifest = JSON.parse(new TextDecoder().decode(manifestBytes!)) as {
-      source: { sha256: string };
-    };
-    expect(manifest.source.sha256).toBe(await sha256hex(windows!));
-    /* The assembled backup carries the reachable windows and 0xFF past them. */
-    expect(windows![BANK_A_OFFSET + 5]).toBe(plain[5]);
-    expect(windows![0x200000]).toBe(0xff);
-  });
+      /* The checkpoint files, loadable through the store the test keeps. */
+      const windows = await store.load(PRESERVE_BACKUP_FILE);
+      expect(windows?.length).toBe(FLASH_SIZE);
+      const capture = await store.load(PRESERVE_BANK_CAPTURE_FILE);
+      expect(capture?.length).toBe(0x10000);
+      /* The capture IS the factory plaintext (the 2014 banks hold the image). */
+      expect([...(capture?.subarray(0, plain.length) ?? [])]).toEqual([...plain]);
+      /* The archive came along: manifest, README, and a source sha that names
+       * the assembled backup. */
+      const manifestBytes = await store.load('manifest.json');
+      expect(manifestBytes).not.toBeNull();
+      expect(await store.load('README.md')).not.toBeNull();
+      const manifest = JSON.parse(new TextDecoder().decode(manifestBytes!)) as {
+        source: { sha256: string };
+      };
+      expect(manifest.source.sha256).toBe(await sha256hex(windows!));
+      /* The assembled backup carries the reachable windows and 0xFF past them. */
+      expect(windows![BANK_A_OFFSET + 5]).toBe(plain[5]);
+      expect(windows![0x200000]).toBe(0xff);
+    },
+  );
 
-  it('patch records the summary; the staged chunk count comes from the image length', async () => {
-    const camera = v1Camera(plain);
-    const store = memoryStore(plain);
-    const created = await createPreserveRun(plain, { runId: 'steps' });
-    const afterBackup = await step('backup', camera, created.state, store);
-    const afterPatch = await step('patch', camera, afterBackup, store);
+  it(
+    'patch records the summary; the staged chunk count comes from the image length',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore(plain);
+      const created = await createPreserveRun(plain, { runId: 'steps' });
+      const afterBackup = await step('backup', camera, created.state, store);
+      const afterPatch = await step('patch', camera, afterBackup, store);
 
-    expect(afterPatch.nextStep).toBe('commit');
-    expect(afterPatch.patch?.stagedLength).toBe(plain.length);
-    expect(afterPatch.patch?.chunkCount).toBe(Math.ceil(plain.length / 64));
-    const patched = await store.load(PRESERVE_PATCHED_FILE);
-    expect(patched?.length).toBe(plain.length);
-    /* Exactly the ten enumerated bytes differ. */
-    let diffs = 0;
-    for (let i = 0; i < plain.length; i++) {
-      if (plain[i] !== patched?.[i]) {
-        expect(inPatch(i)).toBe(true);
-        diffs++;
+      expect(afterPatch.nextStep).toBe('commit');
+      expect(afterPatch.patch?.stagedLength).toBe(plain.length);
+      expect(afterPatch.patch?.chunkCount).toBe(Math.ceil(plain.length / 64));
+      const patched = await store.load(PRESERVE_PATCHED_FILE);
+      expect(patched?.length).toBe(plain.length);
+      /* Exactly the ten enumerated bytes differ. */
+      let diffs = 0;
+      for (let i = 0; i < plain.length; i++) {
+        if (plain[i] !== patched?.[i]) {
+          expect(inPatch(i)).toBe(true);
+          diffs++;
+        }
       }
-    }
-    expect(diffs).toBe(10);
-  });
+      expect(diffs).toBe(10);
+    },
+  );
 
-  it('commit moves nextStep to drain and writes exactly the patch into the bank', async () => {
-    const camera = v1Camera(plain);
-    const store = memoryStore(plain);
-    const created = await createPreserveRun(plain, { runId: 'steps' });
-    let state = await step('backup', camera, created.state, store);
-    state = await step('patch', camera, state, store);
-    state = await step('commit', camera, state, store);
+  it(
+    'commit moves nextStep to drain and writes exactly the patch into the bank',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore(plain);
+      const created = await createPreserveRun(plain, { runId: 'steps' });
+      let state = await step('backup', camera, created.state, store);
+      state = await step('patch', camera, state, store);
+      state = await step('commit', camera, state, store);
 
-    expect(state.nextStep).toBe('drain');
-    expect(state.steps.commit?.status).toBe('done');
-    expect(state.steps.commit?.notes).toMatch(/no reset sent in this session/);
-    /* The camera's bank now holds the patched plaintext (no cipher). */
-    const bank = camera.flash.subarray(BANK_A_OFFSET, BANK_A_OFFSET + plain.length);
-    let diffs = 0;
-    for (let i = 0; i < plain.length; i++) {
-      if (bank[i] !== plain[i]) {
-        expect(inPatch(i)).toBe(true);
-        diffs++;
+      expect(state.nextStep).toBe('drain');
+      expect(state.steps.commit?.status).toBe('done');
+      expect(state.steps.commit?.notes).toMatch(/no reset sent in this session/);
+      /* The camera's bank now holds the patched plaintext (no cipher). */
+      const bank = camera.flash.subarray(BANK_A_OFFSET, BANK_A_OFFSET + plain.length);
+      let diffs = 0;
+      for (let i = 0; i < plain.length; i++) {
+        if (bank[i] !== plain[i]) {
+          expect(inPatch(i)).toBe(true);
+          diffs++;
+        }
       }
-    }
-    expect(diffs).toBe(10);
-  });
+      expect(diffs).toBe(10);
+    },
+  );
 
-  it('commit refuses — with "resume at drain" — when the bank already holds the patch', async () => {
-    const camera = v1Camera(plain);
-    const store = memoryStore(plain);
-    const created = await createPreserveRun(plain, { runId: 'steps' });
-    let state = await step('backup', camera, created.state, store);
-    state = await step('patch', camera, state, store);
-    state = await step('commit', camera, state, store);
-    /* The crash case: the checkpoint says commit is pending, but the bank
-     * says it landed. Rewind the state and re-offer the commit. */
-    const rewound: PreserveRunState = { ...state, nextStep: 'commit' };
-    delete rewound.steps.commit;
-    await expect(
-      runPreserveStep('commit', fakeOpener(camera), rewound, store.load, silentReporter),
-    ).rejects.toThrow(/already holds the patched bytes .* Resume at the drain/);
-  });
+  it(
+    'commit refuses — with "resume at drain" — when the bank already holds the patch',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore(plain);
+      const created = await createPreserveRun(plain, { runId: 'steps' });
+      let state = await step('backup', camera, created.state, store);
+      state = await step('patch', camera, state, store);
+      state = await step('commit', camera, state, store);
+      /* The crash case: the checkpoint says commit is pending, but the bank
+       * says it landed. Rewind the state and re-offer the commit. */
+      const rewound: PreserveRunState = { ...state, nextStep: 'commit' };
+      delete rewound.steps.commit;
+      await expect(
+        runPreserveStep('commit', fakeOpener(camera), rewound, store.load, silentReporter),
+      ).rejects.toThrow(/already holds the patched bytes .* Resume at the drain/);
+    },
+  );
 
-  it('a completed commit refuses a re-run, on the state level too', async () => {
-    const camera = v1Camera(plain);
-    const store = memoryStore(plain);
-    const created = await createPreserveRun(plain, { runId: 'steps' });
-    let state = await step('backup', camera, created.state, store);
-    state = await step('patch', camera, state, store);
-    state = await step('commit', camera, state, store);
-    await expect(
-      runPreserveStep('commit', fakeOpener(camera), state, store.load, silentReporter),
-    ).rejects.toThrow(/commit is already done/);
-  });
+  it(
+    'a completed commit refuses a re-run, on the state level too',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore(plain);
+      const created = await createPreserveRun(plain, { runId: 'steps' });
+      let state = await step('backup', camera, created.state, store);
+      state = await step('patch', camera, state, store);
+      state = await step('commit', camera, state, store);
+      await expect(
+        runPreserveStep('commit', fakeOpener(camera), state, store.load, silentReporter),
+      ).rejects.toThrow(/commit is already done/);
+    },
+  );
 
-  it('an abort mid-step throws CancelledError and leaves the state untouched', async () => {
-    const camera = v1Camera(plain);
-    const store = memoryStore(plain);
-    const created = await createPreserveRun(plain, { runId: 'abort' });
-    const controller = new AbortController();
-    /* Abort out of the reporter, deterministically: the fifth window's
-     * progress event fires the signal, and the next loop check throws. */
-    const aborting: Reporter = {
-      log: () => undefined,
-      artifact: () => undefined,
-      progress: (done) => {
-        if (done >= 5) controller.abort();
-      },
-    };
-    await expect(
-      runPreserveStep(
-        'backup',
+  it(
+    'an abort mid-step throws CancelledError and leaves the state untouched',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore(plain);
+      const created = await createPreserveRun(plain, { runId: 'abort' });
+      const controller = new AbortController();
+      /* Abort out of the reporter, deterministically: the fifth window's
+       * progress event fires the signal, and the next loop check throws. */
+      const aborting: Reporter = {
+        log: () => undefined,
+        artifact: () => undefined,
+        progress: (done) => {
+          if (done >= 5) controller.abort();
+        },
+      };
+      await expect(
+        runPreserveStep(
+          'backup',
+          fakeOpener(camera),
+          created.state,
+          store.load,
+          aborting,
+          controller.signal,
+        ),
+      ).rejects.toBeInstanceOf(CancelledError);
+      /* The caller's state was never touched: the previous checkpoint stands. */
+      expect(created.state.steps).toEqual({});
+      expect(created.state.nextStep).toBe('backup');
+      /* And the step re-runs clean on a fresh signal. */
+      const state = await step('backup', camera, created.state, store);
+      expect(state.steps.backup?.status).toBe('done');
+    },
+  );
+
+  it(
+    'restore marks itself done without writing when the bank already holds the original',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore(plain);
+      const created = await createPreserveRun(plain, { runId: 'steps' });
+      let state = created.state;
+      for (const id of ['backup', 'patch', 'commit', 'drain'] as const) {
+        state = await step(id, camera, state, store);
+      }
+      expect(state.nextStep).toBe('restore');
+
+      /* The crash-after-restore case: the bank already holds the original. */
+      const capture = (await store.load(PRESERVE_BANK_CAPTURE_FILE))!;
+      camera.flash.set(capture.subarray(0, plain.length), BANK_A_OFFSET);
+      const outcome = await step('restore', camera, state, store);
+      expect(outcome.steps.restore?.status).toBe('done');
+      expect(outcome.steps.restore?.notes).toMatch(/already held the original content/);
+    },
+  );
+
+  it(
+    'the whole run lands: delivered == the as-booted part, verify 0 diffs, nextStep done',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const asBooted = new Uint8Array(camera.flash);
+      const store = memoryStore(plain);
+      const created = await createPreserveRun(plain, { runId: 'full' });
+      let state = created.state;
+      for (const id of PRESERVE_STEP_IDS) {
+        state = await step(id, camera, state, store);
+      }
+      expect(state.nextStep).toBe('done');
+      expect(state.verify).toEqual({ diffBytes: 0, windowsRead: 31, badWindows: [] });
+
+      /* The delivered dump is the camera's ORIGINAL flash content. */
+      const delivered = await store.load(PRESERVE_DUMP_ORIGINAL_FILE);
+      expect(await sha256hex(delivered!)).toBe(await sha256hex(asBooted));
+      /* The raw post-write dump differs exactly at the bank's patch bytes. */
+      const raw = await store.load(PRESERVE_DUMP_POSTWRITE_FILE);
+      let rawDiffs = 0;
+      for (let i = 0; i < FLASH_SIZE; i++) {
+        if (raw![i] !== asBooted[i]) {
+          expect(
+            i >= BANK_A_OFFSET && i < BANK_A_OFFSET + plain.length && inPatch(i - BANK_A_OFFSET),
+          ).toBe(true);
+          rawDiffs++;
+        }
+      }
+      expect(rawDiffs).toBe(10);
+      /* And the part was restored: the camera's flash is the as-booted image. */
+      expect(await sha256hex(camera.flash)).toBe(await sha256hex(asBooted));
+    },
+  );
+
+  it(
+    'verify refuses when the part re-reads different, and the failure records',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore(plain);
+      const created = await createPreserveRun(plain, { runId: 'verify-fail' });
+      let state = created.state;
+      for (const id of ['backup', 'patch', 'commit', 'drain', 'restore'] as const) {
+        state = await step(id, camera, state, store);
+      }
+      /* Corrupt one byte under the backup, then verify. */
+      const corruptAt = BANK_A_OFFSET + 123;
+      camera.flash[corruptAt] = (camera.flash[corruptAt] ?? 0) ^ 0xff;
+      const error = await runPreserveStep(
+        'verify',
         fakeOpener(camera),
-        created.state,
+        state,
         store.load,
-        aborting,
-        controller.signal,
-      ),
-    ).rejects.toBeInstanceOf(CancelledError);
-    /* The caller's state was never touched: the previous checkpoint stands. */
-    expect(created.state.steps).toEqual({});
-    expect(created.state.nextStep).toBe('backup');
-    /* And the step re-runs clean on a fresh signal. */
-    const state = await step('backup', camera, created.state, store);
-    expect(state.steps.backup?.status).toBe('done');
-  });
+        silentReporter,
+      ).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/differing byte\(s\)/);
+      /* The caller checkpoints the failure; the state it keeps is unchanged. */
+      const failed = recordStepFailure(state, 'verify', error);
+      expect(failed.steps.verify?.status).toBe('failed');
+      expect(failed.nextStep).toBe('verify');
+      /* The backup file itself still matches its recorded sha. */
+      const windows = await store.load(PRESERVE_BACKUP_FILE);
+      expect(await sha256hex(windows!)).toBe(
+        state.steps.backup?.artifactShas?.[PRESERVE_BACKUP_FILE],
+      );
+    },
+  );
 
-  it('restore marks itself done without writing when the bank already holds the original', async () => {
-    const camera = v1Camera(plain);
-    const store = memoryStore(plain);
-    const created = await createPreserveRun(plain, { runId: 'steps' });
-    let state = created.state;
-    for (const id of ['backup', 'patch', 'commit', 'drain'] as const) {
-      state = await step(id, camera, state, store);
-    }
-    expect(state.nextStep).toBe('restore');
-
-    /* The crash-after-restore case: the bank already holds the original. */
-    const capture = (await store.load(PRESERVE_BANK_CAPTURE_FILE))!;
-    camera.flash.set(capture.subarray(0, plain.length), BANK_A_OFFSET);
-    const outcome = await step('restore', camera, state, store);
-    expect(outcome.steps.restore?.status).toBe('done');
-    expect(outcome.steps.restore?.notes).toMatch(/already held the original content/);
-  });
-
-  it('the whole run lands: delivered == the as-booted part, verify 0 diffs, nextStep done', async () => {
-    const camera = v1Camera(plain);
-    const asBooted = new Uint8Array(camera.flash);
-    const store = memoryStore(plain);
-    const created = await createPreserveRun(plain, { runId: 'full' });
-    let state = created.state;
-    for (const id of PRESERVE_STEP_IDS) {
-      state = await step(id, camera, state, store);
-    }
-    expect(state.nextStep).toBe('done');
-    expect(state.verify).toEqual({ diffBytes: 0, windowsRead: 31, badWindows: [] });
-
-    /* The delivered dump is the camera's ORIGINAL flash content. */
-    const delivered = await store.load(PRESERVE_DUMP_ORIGINAL_FILE);
-    expect(await sha256hex(delivered!)).toBe(await sha256hex(asBooted));
-    /* The raw post-write dump differs exactly at the bank's patch bytes. */
-    const raw = await store.load(PRESERVE_DUMP_POSTWRITE_FILE);
-    let rawDiffs = 0;
-    for (let i = 0; i < FLASH_SIZE; i++) {
-      if (raw![i] !== asBooted[i]) {
-        expect(
-          i >= BANK_A_OFFSET && i < BANK_A_OFFSET + plain.length && inPatch(i - BANK_A_OFFSET),
-        ).toBe(true);
-        rawDiffs++;
+  it(
+    'the verify reference rebuilt from the assembled backup matches, window for window',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore(plain);
+      const created = await createPreserveRun(plain, { runId: 'assemble' });
+      const state = await step('backup', camera, created.state, store);
+      const windows = (await store.load(PRESERVE_BACKUP_FILE))!;
+      const rebuilt = backupResultFromImage(windows);
+      expect(rebuilt.windows.length).toBe(31);
+      for (const entry of rebuilt.windows) {
+        const at = entry.address - FLASH_BASE;
+        expect(windows.subarray(at, at + 0x10000)).toEqual(entry.bytes);
       }
-    }
-    expect(rawDiffs).toBe(10);
-    /* And the part was restored: the camera's flash is the as-booted image. */
-    expect(await sha256hex(camera.flash)).toBe(await sha256hex(asBooted));
-  });
-
-  it('verify refuses when the part re-reads different, and the failure records', async () => {
-    const camera = v1Camera(plain);
-    const store = memoryStore(plain);
-    const created = await createPreserveRun(plain, { runId: 'verify-fail' });
-    let state = created.state;
-    for (const id of ['backup', 'patch', 'commit', 'drain', 'restore'] as const) {
-      state = await step(id, camera, state, store);
-    }
-    /* Corrupt one byte under the backup, then verify. */
-    const corruptAt = BANK_A_OFFSET + 123;
-    camera.flash[corruptAt] = (camera.flash[corruptAt] ?? 0) ^ 0xff;
-    const error = await runPreserveStep(
-      'verify',
-      fakeOpener(camera),
-      state,
-      store.load,
-      silentReporter,
-    ).catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toMatch(/differing byte\(s\)/);
-    /* The caller checkpoints the failure; the state it keeps is unchanged. */
-    const failed = recordStepFailure(state, 'verify', error);
-    expect(failed.steps.verify?.status).toBe('failed');
-    expect(failed.nextStep).toBe('verify');
-    /* The backup file itself still matches its recorded sha. */
-    const windows = await store.load(PRESERVE_BACKUP_FILE);
-    expect(await sha256hex(windows!)).toBe(
-      state.steps.backup?.artifactShas?.[PRESERVE_BACKUP_FILE],
-    );
-  });
-
-  it('the verify reference rebuilt from the assembled backup matches, window for window', async () => {
-    const camera = v1Camera(plain);
-    const store = memoryStore(plain);
-    const created = await createPreserveRun(plain, { runId: 'assemble' });
-    const state = await step('backup', camera, created.state, store);
-    const windows = (await store.load(PRESERVE_BACKUP_FILE))!;
-    const rebuilt = backupResultFromImage(windows);
-    expect(rebuilt.windows.length).toBe(31);
-    for (const entry of rebuilt.windows) {
-      const at = entry.address - FLASH_BASE;
-      expect(windows.subarray(at, at + 0x10000)).toEqual(entry.bytes);
-    }
-    expect(state.steps.backup?.artifactShas?.[PRESERVE_BACKUP_FILE]).toBe(await sha256hex(windows));
-  });
+      expect(state.steps.backup?.artifactShas?.[PRESERVE_BACKUP_FILE]).toBe(
+        await sha256hex(windows),
+      );
+    },
+  );
 });
