@@ -4377,3 +4377,133 @@ drain, expect the restore's first boot-config read to stall, and re-boot before 
   agreeing), booting 1.3.0.0 from bank A, cfg[0]=0, bank B blank. The repo took no diff: the
   `--chunk` flag the campaign needed already existed, and the run's deviations were carried by
   the checkpoint/resume machinery the six-step design shipped with.
+
+## 29. The preserve run self-sources: the image is the camera's active slot, read twice and agreed (2026-10-02)
+
+Every preservation run to date began with a file the operator handed over: `seek-fw preserve
+<image>`, the DECRYPTED factory plaintext, sha-checked into the run state and re-served by the
+front end on every load (`PRESERVE_PLAIN_NAME`, a name that named no file in the run directory).
+That input is the last remaining way to run the patch against bytes that did not come off the
+camera, and the ruling that closes this workstream removes it: **there is NO manual
+plaintext-image selection anywhere — the image ALWAYS derives from the camera itself.** The
+backup step becomes the origin of the whole run; the CLI loses its positional argument; and the
+factory plaintext becomes a run artifact, so `--resume` needs nothing but the run directory.
+
+### 29.1 The backup step is the origin now
+
+The reworked `runBackupStep` does four things in one session, in this order:
+
+1. **The 31 windows and the slot verdict, as before** (modes 3..9 + 0x0A..0x21, the boot-config
+   record parsed).
+2. **THE DOUBLE READ.** The active slot's 64 KiB window is read a second time, independently:
+   the bank window is re-armed and the whole window served through the drain path (a different
+   reader shape than the backup pass's `readArmed`, so the two captures share no ask sequence).
+   The two captures must agree BYTE FOR BYTE. On disagreement the run refuses — "the two reads of
+   the active slot disagree (sha256 X vs Y)" — and records nothing. The reasoning is the
+   campaign's: the capture is the restore source AND the patch's derivation input, and a camera
+   that cannot serve its own slot twice in a row identically is not a camera to write to. A read
+   glitch must become a refusal, never a write.
+3. **THE DERIVATION** (`solve.ts`, new). The agreed capture is the plain-image candidate. The
+   identity solve is tried first (the v1-2014 plain chain, whose banks hold the image as-is:
+   structural validation on the verbatim header window — magic 0xA1B2C3D4 at 0x200, a
+   word-multiple `header.length` that fits the capture and stays under the 2014 bootloader's own
+   0x10000 bound — then the image-length slice). Then each cipher family's solver in table order
+   (v1-2014-ff, compact-2016). EVERY candidate is pushed through the full gate set on the DERIVED
+   image before it is trusted: the version cross-check first (the derived image's header version
+   must equal what the camera reported in that same session — a mismatch refuses with "the camera
+   reports X but the active slot's image says Y"), then `buildV1Patch` — the build table's detect
+   hooks, the before-byte site gates, the family word-sum/acceptance rule. An already-patched
+   bank refuses right there: identity solves it (a patched plain-chain bank still parses), the
+   version agrees (the patch never touches the version word), and the before-bytes refuse. The
+   first candidate through every gate IS the factory plaintext; a capture for which none passes
+   refuses the run, and nothing is recorded, let alone written. `verifyCapture`'s old pre-write
+   role is gone — the double read IS the capture check; the commit pre-check on the 0x238 word,
+   the restore's capture-verbatim and the verify's 0-diff are untouched.
+   **The FF route's re-point moved into the step.** `effectiveDetection` used to read
+   `state.route` — which `createPreserveRun` filled from the image at create time — to re-point a
+   blank-cfg detection at recovery before capturing. With no image at create there is no route
+   yet, so the re-point now happens AFTER a first derivation: when the derived build's route is
+   recovery-only and the detection does not name recovery, the detection is re-pointed (the
+   2014 bootloader rejects the 0xFFFF-sum image at A/B and boots recovery unchecked, doc 35.3)
+   and the bank that actually runs is captured — double read and derived in full. The first
+   families-FF emulator run after the rework caught exactly this: backup and patch succeeded on
+   the cfg-named bank A and every commit round then refused with "the backup's detection named
+   bank a" — the ordering bug the in-step re-point fixes.
+4. **The record.** The derived plaintext is emitted as the artifact `preserve_image_plain.bin`
+   (the name now names a real run-directory file), with `state.imageSha256` = its sha,
+   `state.expectedVersion` = the camera's report, the build table's facts
+   (family/build/label/stagedForm/restoreForm/route/capability) recorded by the step that derived
+   them, and — new — `slotReadShas: [sha1, sha2]`, the double-read proof, plus
+   `imageSource: 'device'` under a **schema bump: `PreserveRunState.version` is 2.** Version-1 run
+   directories still load (the CLI's state parser takes both; the artifact set is identical), and
+   every field means the same thing in both; a v1 directory that has since lost its plaintext
+   (its file lived outside the run directory) refuses at the first patch-building step with the
+   remedy — put the file back as `preserve_image_plain.bin`.
+
+`createPreserveRun` takes NO image argument any more (it builds the empty, self-sourcing shell of
+a run and returns `{ state }`; the `patch` it used to build on the desk cannot exist before the
+camera has spoken, so the desk refusal a wrong image used to earn happens on the wire instead —
+at the backup step's gates, before anything write-shaped runs).
+
+### 29.2 The solver seam, and what the cipher families do today
+
+`packages/core/src/preservation/solve.ts` is the module the keystream-solving workstream plugs
+into: `solvePlainFromCapture(family, capture) → { ok: true; plain; method } | { ok: false;
+reason }` — pure, deterministic, never throws for content reasons. This workstream implements the
+interface, the identity path and the structural validation; **both cipher families return
+`ok: false` with a clear reason** ("the <family> keystream solver is not implemented in this
+build — the capture cannot be turned into the factory plaintext yet, and the run refuses rather
+than write over a slot it cannot read"). The contract is documented in the module header: the
+capture is the slot bytes, one 64 KiB window, with the header window stored VERBATIM — which is
+why a ciphered capture still gets as far as the build gates (the identity path parses its
+header, the length is readable in every family) before failing them. The caller never trusts a
+solved plain on its own: the gates above decide. Measured on the real thing: the native 1.0.3.0
+corpus dump (whose as-booted bank is plain ⊕ ks1) self-sources up to the seam — the expectedSlotPrefix
+gate passes, the identity candidate fails the build gates, the two cipher reasons name the way
+out, and the wire ledger of the whole server shows no `0x50`, no `0x81`, no `0x59`: nothing
+write-shaped went out.
+
+### 29.3 The CLI, and the front-end contract
+
+`seek-fw preserve` has no positional argument: `seek-fw preserve [--out dir] [--yes]`,
+`seek-fw preserve --resume <dir> [--from-step <id>]`, `--print-state <dir>`. The confirmation
+moved with the knowledge: an interactive run confirms once before the camera is touched (the
+generic plan — read-only backup first, the plan prints before anything is written), and AGAIN at
+the derived plan, which the CLI prints the moment the patch step records it — build, sites,
+rebalance word, staged form, commit route, restore, drain, next write — the last gate before the
+commit. `--yes` skips both. The `--json` document's `image` field is now
+`{ source: 'device', version, sha256 }` and `sha256.slotReads` carries the double-read pair.
+`usage.ts`, the README's preserve section and the plan prints all say where the image came from:
+"read from the camera's active slot, two agreeing reads".
+
+### 29.4 The proofs, and the unchanged shas
+
+- **Unit (fake camera, no emulator):** the double-read disagreement refuses (a device that serves
+  one flipped byte per chunk from the bank window's second arm); the ciphered-slot refusal names
+  both cipher families; the version cross-check refuses ("the camera reports 1.3.0.0 but the
+  active slot's image says 1.2.0.0"); the already-patched bank refuses at the before-bytes of the
+  derived image; the version-2 state round-trips and a lost `preserve_image_plain.bin` refuses
+  with the version-1 remedy; the whole six-step run lands delivered == as-booted with no image
+  input anywhere.
+- **The corpus donor, six steps, resumed, on the emulator** (the vendored 101310HSNEA2 dump, the
+  hardware campaign's own part): the run is self-sourced end to end — no plaintext is seeded
+  anywhere, the backup step derives it from the slot, the "crash" hands only the checkpoint
+  document to the resume — and the outputs are **byte-identical to the sec. 28.2 hardware
+  campaign: raw post-write dump sha256 `7ada1be6b211329189ff3e87d109e9d5ac5f2fcb9e891d054127e72f53d499f9`
+  (10-minute drain at the 64-byte ask, 139.5 s here), delivered dump sha256
+  `40447c7e6da5cbc84621f4694ffff5bda0f783e7807a45e80443383b19a8eb72` — the as-booted part
+  content, byte for byte.** Both shas are now PINNED in the suites (resume.emulator.test.ts and
+  the corpus case of the four-phase suite), so the self-sourced flow cannot drift a byte without
+  the tests saying so. Restore and verify green, 0 diffs, run done.
+- **The families' rows, self-sourced:** the 1.3.0.8 8 Hz chimera and the 1.3.0.8-FF recovery
+  route run the full in-place chain from the camera's own bytes (their donors store the image
+  as-is, so identity solves them); the 1.0.3.0 native-dump row is the seam proof of 29.2.
+- **The CLI (fake camera, real command):** the full run leaves a complete run directory with
+  `preserve_image_plain.bin` in it, both plan prints on the human stream, and the
+  `--json` document naming `image.source: 'device'`; a positional argument is a usage error;
+  the lost-artifact and version-1 migration paths refuse with the remedy and recover when the
+  file is back.
+
+What the web package still owes is its own workstream: the wizard's plan-from-image screen and
+its `plainLoader` served the removed input, and its preserve tests are the ones this change
+deliberately leaves red until that rework lands against these exports.

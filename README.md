@@ -210,12 +210,16 @@ command set. Nothing in the dump view reaches it.
 
 ## The v1 full-flash preservation pipeline
 
-`packages/core/src/preservation/` and `seek-fw preserve <image>` implement a full-flash
-preservation pipeline for the v1 "locked line" cameras. These are the builds whose write path the
-profiles refuse, and that refusal is still right for the general `flash` command; this pipeline is
-a separate, explicit, operator-invoked route that exists because in-place preservation cannot be
-done read-only. It started with Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0 (FW-V1 docs 33 sec. 11.7 and 34) and now covers eight builds across three cipher/acceptance families — `seek-fw preserve`
-detects the build from the image's bytes and prints what it will do before asking.
+`packages/core/src/preservation/` and `seek-fw preserve` implement a full-flash preservation
+pipeline for the v1 "locked line" cameras. These are the builds whose write path the profiles
+refuse, and that refusal is still right for the general `flash` command; this pipeline is a
+separate, explicit, operator-invoked route that exists because in-place preservation cannot be
+done read-only. It started with Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0 (FW-V1 docs 33 sec. 11.7 and 34) and now covers eight builds across three cipher/acceptance families. The command takes NO
+image argument: the backup step reads the active slot's image TWICE (two independent captures
+that must agree byte for byte — a disagreement refuses the run), derives the factory plaintext
+from that capture (identity on the 2014 plain chain, the build family's keystream solver on a
+cipher family), gates the derived image, and prints what it will do before anything write-shaped
+runs.
 
 ### The supported builds
 
@@ -239,18 +243,24 @@ Two build-specific facts the plan print states and the gates enforce:
   patch in place; the original content can only go back with a full-flash programmer.
 - **1.3.0.8 and 1.3.0.8-FF report the same version string.** The build is chosen from image
   properties — the 0xFFFF word-sum sentinel and the key blocks (located by value), never the
-  version alone. A 2018-or-later build (4.x, Compact XR, Nano 200/300, Mosaic) is refused at the
-  desk with a pointer at the standard dump workflow: no widening patch is needed, the modern
-  stock plan already reads 63 of the 64 flash windows.
+  version alone. A 2018-or-later build (4.x, Compact XR, Nano 200/300, Mosaic) is refused with a
+  pointer at the standard dump workflow: no widening patch is needed, the modern stock plan
+  already reads 63 of the 64 flash windows.
+- **A ciphered slot refuses at the keystream-solver seam.** Self-sourcing has to READ the factory
+  plaintext out of the slot, and today only the identity solve is implemented (the 2014 plain
+  chain, plus every build whose donor stores the image as-is — the 1.3.0.8 chimeras included). A
+  genuinely ciphered capture (the native 2016 Compact Pro dumps, whose banks hold plain ⊕ ks) gets
+  as far as the build gates and then refuses with "the <family> keystream solver is not
+  implemented in this build" — nothing is written, and the run says so.
 
 ### What it does — the four phases
 
-| Phase                 | What happens                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | What it touches            |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
-| **P1 backup**         | Reads all 31 windows a stock camera can serve (BeginFirmwareUpgrade modes 3..9 with the 18-byte token, 0x0A..0x21 plain; 0x14010000..0x141FFFFF, 64 KiB each) and refuses to continue if any window comes back short.                                                                                                                                                                                                                                                              | read-only                  |
-| **P2 in-place patch** | Reads the 28-byte boot-config record (mode 3), names the ACTIVE slot (a blank `cfg[0]` boots bank A 0x14050000 — the bootloader's fixed A→B→recovery validate order), captures that bank and verifies it against the builder's expected bytes BEFORE anything is written, then commits the patch into the active slot via the raw types-7 path (`0x52` mode 7 + token, `0x50` staging in 64-B chunks, `0x51` commit with the u16 sum). No boot-config write, no other-slot write.  | **writes the active slot** |
-| **P3 full dump**      | Sends the wire-89 reset, which boots the PATCHED image; after re-enumeration it probes the widened mode-2 window (the patch turns the reader's 64 KiB window into the whole 4 MiB part) and drains all 4 MiB at 64 B per call (one EP0 packet — the ask measured exact on the hardware, TESTING.md §28.3). The DELIVERED dump is post-processed: the active bank's 64 KiB is replaced from the P1 backup, so the file you keep is the camera's original flash content, byte-clean. | read-only after the reset  |
-| **P4 restore**        | Commits the ORIGINAL bank content (the P1 capture, staged verbatim — the raw path programs exactly what is staged) back over the active bank while the patched image still runs from SRAM, resets, then re-reads the 31 windows and requires 0 differing bytes against the P1 backup.                                                                                                                                                                                              | **writes the active slot** |
+| Phase                 | What happens                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | What it touches            |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| **P1 backup**         | Reads all 31 windows a stock camera can serve (BeginFirmwareUpgrade modes 3..9 with the 18-byte token, 0x0A..0x21 plain; 0x14010000..0x141FFFFF, 64 KiB each) and refuses to continue if any window comes back short. The active bank is then read AGAIN as an independent capture — the two must agree byte for byte, and a disagreement refuses the run (a read glitch must become a refusal, never a write) — and the factory plaintext is DERIVED from the agreed capture: identity on the 2014 plain chain, the build family's keystream solver on a cipher family. The derived image's header version must equal what the camera reports, and the build table's gates (detect hooks, before-bytes — an already-patched bank refuses here) run on it before anything is trusted. | read-only                  |
+| **P2 in-place patch** | Reads the 28-byte boot-config record (mode 3) and names the ACTIVE slot (a blank `cfg[0]` boots bank A 0x14050000 — the bootloader's fixed A→B→recovery validate order), then commits the patch into the active slot via the raw types-7 path (`0x52` mode 7 + token, `0x50` staging in 64-B chunks, `0x51` commit with the u16 sum) — the bank was already captured, double-read and its image gated in P1. No boot-config write, no other-slot write.                                                                                                                                                                                                                                                                                                                               | **writes the active slot** |
+| **P3 full dump**      | Sends the wire-89 reset, which boots the PATCHED image; after re-enumeration it probes the widened mode-2 window (the patch turns the reader's 64 KiB window into the whole 4 MiB part) and drains all 4 MiB at 64 B per call (one EP0 packet — the ask measured exact on the hardware, TESTING.md §28.3). The DELIVERED dump is post-processed: the active bank's 64 KiB is replaced from the P1 backup, so the file you keep is the camera's original flash content, byte-clean.                                                                                                                                                                                                                                                                                                    | read-only after the reset  |
+| **P4 restore**        | Commits the ORIGINAL bank content (the P1 capture, staged verbatim — the raw path programs exactly what is staged) back over the active bank while the patched image still runs from SRAM, resets, then re-reads the 31 windows and requires 0 differing bytes against the P1 backup.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | **writes the active slot** |
 
 ### The patch, and the ciphertext rule
 
@@ -279,9 +289,9 @@ camera can die.
 
 ### Running it
 
-Against the emulator (the four-phase suite; needs the FW-V1 `emu` directory — point `SEEK_EMU_DIR`
-at one whose `seekemu/cli.py` carries `--host-wait-budget`, e.g. the FW-V1_copy tree — and boots
-Compact 1.3.0.0 as a chimera on the 2016 Compact PRO donor):
+Against the emulator (needs the FW-V1 `emu` directory — point `SEEK_EMU_DIR` at one whose
+`seekemu/cli.py` carries `--jedec`, `--flash`, `--flash-out`, `--corpus-entry` and
+`--usbip-clock`; the suites boot the real corpus dumps, the corpus entry itself included):
 
 ```sh
 SEEK_EMU_DIR=/path/to/FW-V1/emu npm run test -- preserve
@@ -289,12 +299,12 @@ SEEK_EMU_DIR=/path/to/FW-V1/emu npm run test -- preserve
 SEEK_EMU_DIR=/path/to/FW-V1/emu npx vitest run packages/core/test/preservation/
 ```
 
-On hardware (Chrome/WebUSB or the node-usb backend), with the DECRYPTED factory plaintext of the
-build the camera runs — the expected version is derived from it, and the camera must report that
-build before anything is sent:
+On hardware (Chrome/WebUSB or the node-usb backend). There is no image to pass: the run derives
+everything from the camera, and the detailed plan prints after the backup step — before anything
+write-shaped runs, with a second confirmation at that point on an interactive terminal:
 
 ```sh
-seek-fw preserve plain-1.3.0.0.bin --out ./preserve-run --yes
+seek-fw preserve --out ./preserve-run --yes
 ```
 
 ### Stepwise runs, and resuming one
@@ -302,13 +312,18 @@ seek-fw preserve plain-1.3.0.0.bin --out ./preserve-run --yes
 The pipeline also exists as SIX RESUMABLE STEPS — `backup → patch → commit → drain → restore →
 verify` — and this is what `seek-fw preserve` drives: after every step it rewrites
 `preserve_run.json` (the run state: what completed, what each step produced, the sha256 of every
-artifact) in the run directory. Two properties fall out of that, and they are the reason the
+artifact) in the run directory. Three properties fall out of that, and they are the reason the
 stepwise shape exists:
 
 - **The restore source reaches disk before the first write.** The backup step persists the 31
-  windows, the active-bank capture, AND the standard dump archive built offline from them
-  (decrypted slots, reports, manifest) — the user's pre-flash dump of every region the stock plan
-  can read — before anything write-shaped can possibly run.
+  windows, the active-bank capture, the DERIVED factory plaintext, AND the standard dump archive
+  built offline from the windows (decrypted slots, reports, manifest) — the user's pre-flash dump
+  of every region the stock plan can read — before anything write-shaped can possibly run.
+- **The run needs nothing but the camera and its own directory.** The image always comes from the
+  camera itself, and the derived plaintext is a run artifact — so `--resume <dir>` needs no file
+  but the run directory. (Run directories from before the self-sourcing schema kept their
+  plaintext outside; resume one at a patch-building step and it asks for that file copied into
+  the directory as `preserve_image_plain.bin`.)
 - **A crash is a pause, not a loss.** Re-run with `--resume <dir>` and the run continues at
   `state.nextStep`; the interrupted step starts over, and a completed step is never repeated.
   The commit step is not replayable, so it reads the bank back before it writes: a bank that
@@ -330,29 +345,34 @@ the steps either way. A Ctrl-C is not a failure: it stops at the
 next safe point, leaves the previous checkpoint standing, and exits 130 — the interrupted step is
 re-run on the next `--resume`.
 
-On a core level the same steps are `createPreserveRun(plain, opts)` and
+On a core level the same steps are `createPreserveRun(opts)` — no image argument; it builds the
+empty, self-sourcing shell of a run — and
 `runPreserveStep(step, opener, state, loadArtifact, reporter, signal?)` in
 `packages/core/src/preservation/steps.ts`: core returns bytes as `Artifact[]` and never touches
 the filesystem; the caller (CLI or web) persists them and rewrites the state after every step.
+The plaintext-from-capture seam is `solvePlainFromCapture(family, capture)` in
+`packages/core/src/preservation/solve.ts`.
 
 Artifacts in the run directory: `preserve_run.json` (the state, rewritten after every step),
 `preserve_backup_windows.bin` (the backup, assembled at its flash addresses),
-`preserve_bank_capture.bin`, `preserve_patch_plain_patched.bin` (the patched plaintext),
+`preserve_bank_capture.bin`, `preserve_image_plain.bin` (the factory plaintext the backup step
+derived from the capture), `preserve_patch_plain_patched.bin` (the patched plaintext),
 `preserve_dump_postwrite.bin` (the part as patched), `preserve_dump_original.bin` (the delivered
 image — the camera's original content), plus `manifest.json`, `README.md` and the decrypted
 slots under `decrypted/` (the backup's dump archive).
 
 Artifacts in `--out`: `preserve_backup_windows.bin` (the P1 backup, assembled at its flash
-addresses), `preserve_bank_capture.bin`, `preserve_dump_postwrite.bin` (the part as patched),
-`preserve_dump_original.bin` (the delivered image — the camera's original content) and
-`preserve_run.json` (per-step records with sha256 of everything).
+addresses), `preserve_bank_capture.bin`, `preserve_image_plain.bin` (the derived factory
+plaintext), `preserve_dump_postwrite.bin` (the part as patched), `preserve_dump_original.bin`
+(the delivered image — the camera's original content) and `preserve_run.json` (per-step records
+with sha256 of everything).
 
 In the browser, the **Preserve (stepwise)** view drives the same checkpoint-step API one step at a
-time: the plan is built offline from the image before anything is armed, each completed step
-re-issues a downloadable `preserve-run-<runId>.zip` (the run state plus every checkpoint produced
-so far), and resuming from that file continues the run — or starts at an earlier-or-equal step the
-gates allow. The commit session never resets; the drain step owns the wire-89 and waits out the
-~10 s reboot by itself ("camera rebooting…").
+time; the run there is self-sourced exactly as the CLI's is — the image comes from the camera's
+active slot, never from a file the person picked — and each completed step re-issues a
+downloadable `preserve-run-<runId>.zip` (the run state plus every checkpoint produced so far,
+the derived plaintext included), from which the run resumes. The commit session never resets; the
+drain step owns the wire-89 and waits out the ~10 s reboot by itself ("camera rebooting…").
 
 ## Operation mode 0, and why a cold camera used to hang
 
