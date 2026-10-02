@@ -8,11 +8,16 @@
  * at the joints a crash actually leaves behind, so each step ends with
  * everything it produced in the caller's hands:
  *
- *   backup  — the 31 stock windows, the active-bank capture, and the standard
- *             dump archive (decrypted slots, reports, manifest) built offline
- *             from the assembled backup. Read-only. THIS is the user's
- *             pre-flash dump of every region the stock plan can read, and it
- *             is handed over before anything write-shaped can possibly run.
+ *   backup  — the 31 stock windows, the active-bank capture read TWICE (two
+ *             independent captures that must agree byte for byte — a read
+ *             glitch becomes a refusal, never a write), the factory plaintext
+ *             DERIVED from that capture (`solve.ts`: identity on the plain
+ *             chain, the family's keystream solver on a cipher family), the
+ *             whole gate set run on the derived image, and the standard dump
+ *             archive (decrypted slots, reports, manifest) built offline from
+ *             the assembled backup. Read-only. THIS is the user's pre-flash
+ *             dump of every region the stock plan can read, and it is handed
+ *             over before anything write-shaped can possibly run.
  *   patch   — offline, no device: buildV1Patch from the factory plaintext,
  *             refusing on every before-byte gate, and the patched image.
  *   commit  — the conjugated in-place patch into the active bank, staged
@@ -38,10 +43,12 @@
  * `Artifact[]`; the caller (CLI, web runner) persists them and rewrites the
  * run state after every step. Resume hands the state back in together with a
  * `loadArtifact(name)` callback that serves the checkpoint files — the backup
- * windows, the bank capture, the factory plaintext — from wherever the caller
- * keeps them. A step that cannot load what an earlier step produced refuses
- * with the reason, so `--from-step` cannot silently run against a torn run
- * directory.
+ * windows, the bank capture, the derived factory plaintext — from wherever
+ * the caller keeps them. A step that cannot load what an earlier step
+ * produced refuses with the reason, so `--from-step` cannot silently run
+ * against a torn run directory. Every artifact a step produces — the derived
+ * factory plaintext included — rides in that set, so a resumed run needs no
+ * file the camera did not produce.
  *
  * The state document is the whole cross-step world: everything a later step
  * needs (the detection, the patch summary, the sha256 of every artifact a
@@ -90,7 +97,6 @@ import {
   conjugateCapture,
   stagedAcceptanceSum,
   stagedFormOf,
-  verifyCapture,
   type CommitRouteId,
   type DrainCapability,
   type PreserveFamilyId,
@@ -98,6 +104,7 @@ import {
   type StagedFormId,
   type V1Patch,
 } from './patch.js';
+import { solvePlainFromCapture } from './solve.js';
 import {
   BACKUP_WINDOW_COUNT,
   BANKS,
@@ -159,21 +166,44 @@ export interface PreservePatchSummary {
   readonly stagedLength: number;
   readonly chunkCount: number;
   readonly patchedSha256: string;
+  /** How many bytes the patched image differs from the factory one in — the
+   *  part's whole enumerated change, rebalance word included. Absent in a
+   *  version-1 run directory's summary (readers may ignore). */
+  readonly diffCount?: number;
 }
 
 export interface PreserveRunState {
-  version: 1;
+  /** 2 — the current schema: the run derives its factory plaintext from the
+   *  camera itself (`imageSource: 'device'`). 1 — the older schema, where the
+   *  caller handed over a plaintext file; version-1 run directories still
+   *  load (their artifact set is identical — when they carry the derived
+   *  plaintext artifact, every step works), and every field below means the
+   *  same thing in both. */
+  version: 1 | 2;
   /** Timestamped (`preserve-2026-10-01T09-30-00Z`); names nothing on disk. */
   runId: string;
-  /** The cipher/acceptance family the detected build belongs to. */
-  buildFamily: PreserveFamilyId;
-  /** The factory plaintext sha the patch derives from — what a resumed image
-   *  file is checked against before anything runs. */
-  imageSha256: string;
-  expectedVersion: string;
+  /** The cipher/acceptance family the detected build belongs to. Undefined
+   *  until the backup step derives the image from the camera. */
+  buildFamily?: PreserveFamilyId;
+  /** The factory plaintext sha the patch derives from — the sha of the
+   *  DERIVED image artifact (`PRESERVE_PLAIN_NAME`). Undefined until the
+   *  backup step derives it. */
+  imageSha256?: string;
+  /** The version the camera reported at the backup, which the derived
+   *  image's own header agreed with. Every later step requires the camera to
+   *  still report it. */
+  expectedVersion?: string;
   createdAt: string;
   nextStep: PreserveStepId | 'done';
   steps: Partial<Record<PreserveStepId, PreserveStepRecord>>;
+  /** Where the factory plaintext came from. A version-2 run always derives
+   *  it from the camera's active slot — there is no manual plaintext-image
+   *  selection anywhere. Absent in version-1 run directories (their
+   *  plaintext arrived from the caller). */
+  imageSource?: 'device';
+  /** The two independent reads of the active slot, as sha256s — the capture's
+   *  trust anchor, recorded by the backup step once the reads agree. */
+  slotReadShas?: readonly [string, string];
   /** The slot verdict, after backup. */
   detection?: SlotDetection;
   /** The patch summary, after patch. */
@@ -181,9 +211,11 @@ export interface PreserveRunState {
   /** The dump shas, after drain. */
   rawDumpSha256?: string;
   deliveredSha256?: string;
-  /* ---- additive extensions (still version 1; readers may ignore) --------- */
+  /* ---- additive extensions (readers may ignore) --------------------------- */
   /** The detected build's id in the patch table (`compact-1.3.0.8-8hz`, ...). */
   buildId?: string;
+  /** The detected build's display name, as the plan print shows it. */
+  buildLabel?: string;
   /** How the wire-80 staged bytes relate to the patched plaintext. */
   stagedForm?: StagedFormId;
   /** How (and whether) the restore step can put the original bank back
@@ -227,10 +259,14 @@ export const PRESERVE_DUMP_MANIFEST_FILE = 'manifest.json';
 export const PRESERVE_DUMP_README_FILE = 'README.md';
 
 /**
- * The name the factory plaintext arrives under, via `loadArtifact`. It is NOT
- * a run-directory file: the CLI serves it from the positional image path (its
- * sha256 is checked against `state.imageSha256` on every load), and a web
- * runner serves it from memory. Nothing in the run directory has to hold it.
+ * The name the factory plaintext (the DERIVED image the patch is built from)
+ * travels under: an artifact the BACKUP step emits, the caller persists, and
+ * `loadArtifact` serves back to every later step that rebuilds the patch or
+ * the restore payload. Since the image always derives from the camera itself,
+ * the run directory (or run zip) carries it — `--resume` never needs any
+ * external file. Version-1 run directories predate this: their plaintext was
+ * the caller's own file, so resuming one at a patch-building step needs that
+ * file copied into the directory under this name.
  */
 export const PRESERVE_PLAIN_NAME = 'preserve_image_plain.bin';
 
@@ -243,8 +279,6 @@ export type PreserveArtifactLoader = (name: string) => Promise<Uint8Array | null
  * ==================================================================== */
 
 export interface CreatePreserveRunOptions {
-  /** The version the camera must report. Default: the image header's own. */
-  readonly expectedVersion?: string;
   /** Default: `preserve-<isoStamp>`. */
   readonly runId?: string;
   /** Injectable clock for the timestamps, so tests are reproducible. */
@@ -256,58 +290,35 @@ export interface CreatePreserveRunOptions {
 
 export interface CreatedPreserveRun {
   readonly state: PreserveRunState;
-  /** The patch the run will stage — built here so a wrong image fails on the
-   *  desk, before any run directory exists. */
-  readonly patch: V1Patch;
 }
 
 /**
- * Create a run state from the factory plaintext. Offline: no device, no
- * filesystem — the caller chooses where the run lives and writes `state` out
- * as `preserve_run.json` BEFORE the first step, so even a crash during the
- * backup leaves a resumable run.
+ * Create a run state. Offline: no device, no filesystem — the caller chooses
+ * where the run lives and writes `state` out as `preserve_run.json` BEFORE
+ * the first step, so even a crash during the backup leaves a resumable run.
  *
- * The build is detected from the image's bytes (the patch table dispatches on
- * properties, never the version string alone), and the patch is built here so
- * a wrong image fails on the desk, before any run directory exists.
- *
- * Throws (SeekError `pipeline/refused`) when no build in the patch table
- * matches the image — including the modern/nano builds, which need no
- * widening patch and are pointed at the standard dump workflow — when the
- * image fails its build's before-byte or acceptance gates, or when it has no
- * header to derive the expected version from and none was given.
+ * There is NO image argument and nothing to detect yet: the factory
+ * plaintext always derives from the camera itself (the backup step reads the
+ * active slot twice, requires agreement, solves the family's cipher, and
+ * records the build it finds — `runBackupStep`). The run this creates is a
+ * shell whose build fields fill in when the backup completes; the desk
+ * refusal a wrong image used to earn happens on the wire instead, at the
+ * backup step's gates, before anything write-shaped runs.
  */
-export async function createPreserveRun(
-  plain: Uint8Array,
+export function createPreserveRun(
   options: CreatePreserveRunOptions = {},
 ): Promise<CreatedPreserveRun> {
-  const patch = buildV1Patch(plain); /* refuses before anything is derived */
-  const version = options.expectedVersion ?? parseImageHeader(plain)?.versionStr ?? null;
-  if (version === null) {
-    throw new SeekError(
-      'pipeline/refused',
-      'the image does not parse as a decrypted Seek firmware image (no header at 0x200) — ' +
-        'pass expectedVersion explicitly to run against it anyway',
-    );
-  }
+  /* The Promise shape is kept on purpose: every caller (CLI, web runner,
+   * tests) awaits this entry point, and the sibling front ends are being
+   * rebuilt against it as an async call. */
   const now = options.now ?? ((): Date => new Date());
   const state: PreserveRunState = {
-    version: 1,
+    version: 2,
     runId: options.runId ?? `preserve-${isoStamp(now())}`,
-    buildFamily: patch.family,
-    imageSha256: await sha256hex(plain),
-    expectedVersion: version,
     createdAt: now().toISOString(),
     nextStep: 'backup',
     steps: {},
-    /* The build the detection named — the plan print, the gates and the
-     * capability table all read the run state, not the image, after this. */
-    buildId: patch.buildId,
-    stagedForm: patch.stagedForm,
-    restoreForm: patch.restoreForm,
-    route: patch.route,
-    routeNote: patch.routeNote,
-    capability: patch.capability,
+    imageSource: 'device',
     ...(options.drainChunk === undefined ? {} : { drainChunk: options.drainChunk }),
     ...(options.expectedSlotPrefix === undefined
       ? {}
@@ -316,7 +327,7 @@ export async function createPreserveRun(
       ? {}
       : { postResetAttempts: options.postResetAttempts }),
   };
-  return { state, patch };
+  return Promise.resolve({ state });
 }
 
 /* ==================================================================== *
@@ -353,29 +364,28 @@ async function loadCheckpoint(
   return bytes;
 }
 
+/**
+ * The factory plaintext, as the backup step derived it: a run artifact, served
+ * by `loadArtifact` and sha-checked against the backup step's record by
+ * `loadCheckpoint`. There is no other source — a run directory without the
+ * artifact refuses, with the remedy (version-1 run directories kept their
+ * plaintext outside; the file goes back under this name).
+ */
 async function loadPlain(
   state: PreserveRunState,
   loadArtifact: PreserveArtifactLoader,
 ): Promise<Uint8Array> {
-  const plain = await loadArtifact(PRESERVE_PLAIN_NAME);
-  if (plain === null) {
+  if ((await loadArtifact(PRESERVE_PLAIN_NAME)) === null) {
     throw new SeekError(
       'pipeline/refused',
-      `this step needs the factory plaintext the patch derives from (loadArtifact ` +
-        `'${PRESERVE_PLAIN_NAME}') and the caller did not supply it — pass the image path to ` +
-        'the CLI, or the bytes to the runner',
+      `this step needs the factory plaintext the patch derives from (the run artifact ` +
+        `'${PRESERVE_PLAIN_NAME}') and the run directory does not hold it — the backup step ` +
+        'writes it there, derived from the camera’s own active slot; put the file back ' +
+        'from your copy of the run zip. A version-1 run (the older schema) took it from the ' +
+        'file the run was started with: copy that image into the run directory under this name.',
     );
   }
-  const actual = await sha256hex(plain);
-  if (actual !== state.imageSha256) {
-    throw new SeekError(
-      'pipeline/refused',
-      `the image is not the one this run was created from (sha256 ${actual}, want ` +
-        `${state.imageSha256}) — the patch is derived from one build's bytes and must not be ` +
-        'rebuilt from another',
-    );
-  }
-  return plain;
+  return loadCheckpoint(state, loadArtifact, PRESERVE_PLAIN_NAME, 'backup');
 }
 
 const isDone = (state: PreserveRunState, id: PreserveStepId): boolean =>
@@ -527,7 +537,7 @@ export async function describeStepGate(
        * (the 1.0.3.2 builds' EP0 sessions die at ~64-81 KB). */
       if (state.capability !== undefined && !state.capability.wholePart) {
         return (
-          `the drain step refuses on ${state.buildId ?? state.buildFamily}: ` +
+          `the drain step refuses on ${state.buildId ?? state.buildFamily ?? 'the detected build'}: ` +
           state.capability.note
         );
       }
@@ -559,7 +569,9 @@ export async function describeStepGate(
       }
       if (state.restoreForm === 'none') {
         return (
-          `the restore step refuses on ${state.buildId ?? state.buildFamily}: no staged form ` +
+          `the restore step refuses on ${
+            state.buildId ?? state.buildFamily ?? 'the detected build'
+          }: no staged form ` +
           'of the factory image passes the running app\u2019s own acceptance while ' +
           'transforming back to the original slot bytes \u2014 accept1 reads sum(P ^ ksD), ' +
           'the factory image carries 0xB7AB9D17 there (measured), not the 0xFFFF the app ' +
@@ -569,15 +581,16 @@ export async function describeStepGate(
       }
       /* A cipher family's restore stages the FACTORY image in the build's
        * staged form (the commit's own transform turns it back into the
-       * original slot bytes) — so it needs the plaintext, which the 'plain'
-       * families never do (they stage the capture verbatim). */
+       * original slot bytes) — so it needs the derived plaintext, which the
+       * 'plain' families never do (they stage the capture verbatim). */
       if (state.stagedForm !== undefined && state.stagedForm !== 'plain') {
         if ((await loadArtifact(PRESERVE_PLAIN_NAME)) === null) {
           return (
             `restore stages the original image in this build's staged form ` +
-            `(${state.stagedForm}), which is derived from the factory plaintext — pass the ` +
-            'image path to the CLI, or the bytes to the runner (loadArtifact ' +
-            `'${PRESERVE_PLAIN_NAME}')`
+            `(${state.stagedForm}), which is derived from the factory plaintext — and the run ` +
+            `directory does not hold ${PRESERVE_PLAIN_NAME} (the backup step wrote it there, ` +
+            'derived from the camera’s own active slot). Put the file back from your copy ' +
+            'of the run zip.'
           );
         }
       }
@@ -646,7 +659,7 @@ export async function runPreserveStep(
   const fresh: PreserveRunState = { ...state, steps: { ...state.steps } };
   switch (step) {
     case 'backup':
-      return runBackupStep(fresh, opener, loadArtifact, reporter, signal, startedAt);
+      return runBackupStep(fresh, opener, reporter, signal, startedAt);
     case 'patch':
       return runPatchStep(fresh, loadArtifact, reporter, signal, startedAt);
     case 'commit':
@@ -693,6 +706,9 @@ function assertLive(signal: AbortSignal | undefined): void {
 
 async function gateVersion(device: SeekDevice, state: PreserveRunState): Promise<string> {
   const version = await readVersion(device);
+  if (state.expectedVersion === undefined) {
+    fail('the run state carries no expected version — the backup step has not derived the image');
+  }
   if (version !== state.expectedVersion) {
     throw new SeekError(
       'pipeline/refused',
@@ -793,41 +809,204 @@ export function backupResultFromImage(image: Uint8Array): BackupResult {
   return { windows, byAddress, bytes: windows.length * WINDOW_BYTES };
 }
 
+/* ==================================================================== *
+ * backup — the 31 windows, the double-read capture, the derived image
+ * ==================================================================== */
+
+/** The bank the backup just captured, read AGAIN as an independent capture:
+ *  the bank window is re-armed and the whole 64 KiB served through the drain
+ *  path — a different reader shape than the backup pass's `readArmed`, so the
+ *  two captures share no ask sequence. THE RULE: the two reads must agree
+ *  byte for byte. A read glitch must become a refusal, never a write — the
+ *  capture is the restore source and the patch's derivation input, and a
+ *  camera that cannot serve its own slot twice in a row is not a camera to
+ *  write to. */
+async function readSlotAgain(
+  device: SeekDevice,
+  bank: BankKey,
+  signal: AbortSignal | undefined,
+): Promise<Uint8Array> {
+  await device.armWindow(bankWindow(bank));
+  return drainExact(device, WINDOW_BYTES, 'the active slot’s second read', {
+    chunk: READ_CHUNK,
+    retries: 3,
+    timeoutMs: 20000,
+    ...(signal === undefined ? {} : { signal }),
+  });
+}
+
+/**
+ * The factory plaintext, derived from the agreed capture — the ruling's whole
+ * mechanism, in one function. The candidate order is fixed: the identity
+ * solve first (the 2014 chain's banks hold the image as-is), then each cipher
+ * family's solver in table order. EVERY candidate is pushed through the full
+ * gate set on the DERIVED image before it is trusted — the version
+ * cross-check against the camera's own report, then `buildV1Patch` (the build
+ * table's detect hooks, the before-byte site gates — which refuse an
+ * already-patched bank — and the family word-sum/acceptance rule). The first
+ * candidate that passes all of them IS the factory plaintext; a capture for
+ * which none passes refuses the run, and nothing is recorded, let alone
+ * written.
+ */
+function deriveFactoryImage(
+  capture: Uint8Array,
+  cameraVersion: string,
+): { plain: Uint8Array; patch: V1Patch; method: string } {
+  const attempts: { plain: Uint8Array; method: string }[] = [];
+  const reasons: string[] = [];
+  for (const family of ['v1-2014', 'v1-2014-ff', 'compact-2016'] as const) {
+    const solved = solvePlainFromCapture(family, capture);
+    if (solved.ok) attempts.push({ plain: solved.plain, method: solved.method });
+    else reasons.push(solved.reason);
+  }
+  for (const attempt of attempts) {
+    /* The version cross-check, FIRST of the gates: the camera's own report is
+     * the one external fact here, and the derived image must agree with it. */
+    const says = parseImageHeader(attempt.plain)?.versionStr;
+    if (says !== undefined && says !== cameraVersion) {
+      reasons.push(`the camera reports ${cameraVersion} but the active slot's image says ${says}`);
+      continue;
+    }
+    try {
+      return { plain: attempt.plain, patch: buildV1Patch(attempt.plain), method: attempt.method };
+    } catch (error) {
+      reasons.push(
+        `the ${attempt.method} candidate failed its build gates: ` +
+          (error instanceof Error ? error.message : String(error)),
+      );
+    }
+  }
+  fail(
+    'the two agreeing reads of the active slot do not yield the factory plaintext, and the ' +
+      'run refuses rather than write over a slot it cannot read. Every candidate was tried:\n  - ' +
+      reasons.join('\n  - '),
+  );
+}
+
+/** One capture-and-derive pass, against the bank `detection` names: the
+ *  double read, the expected-prefix gate (when the slot key is known), and
+ *  the derivation with its gate set. The FF route's re-point runs this twice —
+ *  the first pass names the build, the second captures the bank that runs. */
+async function captureAndDerive(
+  device: SeekDevice,
+  byAddress: ReadonlyMap<number, Uint8Array>,
+  detection: SlotDetection,
+  version: string,
+  expectedPrefix: Uint8Array | undefined,
+  reporter: Reporter,
+  signal: AbortSignal | undefined,
+): Promise<{
+  detection: SlotDetection;
+  capture: Uint8Array;
+  slotReadShas: readonly [string, string];
+  derived: ReturnType<typeof deriveFactoryImage>;
+}> {
+  const captured = byAddress.get(detection.bankAddress);
+  if (captured === undefined) {
+    fail(
+      `the backup does not hold the active bank ` +
+        `${detection.bankAddress.toString(16)} — the stock windows cannot serve it`,
+    );
+  }
+  const capture = new Uint8Array(captured);
+  const sha1 = await sha256hex(capture);
+  const second = await readSlotAgain(device, detection.bank, signal);
+  const sha2 = await sha256hex(second);
+  if (!equalBytes(capture, second)) {
+    fail(
+      `the two reads of the active slot disagree (sha256 ${sha1} vs ${sha2}) — a camera ` +
+        'that cannot serve its own slot twice in a row is not a camera to write to; the ' +
+        'capture is the restore source and the patch’s derivation input',
+    );
+  }
+  reporter.log(`the active slot read twice: both reads agree (sha256 ${sha1})`, 'detail');
+
+  /* The strongest keyless gate that survives, when the slot key is known
+   * (the emulator's donor): the capture must be the factory image as the
+   * cipher stores it. */
+  if (
+    expectedPrefix !== undefined &&
+    !equalBytes(capture.subarray(0, expectedPrefix.length), expectedPrefix)
+  ) {
+    fail(
+      'the active slot does not hold the factory image as this build’s cipher stores it ' +
+        '(the expected image prefix does not match the capture) — refusing before anything ' +
+        'is recorded, let alone written',
+    );
+  }
+
+  const derived = deriveFactoryImage(capture, version);
+  reporter.log(
+    `the factory plaintext derived from the capture: ${derived.method} ` +
+      `(${String(derived.plain.length)} B, sha256 ${await sha256hex(derived.plain)}); ` +
+      `build ${derived.patch.buildId} (family ${derived.patch.family})`,
+    'detail',
+  );
+  return { detection, capture, slotReadShas: [sha1, sha2] as const, derived };
+}
+
 async function runBackupStep(
   state: PreserveRunState,
   opener: SessionOpener,
-  loadArtifact: PreserveArtifactLoader,
   reporter: Reporter,
   signal: AbortSignal | undefined,
   startedAt: string,
 ): Promise<PreserveStepOutcome> {
-  const plain = await loadPlain(state, loadArtifact);
   const expectedPrefix = expectedPrefixOf(state);
 
   const read = await withSession(opener, async (device) => {
     assertLive(signal);
-    const version = await gateVersion(device, state);
+    /* No gate yet — the camera's own report is the version the run expects
+     * from here on. The derived image's header must agree with it (below). */
+    const version = await readVersion(device);
     reporter.log(`camera reports firmware ${version}`, 'detail');
 
     const backup = await backupWindows(device, reporter, READ_CHUNK, signal);
+    const byAddress = backup.byAddress;
     const detection = effectiveDetection(state, await detectActiveSlot(device));
     reporter.log(`slot: ${detection.verdict}`, 'detail');
-    const captured = backup.byAddress.get(detection.bankAddress);
-    if (captured === undefined) {
-      fail(
-        `the backup does not hold the active bank ` +
-          `${detection.bankAddress.toString(16)} — the stock windows cannot serve it`,
+
+    let repointed_ = false;
+    let read2 = await captureAndDerive(
+      device,
+      byAddress,
+      detection,
+      version,
+      expectedPrefix,
+      reporter,
+      signal,
+    );
+    /* THE RECOVERY RE-POINT, IN-STEP. A build whose route is recovery-only
+     * (the FF build) cannot run from the cfg-named bank: the 2014 bootloader
+     * rejects its 0xFFFF-sum image at slots A/B and boots the recovery bank
+     * UNCHECKED (doc 35.3) — so the bank that truly runs is recovery, and
+     * the capture that matters is recovery's. The route is only KNOWN once a
+     * capture has been derived, so the first pass may derive from the
+     * cfg-named bank; if it names a recovery-only route, the detection is
+     * re-pointed and the bank that runs is captured and derived in full. */
+    if (read2.derived.patch.route === 'recovery-only' && read2.detection.bank !== 'r') {
+      const repointed = effectiveDetection({ ...state, route: 'recovery-only' }, detection);
+      reporter.log(`slot re-pointed: ${repointed.verdict}`, 'detail');
+      read2 = await captureAndDerive(
+        device,
+        byAddress,
+        repointed,
+        version,
+        expectedPrefix,
+        reporter,
+        signal,
       );
+      repointed_ = true;
     }
-    const capture = new Uint8Array(captured);
-    const check = verifyCapture(capture, plain, expectedPrefix);
-    if (!check.ok) {
-      fail(
-        `the bank capture does not match the factory image: ${check.reason ?? 'unknown'} — ` +
-          'refusing before anything is recorded, let alone written',
-      );
-    }
-    return { detection, capture, assembled: assembleBackupImage(backup.byAddress) };
+    return {
+      version,
+      detection: read2.detection,
+      capture: read2.capture,
+      slotReadShas: read2.slotReadShas,
+      derived: read2.derived,
+      repointed: repointed_,
+      assembled: assembleBackupImage(byAddress),
+    };
   });
 
   /* THE PRE-FLASH DUMP ARCHIVE, offline from the assembled backup: the same
@@ -859,19 +1038,32 @@ async function runBackupStep(
     profile: profileInfoOf(profile, archive.detection),
   });
 
-  /* The run's two checkpoint files first, then the archive as it came. */
+  /* The run's checkpoint files — the derived factory plaintext among them,
+   * so a resume never needs an external image — then the archive as it came. */
   const artifacts: Artifact[] = [
     named(PRESERVE_BACKUP_FILE, read.assembled),
     named(PRESERVE_BANK_CAPTURE_FILE, read.capture),
+    named(PRESERVE_PLAIN_NAME, read.derived.plain),
     ...archive.artifacts.map((a) => named(a.name, a.data)),
     named(PRESERVE_DUMP_MANIFEST_FILE, utf8(manifestToJson(manifest))),
     named(PRESERVE_DUMP_README_FILE, utf8(makeOfflineDecryptReadme(manifest))),
   ];
   const shas = await shasOf(artifacts);
-  const form =
-    expectedPrefix === undefined ? 'the keyless verbatim-header window' : 'the expected prefix';
+  const patch = read.derived.patch;
   const nextState: PreserveRunState = {
     ...state,
+    /* The run's build facts, recorded by the step that derived them. */
+    buildFamily: patch.family,
+    imageSha256: shas.get(PRESERVE_PLAIN_NAME) ?? '',
+    expectedVersion: read.version,
+    slotReadShas: read.slotReadShas,
+    buildId: patch.buildId,
+    buildLabel: patch.label,
+    stagedForm: patch.stagedForm,
+    restoreForm: patch.restoreForm,
+    route: patch.route,
+    routeNote: patch.routeNote,
+    capability: patch.capability,
     detection: read.detection,
     nextStep: nextStepAfter('backup'),
     steps: {
@@ -880,8 +1072,14 @@ async function runBackupStep(
         startedAt,
         `${String(BACKUP_WINDOW_COUNT)} windows (${String(
           BACKUP_WINDOW_COUNT * WINDOW_BYTES,
-        )} B) backed up; ${read.detection.verdict}; bank capture verified against the factory ` +
-          `image through ${form}; dump archive: ${String(archive.slots.length)} slot(s) decrypted`,
+        )} B) backed up; ${read.detection.verdict}; the active slot read twice, both reads ` +
+          `agree (sha256 ${read.slotReadShas[0]}); the factory plaintext derived from the ` +
+          `capture (${read.derived.method}, ${String(read.derived.plain.length)} B) and gated; ` +
+          `build ${patch.buildId}` +
+          (read.repointed
+            ? '; the capture re-pointed at the recovery bank (the build boots recovery unchecked)'
+            : '') +
+          `; dump archive: ${String(archive.slots.length)} slot(s) decrypted`,
         shas,
       ),
     },
@@ -916,6 +1114,7 @@ async function runPatchStep(
     stagedLength: plain.length,
     chunkCount: Math.ceil(plain.length / STAGE_CHUNK),
     patchedSha256: patchedSha,
+    diffCount: patch.diffOffsets.length,
   };
   const artifacts: Artifact[] = [named(PRESERVE_PATCHED_FILE, patch.patched)];
   const shas = await shasOf(artifacts);
@@ -995,15 +1194,11 @@ async function runCommitStep(
   await loadCheckpoint(state, loadArtifact, PRESERVE_BACKUP_FILE, 'backup');
   const detection = state.detection;
   if (detection === undefined) fail('the run state carries no slot detection');
-  const expectedPrefix = expectedPrefixOf(state);
-
-  const check = verifyCapture(capture, plain, expectedPrefix);
-  if (!check.ok) {
-    fail(
-      'the backed-up bank capture does not match the factory image: ' +
-        `${check.reason ?? 'unknown'} — the restore source is not trustworthy`,
-    );
-  }
+  /* THE CAPTURE IS ALREADY ANCHORED: the backup step read it twice, required
+   * byte agreement, and derived the plaintext this patch is built from THROUGH
+   * it — and `loadCheckpoint` just proved the file still is those bytes. The
+   * wire-side protection that remains at write time is the bank head
+   * pre-check below, against the capture and the patched expectation. */
   /* THE STAGED PAYLOAD, per family. On the plaintext 2014 banks it is the
    * conjugated capture (the keystream is zero, so the conjugation is its own
    * identity). On the cipher families the wire-80 bytes are the STAGED form

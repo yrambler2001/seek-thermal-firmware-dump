@@ -12,10 +12,18 @@
  * run against a post-commit part). `readVersion` reports the version the
  * synthetic image's header declares, as every corpus build does.
  *
- * What these tests pin, and why each one earns its place:
+ * THE RUN SELF-SOURCES. No test hands over a plaintext image: the backup step
+ * reads the active slot twice, requires the two reads to agree, derives the
+ * factory plaintext from the agreed capture (identity on this plain chain),
+ * and records the build it finds. What these tests pin, and why each one
+ * earns its place:
  *  - the state document round-trips through JSON (it IS the checkpoint);
- *  - every gate refuses, with its reason (a --from-step must never run
- *    against a torn run directory);
+ *  - the derivation gates refuse, with their reason: two reads that
+ *    disagree, a ciphered slot the solver cannot open yet, a camera whose
+ *    version contradicts the slot image's header, and an already-patched
+ *    bank (the before-byte gate on the DERIVED image);
+ *  - every step-ordering gate refuses, with its reason (a --from-step must
+ *    never run against a torn run directory);
  *  - a completed commit moves nextStep to drain, and a re-run of commit
  *    refuses — the commit is not replayed, on the state level either;
  *  - a commit whose bank already holds the patch refuses with "resume at
@@ -30,7 +38,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { sha256hex } from '../../src/bytes.js';
+import { hexToBytes, sha256hex } from '../../src/bytes.js';
 import { silentReporter, type Reporter } from '../../src/events.js';
 import { CancelledError, SeekError } from '../../src/errors.js';
 import { FLASH_SIZE } from '../../src/profiles/modern-4x.js';
@@ -57,6 +65,7 @@ import {
 import {
   REBALANCE_WORD_OFFSET,
   V1_2014_PATCH_SITES,
+  buildV1Patch,
   wordSum,
 } from '../../src/preservation/patch.js';
 import { FakeCamera, type FakeWindowSpec } from '../fake-transport.js';
@@ -68,7 +77,41 @@ const VERSION_WORD = 0x0000_0301; /* little-endian bytes 01 03 00 00 -> "1.3.0.0
 const EXPECTED_VERSION = '1.3.0.0';
 const FLASH_BASE = 0x14000000;
 const BANK_A_OFFSET = 0x50000;
+const RECOVERY_OFFSET = 0x70000;
 const BOOT_CFG_OFFSET = 0x10000;
+
+/**
+ * A synthetic 1.3.0.8-FF image: the shapes (window ladder, widen tail, mode-2
+ * guard), the FF key blocks, the 0xFFFF word-sum sentinel — everything the
+ * build table's detect hooks read, and nothing else for them to find. The
+ * same recipe the families suite builds its synthetic builds with.
+ */
+function ffBankImage(): Uint8Array {
+  const bytes = new Uint8Array(IMAGE_LENGTH);
+  let s = 0x2468ace1;
+  for (let i = 0; i < bytes.length; i++) {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    bytes[i] = s & 0xff;
+  }
+  const put = (at: number, hex: string): void => {
+    bytes.set(hexToBytes(hex), at);
+  };
+  const LADDER_AT = 0x3000;
+  put(LADDER_AT, '00000614000005140000021400000014');
+  put(LADDER_AT - 0x4a, '4ff480336360e360'); /* the widen tail */
+  put(LADDER_AT - 0x154, '022b06d10420'); /* the mode-2 guard */
+  put(0x2800, '5d7984797c47eb9354fa35898ab11701'); /* the FF key block 0 */
+  put(0x2810, 'b5541579754be4b33b6f1ba975a8badc'); /* the FF key block 1 */
+  const dv = new DataView(bytes.buffer);
+  dv.setUint32(0x200, 0xa1b2c3d4, true);
+  dv.setUint32(0x204, bytes.length, true);
+  dv.setUint32(0x20c, 0x0800_0301, true); /* bytes 01 03 00 08 -> "1.3.0.8" */
+  dv.setUint32(REBALANCE_WORD_OFFSET, 0, true);
+  const scratch = 0x3ff0;
+  dv.setUint32(scratch, 0, true);
+  dv.setUint32(scratch, ((0xffff - wordSum(bytes)) | 0) >>> 0, true);
+  return bytes;
+}
 
 function syntheticPlain(): Uint8Array {
   const bytes = new Uint8Array(IMAGE_LENGTH);
@@ -83,7 +126,8 @@ function syntheticPlain(): Uint8Array {
   bytes[REBALANCE_WORD_OFFSET + 2] = 0;
   bytes[REBALANCE_WORD_OFFSET + 3] = 0;
   const dv = new DataView(bytes.buffer);
-  /* A header, so the expected version derives from the image itself. */
+  /* A header, so the derived image's version can be cross-checked against
+   * what the camera reports. */
   dv.setUint32(0x200, 0xa1b2c3d4, true);
   dv.setUint32(0x204, IMAGE_LENGTH, true);
   dv.setUint32(0x20c, VERSION_WORD, true);
@@ -108,16 +152,27 @@ function v1WindowMap(): FakeWindowSpec[] {
   return windows;
 }
 
+interface V1CameraOptions {
+  readonly flash?: Uint8Array;
+  /** The version word wire 0x4E reports (default: the fixture's 1.3.0.0). */
+  readonly version?: readonly number[];
+}
+
 /** A stock-shaped v1 camera: blank cfg, factory plaintext in bank A. */
-function v1Camera(plain: Uint8Array): FakeCamera {
-  const flash = new Uint8Array(FLASH_SIZE).fill(0xff);
-  new DataView(flash.buffer).setUint32(BOOT_CFG_OFFSET, 0xffffffff, true); /* blank -> bank A */
-  flash.set(plain, BANK_A_OFFSET);
+function v1Camera(plain: Uint8Array, options: V1CameraOptions = {}): FakeCamera {
+  const flash =
+    options.flash ??
+    (() => {
+      const bytes = new Uint8Array(FLASH_SIZE).fill(0xff);
+      new DataView(bytes.buffer).setUint32(BOOT_CFG_OFFSET, 0xffffffff, true); /* blank -> A */
+      bytes.set(plain, BANK_A_OFFSET);
+      return bytes;
+    })();
   return new FakeCamera({
     flash,
     windows: v1WindowMap(),
     authBanks: [3, 4, 5, 6, 7, 8, 9] /* the token form; any 18-byte payload matches */,
-    fwInfo: new Map([[0, Uint8Array.from([1, 3, 0, 0, 0, 0, 0, 0])]]),
+    fwInfo: new Map([[0, Uint8Array.from(options.version ?? [1, 3, 0, 0, 0, 0, 0, 0])]]),
   });
 }
 
@@ -148,17 +203,46 @@ class StalledWire79Device extends SeekDevice {
   }
 }
 
+/**
+ * A device whose wire-79 reads go bad once a given window is RE-ARMED — the
+ * read glitch the double read exists to catch: the backup's pass over the
+ * bank's window comes through clean, and everything after the bank window is
+ * armed a second time (the active slot's SECOND read) serves one flipped byte
+ * per chunk. The two captures then disagree, and the step must refuse.
+ */
+class GlitchySecondReadDevice extends SeekDevice {
+  private readonly watchSubcmd: number;
+  private armed = 0;
+  constructor(camera: FakeCamera, watchSubcmd: number) {
+    super(camera, { reporter: silentReporter });
+    this.watchSubcmd = watchSubcmd;
+  }
+  override async armWindow(...args: Parameters<SeekDevice['armWindow']>): Promise<void> {
+    if (args[0].subcmd === this.watchSubcmd) this.armed += 1;
+    return super.armWindow(...args);
+  }
+  override async rpcIn(op: number, length: number, timeoutMs?: number): Promise<Uint8Array> {
+    const data = await super.rpcIn(op, length, timeoutMs);
+    if (op === OP.GET_FEATURED_FIRMWARE_DATA && this.armed >= 2) {
+      const out = new Uint8Array(data);
+      out[0] = (out[0] ?? 0) ^ 0xff;
+      return out;
+    }
+    return data;
+  }
+}
+
 /** A loader that serves the in-memory artifacts a step emitted — the
- *  one-process stand-in for the run directory. */
-function memoryStore(plain: Uint8Array): {
+ *  one-process stand-in for the run directory. The run self-sources: nothing
+ *  is seeded; the backup step's own artifacts (the derived plaintext among
+ *  them) are what the later steps load. */
+function memoryStore(): {
   load: PreserveArtifactLoader;
   add: (outcome: {
     readonly artifacts: readonly { readonly name: string; readonly data: Uint8Array }[];
   }) => void;
 } {
-  /* The factory plaintext is served by the caller, never from the run
-   * directory — the same rule the CLI's loader implements. */
-  const map = new Map<string, Uint8Array>([[PRESERVE_PLAIN_NAME, plain]]);
+  const map = new Map<string, Uint8Array>();
   return {
     load: (name) => Promise.resolve(map.get(name) ?? null),
     add: (outcome) => {
@@ -187,21 +271,21 @@ async function step(
 
 describe('createPreserveRun — the checkpoint document', () => {
   it(
-    'builds the version-1 state from the image, and the patch beside it',
+    'builds the version-2 state — self-sourced, with nothing derived yet',
     { timeout: 120_000 },
     async () => {
-      const plain = syntheticPlain();
-      const { state, patch } = await createPreserveRun(plain);
-      expect(state.version).toBe(1);
-      expect(state.buildFamily).toBe('v1-2014');
-      expect(state.expectedVersion).toBe(EXPECTED_VERSION);
-      expect(state.imageSha256).toBe(await sha256hex(plain));
+      const { state } = await createPreserveRun();
+      expect(state.version).toBe(2);
+      expect(state.imageSource).toBe('device');
+      expect(state.runId).toMatch(/^preserve-\d{4}-\d{2}-\d{2}T/);
       expect(state.nextStep).toBe('backup');
       expect(state.steps).toEqual({});
-      expect(state.runId).toMatch(/^preserve-\d{4}-\d{2}-\d{2}T/);
-      /* The patch is built here so a wrong image fails before any run exists. */
-      expect(patch.diffOffsets.length).toBe(10);
-      expect(wordSum(patch.patched)).toBe(0);
+      /* The build facts do not exist yet: the backup step derives them from
+       * the camera. */
+      expect(state.buildFamily).toBeUndefined();
+      expect(state.imageSha256).toBeUndefined();
+      expect(state.expectedVersion).toBeUndefined();
+      expect(state.patch).toBeUndefined();
     },
   );
 
@@ -209,29 +293,195 @@ describe('createPreserveRun — the checkpoint document', () => {
     'round-trips through JSON and still gates the round-tripped state',
     { timeout: 120_000 },
     async () => {
-      const plain = syntheticPlain();
-      const { state } = await createPreserveRun(plain, { now: () => new Date(0) });
+      const { state } = await createPreserveRun({ now: () => new Date(0) });
       const restored: PreserveRunState = JSON.parse(JSON.stringify(state)) as PreserveRunState;
       expect(restored).toEqual(state);
       /* The gate runs against the restored document — the shape a resume gets. */
       await expect(describeStepGate('backup', restored, never)).resolves.toBeNull();
     },
   );
+});
+
+/* ==================================================================== *
+ * the derivation — the backup step's own gates
+ * ==================================================================== */
+
+describe('runPreserveStep(backup) — the double read and the derived-image gates', () => {
+  const plain = syntheticPlain();
+
+  it('refuses when the two reads of the active slot disagree', { timeout: 120_000 }, async () => {
+    const camera = v1Camera(plain);
+    const store = memoryStore();
+    const created = await createPreserveRun({ runId: 'double-read' });
+    /* Bank A's window is mode 7: the backup armed it once and read it
+     * clean; the second read re-arms it, and from that arm on every wire-79
+     * serve carries one flipped byte. */
+    const corruptedOpener: SessionOpener = {
+      open: async () => {
+        await camera.open();
+        return new GlitchySecondReadDevice(camera, 7);
+      },
+      close: async () => {
+        await camera.close();
+      },
+    };
+    const error: unknown = await runPreserveStep(
+      'backup',
+      corruptedOpener,
+      created.state,
+      store.load,
+      silentReporter,
+    ).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SeekError);
+    expect((error as Error).message).toMatch(/the two reads of the active slot disagree/);
+    /* Nothing was recorded: the refusal precedes every artifact. */
+    const failed = recordStepFailure(created.state, 'backup', error);
+    expect(failed.steps.backup?.status).toBe('failed');
+    expect(failed.detection).toBeUndefined();
+    expect(failed.slotReadShas).toBeUndefined();
+  });
 
   it(
-    'refuses an image that does not carry the v1 update machinery',
+    'refuses a ciphered slot with the solver reason — no guess, no write',
     { timeout: 120_000 },
     async () => {
-      const plain = syntheticPlain();
-      /* Flip a site byte, then re-balance through the scratch word so ONLY the
-       * before-byte gate fires (the sum gate predates it). */
-      plain[0x3db4] = (plain[0x3db4] ?? 0) ^ 0xff;
-      const dv = new DataView(plain.buffer);
-      dv.setUint32(0x3ff0, 0, true);
-      dv.setUint32(0x3ff0, (0 - wordSum(plain)) >>> 0, true);
-      await expect(createPreserveRun(plain)).rejects.toThrow(
-        /does not carry the v1 2014 update machinery/,
+      /* The bank holds the image XOR 0x5A: the header window is ciphered too,
+       * so the identity path refuses on the magic, and the cipher families'
+       * solvers are the only way in — which this build does not carry yet. */
+      const ciphered = new Uint8Array(plain);
+      for (let i = 0; i < ciphered.length; i++) ciphered[i] = (ciphered[i] ?? 0) ^ 0x5a;
+      const camera = v1Camera(ciphered);
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'cipher' });
+      const error: unknown = await step('backup', camera, created.state, store).catch(
+        (e: unknown) => e,
       );
+      expect(error).toBeInstanceOf(SeekError);
+      expect((error as Error).message).toMatch(/do not yield the factory plaintext/);
+      expect((error as Error).message).toMatch(/keystream solver is not implemented/);
+      expect((error as Error).message).toMatch(/v1-2014-ff/);
+      expect((error as Error).message).toMatch(/compact-2016/);
+    },
+  );
+
+  it(
+    'refuses when the camera reports a version the slot image does not carry',
+    { timeout: 120_000 },
+    async () => {
+      /* The slot image's header says 1.2.0.0; the camera reports 1.3.0.0 —
+       * the cross-check refuses before the build table is even consulted. */
+      const other = syntheticPlain();
+      new DataView(other.buffer).setUint32(0x20c, 0x0000_0201, true); /* -> "1.2.0.0" */
+      const scratch = 0x3ff0;
+      const dv = new DataView(other.buffer);
+      dv.setUint32(scratch, 0, true);
+      dv.setUint32(scratch, (0 - wordSum(other)) >>> 0, true);
+      const camera = v1Camera(other, { version: [1, 3, 0, 0, 0, 0, 0, 0] });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'version' });
+      const error: unknown = await step('backup', camera, created.state, store).catch(
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(SeekError);
+      expect((error as Error).message).toMatch(
+        /the camera reports 1\.3\.0\.0 but the active slot's image says 1\.2\.0\.0/,
+      );
+    },
+  );
+
+  it(
+    'refuses an already-patched bank at the before-bytes of the derived image',
+    { timeout: 120_000 },
+    async () => {
+      /* The bank holds the PATCHED image: the derivation solves it (identity
+       * — a patched plain chain bank still parses), the version cross-check
+       * passes (the patch never touches the version word), and the build
+       * table refuses it — an already-patched bank has no factory build. */
+      const patched = buildV1Patch(plain).patched;
+      const camera = v1Camera(patched);
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'already-patched' });
+      const error: unknown = await step('backup', camera, created.state, store).catch(
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(SeekError);
+      expect((error as Error).message).toMatch(/do not yield the factory plaintext/);
+      expect((error as Error).message).toMatch(/does not carry the v1 2014 update machinery/);
+      expect((error as Error).message).toMatch(/failed its build gates/);
+    },
+  );
+
+  it(
+    'records the build, the slot-read shas, and the derived artifact when everything agrees',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'derive' });
+      const state = await step('backup', camera, created.state, store);
+
+      expect(state.version).toBe(2);
+      expect(state.imageSource).toBe('device');
+      expect(state.buildFamily).toBe('v1-2014');
+      expect(state.buildId).toBe('v1-2014');
+      expect(state.expectedVersion).toBe(EXPECTED_VERSION);
+      /* The two reads agreed: both shas recorded, and they are the same. */
+      expect(state.slotReadShas).toHaveLength(2);
+      expect(state.slotReadShas?.[0]).toBe(state.slotReadShas?.[1]);
+      /* The derived plaintext is a first-class artifact, and its sha is the
+       * run's image sha. */
+      const derived = await store.load(PRESERVE_PLAIN_NAME);
+      expect(derived).not.toBeNull();
+      expect(await sha256hex(derived!)).toBe(state.imageSha256);
+      expect([...derived!]).toEqual([...plain]);
+      expect(state.steps.backup?.notes).toMatch(/both reads agree/);
+      expect(state.steps.backup?.notes).toMatch(/identity/);
+      /* The capture, as before, is the bank verbatim. */
+      const capture = await store.load(PRESERVE_BANK_CAPTURE_FILE);
+      expect(capture?.length).toBe(0x10000);
+      expect([...(capture?.subarray(0, plain.length) ?? [])]).toEqual([...plain]);
+    },
+  );
+
+  it(
+    're-points the capture at recovery when the derived build commits only there',
+    { timeout: 120_000 },
+    async () => {
+      /* The FF chimera's shape (doc 35.3): a blank cfg names bank A, but the
+       * 0xFFFF-sum build in the slots can never BOOT from A — the bootloader
+       * rejects it there and runs the recovery bank unchecked. The route is
+       * only known once a capture has been derived, so the backup derives the
+       * build from the cfg-named bank's capture first, then re-points and
+       * captures the bank that actually runs. */
+      const ff = ffBankImage();
+      const flash = new Uint8Array(FLASH_SIZE).fill(0xff);
+      const dv = new DataView(flash.buffer);
+      dv.setUint32(BOOT_CFG_OFFSET, 0xffffffff, true); /* blank -> names A */
+      flash.set(ff, BANK_A_OFFSET);
+      flash.set(ff, RECOVERY_OFFSET); /* the bank that runs */
+      const camera = v1Camera(ff, {
+        flash,
+        version: [1, 3, 0, 8, 0, 0, 0, 0], /* the FF build reports 1.3.0.8 */
+      });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'repoint' });
+      const state = await step('backup', camera, created.state, store);
+
+      expect(state.buildId).toBe('compact-1.3.0.8-ff');
+      expect(state.route).toBe('recovery-only');
+      /* The detection and the capture act on RECOVERY, not on the A the blank
+       * record named. */
+      expect(state.detection?.bank).toBe('r');
+      expect(state.detection?.bankAddress).toBe(0x14070000);
+      const capture = (await store.load(PRESERVE_BANK_CAPTURE_FILE))!;
+      expect([...capture.subarray(0, ff.length)]).toEqual([...ff]);
+      expect(state.imageSha256).toBe(await sha256hex(ff));
+      /* The double-read proof is the RECOVERY capture's, both reads. */
+      const window = new Uint8Array(0x10000).fill(0xff);
+      window.set(ff, 0);
+      expect(state.slotReadShas?.[0]).toBe(await sha256hex(window));
+      expect(state.slotReadShas?.[1]).toBe(state.slotReadShas?.[0]);
+      expect(state.steps.backup?.notes).toMatch(/re-pointed at the recovery bank/);
     },
   );
 });
@@ -249,6 +499,7 @@ describe('describeStepGate — every prerequisite refusal', () => {
     stagedLength: length,
     chunkCount: Math.ceil(length / 64),
     patchedSha256: 'ab',
+    diffCount: 10,
   });
 
   /** A state advanced by actually RUNNING the named steps against a fresh
@@ -257,8 +508,8 @@ describe('describeStepGate — every prerequisite refusal', () => {
     steps: readonly PreserveStepId[],
   ): Promise<{ state: PreserveRunState; store: ReturnType<typeof memoryStore> }> {
     const camera = v1Camera(plain);
-    const store = memoryStore(plain);
-    let state = await createPreserveRun(plain, { runId: 'gates' }).then((r) => r.state);
+    const store = memoryStore();
+    let state = await createPreserveRun({ runId: 'gates' }).then((r) => r.state);
     for (const id of steps) state = await step(id, camera, state, store);
     return { state, store };
   }
@@ -267,7 +518,7 @@ describe('describeStepGate — every prerequisite refusal', () => {
     'patch refuses before the backup — the run dumps the regions first',
     { timeout: 120_000 },
     async () => {
-      const { state } = await createPreserveRun(plain, { runId: 'gates' });
+      const { state } = await createPreserveRun({ runId: 'gates' });
       const refusal = await describeStepGate('patch', state, never);
       expect(refusal).toMatch(/patch runs after the backup/);
       expect(refusal).toMatch(/the only.*copy of this camera/);
@@ -322,6 +573,25 @@ describe('describeStepGate — every prerequisite refusal', () => {
       delete noSummary.patch; /* absence, not an undefined value */
       expect(await describeStepGate('restore', noSummary, store.load)).toMatch(/patch summary/);
       expect(await describeStepGate('restore', throughCommit, store.load)).toBeNull();
+    },
+  );
+
+  it(
+    'a cipher-family restore refuses without the derived plaintext artifact',
+    { timeout: 120_000 },
+    async () => {
+      const { state: throughCommit, store } = await stateThrough(['backup', 'patch', 'commit']);
+      const cipher: PreserveRunState = {
+        ...throughCommit,
+        stagedForm: 'xor-ks0',
+        buildFamily: 'compact-2016',
+      };
+      const withoutPlain: PreserveRunState = { ...cipher };
+      expect(await describeStepGate('restore', cipher, store.load)).toBeNull();
+      /* The artifact's name is in the refusal, with the remedy. */
+      expect(await describeStepGate('restore', withoutPlain, never)).toMatch(
+        /preserve_image_plain\.bin[\s\S]*run zip/,
+      );
     },
   );
 
@@ -411,7 +681,7 @@ describe('describeStepGate — every prerequisite refusal', () => {
   );
 
   it('a failed step does not block its own re-run', { timeout: 120_000 }, async () => {
-    const { state } = await createPreserveRun(plain, { runId: 'gates' });
+    const { state } = await createPreserveRun({ runId: 'gates' });
     const failed = recordStepFailure(state, 'backup', new Error('the camera came unplugged'));
     expect(failed.steps.backup?.status).toBe('failed');
     expect(failed.steps.backup?.error).toBe('the camera came unplugged');
@@ -438,8 +708,8 @@ describe('runPreserveStep — the recovery behaviours', () => {
     { timeout: 120_000 },
     async () => {
       const camera = v1Camera(plain);
-      const store = memoryStore(plain);
-      const created = await createPreserveRun(plain, { runId: 'steps' });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'steps' });
       const state = await step('backup', camera, created.state, store);
 
       expect(state.nextStep).toBe('patch');
@@ -472,17 +742,18 @@ describe('runPreserveStep — the recovery behaviours', () => {
   );
 
   it(
-    'patch records the summary; the staged chunk count comes from the image length',
+    'patch records the summary; the staged chunk count comes from the derived image',
     { timeout: 120_000 },
     async () => {
       const camera = v1Camera(plain);
-      const store = memoryStore(plain);
-      const created = await createPreserveRun(plain, { runId: 'steps' });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'steps' });
       const afterBackup = await step('backup', camera, created.state, store);
       const afterPatch = await step('patch', camera, afterBackup, store);
 
       expect(afterPatch.nextStep).toBe('commit');
       expect(afterPatch.patch?.stagedLength).toBe(plain.length);
+      expect(afterPatch.patch?.diffCount).toBe(10);
       expect(afterPatch.patch?.chunkCount).toBe(Math.ceil(plain.length / 64));
       const patched = await store.load(PRESERVE_PATCHED_FILE);
       expect(patched?.length).toBe(plain.length);
@@ -499,12 +770,37 @@ describe('runPreserveStep — the recovery behaviours', () => {
   );
 
   it(
+    'patch refuses when the run directory lost the derived plaintext',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'lost-plain' });
+      const afterBackup = await step('backup', camera, created.state, store);
+      /* The derived artifact vanishes — the version-1 migration shape, where
+       * the plaintext lived outside the run directory. */
+      const empty: PreserveArtifactLoader = (name) =>
+        name === PRESERVE_PLAIN_NAME ? Promise.resolve(null) : store.load(name);
+      const error: unknown = await runPreserveStep(
+        'patch',
+        fakeOpener(camera),
+        afterBackup,
+        empty,
+        silentReporter,
+      ).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(SeekError);
+      expect((error as Error).message).toMatch(/preserve_image_plain\.bin/);
+      expect((error as Error).message).toMatch(/version-1 run/);
+    },
+  );
+
+  it(
     'commit moves nextStep to drain and writes exactly the patch into the bank',
     { timeout: 120_000 },
     async () => {
       const camera = v1Camera(plain);
-      const store = memoryStore(plain);
-      const created = await createPreserveRun(plain, { runId: 'steps' });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'steps' });
       let state = await step('backup', camera, created.state, store);
       state = await step('patch', camera, state, store);
       state = await step('commit', camera, state, store);
@@ -530,8 +826,8 @@ describe('runPreserveStep — the recovery behaviours', () => {
     { timeout: 120_000 },
     async () => {
       const camera = v1Camera(plain);
-      const store = memoryStore(plain);
-      const created = await createPreserveRun(plain, { runId: 'steps' });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'steps' });
       let state = await step('backup', camera, created.state, store);
       state = await step('patch', camera, state, store);
       state = await step('commit', camera, state, store);
@@ -550,8 +846,8 @@ describe('runPreserveStep — the recovery behaviours', () => {
     { timeout: 120_000 },
     async () => {
       const camera = v1Camera(plain);
-      const store = memoryStore(plain);
-      const created = await createPreserveRun(plain, { runId: 'steps' });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'steps' });
       let state = await step('backup', camera, created.state, store);
       state = await step('patch', camera, state, store);
       state = await step('commit', camera, state, store);
@@ -566,8 +862,8 @@ describe('runPreserveStep — the recovery behaviours', () => {
     { timeout: 120_000 },
     async () => {
       const camera = v1Camera(plain);
-      const store = memoryStore(plain);
-      const created = await createPreserveRun(plain, { runId: 'abort' });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'abort' });
       const controller = new AbortController();
       /* Abort out of the reporter, deterministically: the fifth window's
        * progress event fires the signal, and the next loop check throws. */
@@ -602,8 +898,8 @@ describe('runPreserveStep — the recovery behaviours', () => {
     { timeout: 120_000 },
     async () => {
       const camera = v1Camera(plain);
-      const store = memoryStore(plain);
-      const created = await createPreserveRun(plain, { runId: 'steps' });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'steps' });
       let state = created.state;
       for (const id of ['backup', 'patch', 'commit', 'drain'] as const) {
         state = await step(id, camera, state, store);
@@ -624,8 +920,8 @@ describe('runPreserveStep — the recovery behaviours', () => {
     { timeout: 120_000 },
     async () => {
       const camera = v1Camera(plain);
-      const store = memoryStore(plain);
-      const created = await createPreserveRun(plain, { runId: 'stall' });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'stall' });
       let state = created.state;
       for (const id of ['backup', 'patch', 'commit', 'drain'] as const) {
         state = await step(id, camera, state, store);
@@ -669,8 +965,8 @@ describe('runPreserveStep — the recovery behaviours', () => {
     async () => {
       const camera = v1Camera(plain);
       const asBooted = new Uint8Array(camera.flash);
-      const store = memoryStore(plain);
-      const created = await createPreserveRun(plain, { runId: 'full' });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'full' });
       let state = created.state;
       for (const id of PRESERVE_STEP_IDS) {
         state = await step(id, camera, state, store);
@@ -703,8 +999,8 @@ describe('runPreserveStep — the recovery behaviours', () => {
     { timeout: 120_000 },
     async () => {
       const camera = v1Camera(plain);
-      const store = memoryStore(plain);
-      const created = await createPreserveRun(plain, { runId: 'verify-fail' });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'verify-fail' });
       let state = created.state;
       for (const id of ['backup', 'patch', 'commit', 'drain', 'restore'] as const) {
         state = await step(id, camera, state, store);
@@ -738,8 +1034,8 @@ describe('runPreserveStep — the recovery behaviours', () => {
     { timeout: 120_000 },
     async () => {
       const camera = v1Camera(plain);
-      const store = memoryStore(plain);
-      const created = await createPreserveRun(plain, { runId: 'assemble' });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'assemble' });
       const state = await step('backup', camera, created.state, store);
       const windows = (await store.load(PRESERVE_BACKUP_FILE))!;
       const rebuilt = backupResultFromImage(windows);

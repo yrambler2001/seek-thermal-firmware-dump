@@ -10,12 +10,15 @@
  *   P1  backup — the 31 stock windows (modes 3..9 with the 18-byte token,
  *       0x0A..0x21 plain), 64 KiB each, 0x14010000..0x141FFFFF. Read-only.
  *       Every window must come back complete: this is the copy the pipeline
- *       restores from, and a short one is refused, not gap-filled.
+ *       restores from, and a short one is refused, not gap-filled. The
+ *       active bank is read TWICE — two independent captures that must agree
+ *       byte for byte — and the factory plaintext is DERIVED from the agreed
+ *       capture (`solve.ts`): there is no manual image input anywhere.
  *
  *   P2  in-place patch — read the 28-byte boot-config record (mode 3) and
- *       name the ACTIVE slot; capture that bank through its own window and
- *       verify it against the factory plaintext BEFORE anything is written;
- *       conjugate the plaintext patch into the ciphertext capture
+ *       name the ACTIVE slot; the captured bank's image was already gated
+ *       (the build table's detect hooks and before-bytes) BEFORE anything is
+ *       written; conjugate the plaintext patch into the ciphertext capture
  *       (`patch.ts`); stage IMAGE LENGTH ONLY in 64-byte chunks (the commit
  *       erases the whole 64 KiB block and programs exactly the staged bytes,
  *       and a full 64 KiB stage would overrun the descriptor's staging
@@ -68,6 +71,7 @@ import { FLASH_SIZE } from '../profiles/modern-4x.js';
 import {
   PRESERVE_BACKUP_FILE,
   PRESERVE_BANK_CAPTURE_FILE,
+  PRESERVE_PLAIN_NAME,
   PRESERVE_DUMP_ORIGINAL_FILE,
   PRESERVE_DUMP_POSTWRITE_FILE,
   backupResultFromImage,
@@ -556,6 +560,10 @@ export interface PipelineArtifacts {
   readonly backupByAddress: ReadonlyMap<number, Uint8Array>;
   /** The active-bank capture from P1 (ciphertext, as served) — the original bank. */
   readonly bankCapture: Uint8Array;
+  /** The factory plaintext the BACKUP step derived from that capture — the
+   *  image the patch was built from. There is no other input: the run
+   *  self-sources. */
+  readonly plain: Uint8Array;
   /** The slot verdict P2 and P4 acted on. */
   readonly detection: SlotDetection;
   /** P3's raw dump == the post-write part. */
@@ -569,13 +577,9 @@ export interface PipelineArtifacts {
 
 export interface PipelineOptions {
   readonly opener: SessionOpener;
-  /** The factory plaintext of the running build (the corpus image). */
-  readonly plain: Uint8Array;
-  /** The version wire 0x4E must report before anything happens. */
-  readonly expectedVersion: string;
   /** The bank's expected as-booted image prefix (plain XOR keystream) when the
-   *  slot key is known — the emulator's donor case. When absent, only the
-   *  verbatim header window can be checked. */
+   *  slot key is known — the emulator's donor case. When absent, the run
+   *  relies on the double-read agreement and the derived-image gates. */
   readonly expectedSlotPrefix?: Uint8Array;
   readonly reporter: Reporter;
   /** P3/P4 post-reset probe attempts per phase before the wedge is declared. */
@@ -605,9 +609,8 @@ export interface PipelineOptions {
 export async function runPreservationPipeline(
   options: PipelineOptions,
 ): Promise<PipelineArtifacts> {
-  const { opener, plain, reporter, signal } = options;
-  const { state: initialState } = await createPreserveRun(plain, {
-    expectedVersion: options.expectedVersion,
+  const { opener, reporter, signal } = options;
+  const { state: initialState } = await createPreserveRun({
     ...(options.expectedSlotPrefix === undefined
       ? {}
       : { expectedSlotPrefix: options.expectedSlotPrefix }),
@@ -634,17 +637,14 @@ export async function runPreservationPipeline(
     reporter.log(`${phase} ${ok ? 'PASS' : 'FAIL'}: ${title} — ${detail}`, ok ? 'ok' : 'error');
   };
 
+  /* The state threads forward: each step runs on the state the previous one
+   * produced (the gates read the checkpoint record). */
+  let current = initialState;
   const runStep = async (step: PreserveStepId): Promise<PreserveRunState> => {
-    const outcome = await runPreserveStep(
-      step,
-      opener,
-      initialState,
-      loadArtifact,
-      reporter,
-      signal,
-    );
+    const outcome = await runPreserveStep(step, opener, current, loadArtifact, reporter, signal);
     for (const artifact of outcome.artifacts) store.set(artifact.name, artifact.data);
-    return outcome.state;
+    current = outcome.state;
+    return current;
   };
 
   const afterBackup = await runStep('backup');
@@ -655,6 +655,10 @@ export async function runPreservationPipeline(
   const backup = backupResultFromImage(backupImage);
   const bankCapture = store.get(PRESERVE_BANK_CAPTURE_FILE);
   if (bankCapture === undefined) throw new Error('the backup step produced no bank capture');
+  const plain = store.get(PRESERVE_PLAIN_NAME);
+  if (plain === undefined) {
+    throw new Error('the backup step derived no factory plaintext from the capture');
+  }
   record(
     'P1',
     '31-window backup complete',
@@ -712,6 +716,7 @@ export async function runPreservationPipeline(
   return {
     backupByAddress: backup.byAddress,
     bankCapture,
+    plain,
     detection,
     rawDump,
     processedDump,

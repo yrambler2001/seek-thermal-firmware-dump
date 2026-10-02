@@ -472,7 +472,9 @@ function handState(fields: {
   detection: NonNullable<PreserveRunState['detection']>;
 }): PreserveRunState {
   return {
-    version: 1,
+    version: 2,
+    imageSource: 'device',
+    slotReadShas: ['aa', 'aa'],
     runId: 'families',
     imageSha256: 'ab',
     expectedVersion: '1.3.0.8',
@@ -491,6 +493,7 @@ function handState(fields: {
       stagedLength: 0x4000,
       chunkCount: 256,
       patchedSha256: 'ab',
+      diffCount: 10,
     },
     ...fields,
   };
