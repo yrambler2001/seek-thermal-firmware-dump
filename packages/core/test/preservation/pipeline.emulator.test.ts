@@ -7,25 +7,28 @@
  * THE PLAINTEXT WORLD OF THE 2014 LINE. The Sep 29 2014 bootloader has no
  * cipher: a slot is accepted when the magic at +0x200 is 0xA1B2C3D4, the
  * length at +0x204 is under 0x10000, and the stored words sum to 0. Every
- * bank these dumps carry IS the factory plaintext, as stored. So the
- * pipeline runs in its strongest form here: the pre-write capture gate
- * (`verifyCapture`) gets the factory plaintext as the EXPECTED prefix — a
- * whole-image byte comparison, no keyless window fallback — and the
- * conjugation (`conjugateCapture`) is its own zero-keystream identity: the
- * staged wire-80 payload IS the patched plaintext. The rebalance word
- * (0x238) still applies; the keystream never enters.
+ * bank these dumps carry IS the factory plaintext, as stored. So the run
+ * SELF-SOURCES in its strongest form here: no plaintext input exists — each
+ * case's factory plaintext is DERIVED from that case's active-bank capture
+ * (`solvePlainFromCapture`, identity), its header version is cross-checked
+ * against what the camera reports, and the build table's gates run on the
+ * derived image BEFORE anything is written. The conjugation
+ * (`conjugateCapture`) is its own zero-keystream identity: the staged
+ * wire-80 payload IS the patched plaintext. The rebalance word (0x238)
+ * still applies; the keystream never enters. The corpus case pins the
+ * flow's outputs to the hardware campaign's shas (TESTING.md sec. 28.2).
  *
  * The four phases run against real emulator lifecycles, because the
  * pipeline's proofs are cross-lifecycle by nature:
  *
  *   SERVER A (--flash-out) — P1: the 31-window backup; P2: slot detect,
- *     bank capture verified against the factory plaintext BEFORE anything
- *     is written, then the conjugated in-place commit. NO reset here: a
- *     wire-89 resets the part mid-transfer, the URB is never answered, and
- *     a gated-clock emulator never retires it — the server could not stop
- *     politely and its `.final` would be lost to SIGKILL. Unbroken, this
- *     server stops cleanly and its `.final` IS the post-commit ground
- *     truth — asserted to exist, never synthesized.
+ *     the factory plaintext derived from the capture and gated BEFORE
+ *     anything is written, then the conjugated in-place commit. NO reset
+ *     here: a wire-89 resets the part mid-transfer, the URB is never
+ *     answered, and a gated-clock emulator never retires it — the server
+ *     could not stop politely and its `.final` would be lost to SIGKILL.
+ *     Unbroken, this server stops cleanly and its `.final` IS the
+ *     post-commit ground truth — asserted to exist, never synthesized.
  *
  *   The wire-89 reset belongs to P3 (the mission's own phase order): it is
  *   what boots the patched image, and its dropped URB is the documented
@@ -60,8 +63,9 @@
  * names the RECOVERY slot (cfg[0]=2): the pipeline must patch the bank
  * the camera actually boots, and the delivered-dump swap-back must use
  * that bank's backup. A fifth dump, 3.bin, is a DIFFERENT boot chain and
- * is a NEGATIVE case only: the builder refuses its slot image before
- * anything is derived, and the wire run refuses it at the version gate
+ * is a NEGATIVE case only: the derivation refuses its slot image at the
+ * build gates (identity solves it — the header parses — and the derived
+ * candidate fails them), and the wire run refuses it at the version gate
  * with no write-shaped request ever sent.
  *
  * The post-reset quirk is modeled, not ignored: after the wire-89 the
@@ -106,11 +110,13 @@ import {
   readVersion,
   resetDevice,
   resetOpPayload,
+  solvePlainFromCapture,
   verifyAgainstBackup,
   type BackupResult,
   type SlotDetection,
 } from '../../src/preservation/index.js';
-import { buildV1Patch, sum16, verifyCapture, wordSum } from '../../src/preservation/patch.js';
+import { buildV1Patch, sum16, wordSum } from '../../src/preservation/patch.js';
+import { parseImageHeader } from '../../src/image/header.js';
 import { BANKS, type BankKey } from '../../src/preservation/windows.js';
 import {
   InfrastructureDefect,
@@ -157,13 +163,6 @@ function corpusFile(...parts: readonly string[]): string | null {
   return existsSync(file) ? file : null;
 }
 
-const PLAIN_FILE = corpusFile(
-  'compact',
-  '2014.10.21-14.58.29-1.3.0.0',
-  'no-serial',
-  'subi_lpc43xx_lpcopen_1.3.0.0_-_compact_oct_21_2014_14-58-29_99.28_gabiz_ro_firmware.bin',
-);
-
 /** The vendored dump behind the corpus entry — 6.bin byte for byte. */
 const VENDORED_DUMP = corpusFile(
   'compact',
@@ -190,7 +189,6 @@ function unsupportedReason(): string | null {
   for (const flag of ['--jedec', '--flash', '--flash-out', '--corpus-entry', '--usbip-clock']) {
     if (!text.includes(flag)) return `the emulator at ${EMU_DIR} does not support ${flag}`;
   }
-  if (PLAIN_FILE === null) return 'the corpus does not carry the Compact 1.3.0.0 plaintext';
   return null;
 }
 
@@ -510,6 +508,10 @@ interface RunState {
   backup: BackupResult | null;
   detection: SlotDetection | null;
   bankCapture: Uint8Array | null;
+  /** The factory plaintext DERIVED from the capture (self-sourced), and the
+   *  patch built from it. */
+  plain: Uint8Array | null;
+  patch: ReturnType<typeof buildV1Patch> | null;
   payload: Uint8Array | null;
   commit: { chunks: number; sum16: number; status: number; ms: number } | null;
   asbooted: Uint8Array | null;
@@ -525,6 +527,8 @@ const emptyState = (): RunState => ({
   backup: null,
   detection: null,
   bankCapture: null,
+  plain: null,
+  patch: null,
   payload: null,
   commit: null,
   asbooted: null,
@@ -536,10 +540,31 @@ const emptyState = (): RunState => ({
   verify: null,
 });
 
-/* ---- the run's shared plaintext --------------------------------------------- */
+/* ---- the run's plaintext: derived per case, from the slot capture ----------- */
 
-const plain = PLAIN_FILE === null ? new Uint8Array(0) : new Uint8Array(readFileSync(PLAIN_FILE));
-const patch = UNSUPPORTED === null ? buildV1Patch(plain) : null;
+/* The suite self-sources the way the pipeline does: there is no corpus
+ * plaintext input. Each case's factory plaintext is DERIVED from that case's
+ * active-bank capture (identity — the 2014 banks hold the image as-is), and
+ * the patch is built from the derived image. The corpus case additionally
+ * pins the flow's outputs to the hardware campaign's shas (TESTING.md
+ * sec. 28.2): delivered == the as-booted part content, raw == the post-commit
+ * part, byte for byte. */
+interface DerivedImage {
+  readonly plain: Uint8Array;
+  readonly patch: ReturnType<typeof buildV1Patch>;
+}
+
+const derivedOf = new Map<string, DerivedImage>();
+
+function derivedFor(key: string, capture: Uint8Array): DerivedImage {
+  const cached = derivedOf.get(key);
+  if (cached !== undefined) return cached;
+  const solved = solvePlainFromCapture('v1-2014', capture);
+  if (!solved.ok) throw new Error(`the ${key} capture did not self-source: ${solved.reason}`);
+  const derived = { plain: solved.plain, patch: buildV1Patch(solved.plain) };
+  derivedOf.set(key, derived);
+  return derived;
+}
 
 describe.skipIf(UNSUPPORTED !== null)(
   'v1 preservation pipeline — the 2014 Compact flash dumps (emulator)',
@@ -602,18 +627,22 @@ describe.skipIf(UNSUPPORTED !== null)(
                   const capture = st.backup.byAddress.get(detection.bankAddress);
                   expect(capture, 'the P1 backup holds the active bank').toBeDefined();
                   st.bankCapture = capture!;
-                  /* THE PRE-WRITE GATE, PLAINTEXT FORM: the 2014 bootloader
-                   * stores its banks unencrypted, so the wire capture IS the
-                   * factory plaintext and the strongest check applies — the
-                   * whole image prefix, byte for byte. A mismatch here
-                   * refuses the whole run before anything is written. */
-                  const check = verifyCapture(capture!, plain, plain);
-                  expect(check.ok, check.reason ?? 'capture verified').toBe(true);
+                  /* SELF-SOURCED, and the version cross-checked: the factory
+                   * plaintext is DERIVED from this case's capture (identity —
+                   * the 2014 banks hold the image as-is), its header version
+                   * must equal what the camera reports, and the build table's
+                   * gates run on the derived image before anything is
+                   * trusted. */
+                  const derived = derivedFor(spec.key, capture!);
+                  st.plain = derived.plain;
+                  st.patch = derived.patch;
+                  const says = parseImageHeader(st.plain)?.versionStr;
+                  expect(says, 'the derived image’s header version').toBe(EXPECTED_VERSION);
 
                   /* The zero-keystream identity: with no cipher the staged
                    * payload IS the patched plaintext. */
-                  st.payload = conjugateCapture(capture!, patch!);
-                  expect(st.payload.length).toBe(plain.length);
+                  st.payload = conjugateCapture(capture!, st.patch);
+                  expect(st.payload.length).toBe(st.plain.length);
                   const commit = await commitToBank(seek, detection.bank, st.payload, {
                     label: 'P2 in-place patch',
                     reporter: silentReporter,
@@ -621,7 +650,7 @@ describe.skipIf(UNSUPPORTED !== null)(
                   });
                   st.commit = commit;
                   expect(commit.status).toBe(0); /* the measured commit verdict */
-                  expect(commit.chunks).toBe(Math.ceil(plain.length / 64)); /* 747 for 1.3.0.0 */
+                  expect(commit.chunks).toBe(Math.ceil(st.plain.length / 64)); /* 747 for 1.3.0.0 */
                   expect(commit.sum16).toBe(sum16(st.payload));
                   /* NO reset in this session: the reset is P3's opener (its own
                    * phase), and keeping it out of here lets this server stop
@@ -662,11 +691,12 @@ describe.skipIf(UNSUPPORTED !== null)(
         );
 
         it('P2 ground truth: exactly the ten enumerated bytes moved, inside the active bank only', () => {
-          const { asbooted, truth, bankCapture, detection } = st;
+          const { asbooted, truth, bankCapture, detection, patch } = st;
           expect(asbooted).not.toBeNull();
           expect(truth).not.toBeNull();
           expect(bankCapture).not.toBeNull();
           expect(detection).not.toBeNull();
+          expect(patch).not.toBeNull();
 
           const bankOff = detection!.bankAddress - FLASH_BASE;
           const moved = diffOffsets(asbooted!, truth!);
@@ -702,7 +732,7 @@ describe.skipIf(UNSUPPORTED !== null)(
           }
           expect(same(0x80000, FLASH_SIZE)).toBe(0); /* everything above the banks */
           /* And the bank's erased tail past the image is exactly as booted. */
-          expect(same(bankOff + plain.length, bankOff + 0x10000)).toBe(0);
+          expect(same(bankOff + st.plain!.length, bankOff + 0x10000)).toBe(0);
         });
 
         it(
@@ -759,6 +789,20 @@ describe.skipIf(UNSUPPORTED !== null)(
             `DELIVERED dump (bank swapped back) vs the as-booted state — ` +
               `${describeBytes('delivered', processedDump!)} vs ${describeBytes('as-booted', asbooted!)}`,
           ).toEqual([]);
+          /* THE CORPUS CASE'S PINS, byte-exact (TESTING.md sec. 28.2): the
+           * self-sourced flow's outputs must stay identical to what the
+           * hardware campaign measured on the same part — delivered == the
+           * as-booted part content (the vendored dump), raw == the
+           * post-commit part (the full sha measured in the emulator too, and
+           * pinned in the resume suite). */
+          if (spec.key === 'corpus') {
+            expect(sha256(processedDump!), 'delivered dump, pinned to the hardware campaign').toBe(
+              DUMP_SHA256['6.bin'],
+            );
+            expect(sha256(rawDump!), 'raw post-write dump, pinned to the hardware campaign').toBe(
+              '7ada1be6b211329189ff3e87d109e9d5ac5f2fcb9e891d054127e72f53d499f9',
+            );
+          }
           process.stderr.write(
             `[preservation] ${spec.key} P3 GREEN: raw == post-commit state, 0 diffs; ` +
               `delivered == as-booted, 0 diffs; ${describeBytes('raw', rawDump!)}; ` +
@@ -791,7 +835,7 @@ describe.skipIf(UNSUPPORTED !== null)(
                     expect(detection.blank).toBe(
                       spec.expectBlank,
                     ); /* the bootcfg was never written */
-                    const payload = st.bankCapture!.subarray(0, plain.length);
+                    const payload = st.bankCapture!.subarray(0, st.plain!.length);
                     const commit = await commitToBank(seek, detection.bank, payload, {
                       label: 'P4 restore',
                       reporter: silentReporter,
@@ -913,14 +957,17 @@ describe.skipIf(UNSUPPORTED !== null)(
         );
       });
 
-      it('the pre-write capture gate refuses: bank A does not hold the 1.3.0.0 image', () => {
+      it('the derivation gate refuses: bank A does not yield the 1.3.0.0 factory plaintext', () => {
         const dump = new Uint8Array(readFileSync(dumpFile('3.bin')!));
         const capture = dump.subarray(0x50000, 0x50000 + 0x10000);
-        /* The plaintext form of the gate — the whole-image comparison the
-         * pipeline would run — fails on the header length at 0x204. */
-        const check = verifyCapture(capture, plain, plain);
-        expect(check.ok).toBe(false);
-        expect(check.reason).toMatch(/does not hold the factory image/);
+        /* The self-sourcing form of the gate, exactly as the backup step runs
+         * it: the identity solve parses the capture (the header magic is
+         * there; the length at 0x204 is this chain's own), and the build
+         * gates refuse the derived candidate — the stored words do not sum
+         * to 0, and the machinery is not the 2014 build's. */
+        const solved = solvePlainFromCapture('v1-2014', capture);
+        expect(solved.ok).toBe(true);
+        if (solved.ok) expect(() => buildV1Patch(solved.plain)).toThrow(/word sum is not 0/);
       });
 
       it(

@@ -4,18 +4,29 @@
  *
  *   1. Compact 1.3.0.8 8 Hz — the chimera the doc-35 forge ran (the 8 Hz
  *      image spliced onto the PLAINTEXT 2014 donor 101310HSNEA2): the six
- *      steps, whole-part drain, delivered == as-booted.
- *   2. Compact Pro 1.0.3.0 — the NATIVE 2016 dump 0C21A1M5KP15 (the doc-33
- *      sec. 11.7 in-place route): the six steps, staged = plain ^ ks0, the
- *      delivered dump == the vendored dump (sha db4efc84…, the doc-33 IP3
- *      pair), the restore through the app's own two-stream transform.
+ *      steps, whole-part drain, delivered == as-booted. SELF-SOURCED: no
+ *      image input anywhere — the backup step reads the active slot twice,
+ *      agrees the captures, derives the plaintext (identity: the donor's
+ *      banks hold the image as-is), and the run proceeds from that.
+ *   2. Compact Pro 1.0.3.0 — the NATIVE 2016 dump 0C21A1M5KP15: the run
+ *      self-sources UP TO the solver — the capture is CIPHERED (the
+ *      as-booted bank is plain ^ ks1; the header window rides verbatim, so
+ *      the identity path parses it and refuses on the build gates), and the
+ *      compact-2016 keystream solver is the one seam this build does not
+ *      carry yet. The row proves the refusal on the real ciphered capture:
+ *      the run stops at the backup step, nothing write-shaped is sent, and
+ *      the expectedSlotPrefix gate (the donor's known key, an offline
+ *      oracle) passes first. The six-step route here waits on the solver
+ *      landing behind `solvePlainFromCapture`.
  *   3. Compact 1.3.0.8-FF — the recovery-slot route: the part synthesized
  *      from the same plaintext donor with cfg[0]=2 (selecting recovery,
  *      where the 2014 bootloader boots the 0xFFFF-sum image UNCHECKED) and
  *      the FF image spliced into the slots; commit 0x0 through the app's
  *      TWO accepts, drain through the patched guard, 6 patch bytes vs
- *      as-booted. Plus the NEGATIVE: the factory FF chimera on the same
- *      donor with its blank cfg (detection names bank A) refuses the
+ *      as-booted. The FF chimera self-sources like the 8 Hz row: the donor
+ *      stores the image as-is, so identity solves it and the build table
+ *      names the FF build. Plus the NEGATIVE: the factory FF chimera on the
+ *      same donor with its blank cfg (detection names bank A) refuses the
  *      commit and the drain — the bootloader would not boot the patch from
  *      there — and never stages a byte.
  *
@@ -32,13 +43,13 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { silentReporter, type Reporter } from '../../src/events.js';
+import { SeekError } from '../../src/errors.js';
 import { SeekDevice } from '../../src/protocol/client.js';
 import { WebUsbTransport } from '../../src/protocol/webusb.js';
 import { FLASH_SIZE } from '../../src/profiles/modern-4x.js';
 import {
   PRESERVE_DUMP_ORIGINAL_FILE,
   PRESERVE_DUMP_POSTWRITE_FILE,
-  PRESERVE_PLAIN_NAME,
   createPreserveRun,
   describeStepGate,
   readVersion,
@@ -283,13 +294,13 @@ function drainOpener(row: RowEmulators, bootOptions: BootOptions): SessionOpener
   };
 }
 
-function memoryStore(plain: Uint8Array): {
+function memoryStore(): {
   load: PreserveArtifactLoader;
   keep: (outcome: {
     readonly artifacts: readonly { readonly name: string; readonly data: Uint8Array }[];
   }) => void;
 } {
-  const map = new Map<string, Uint8Array>([[PRESERVE_PLAIN_NAME, plain]]);
+  const map = new Map<string, Uint8Array>();
   return {
     load: (name) => Promise.resolve(map.get(name) ?? null),
     keep: (outcome) => {
@@ -324,8 +335,6 @@ function progressReporter(label: string): Reporter {
  */
 async function runFullInPlace(spec: {
   readonly label: string;
-  readonly plainFile: NonNullable<ReturnType<typeof corpusFile>>;
-  readonly version: string;
   readonly expectedSlotPrefix: Uint8Array;
   readonly expectedDiffOffsets: readonly number[];
   readonly bankFlashOffset: number; /* 0x50000 for bank A */
@@ -338,20 +347,15 @@ async function runFullInPlace(spec: {
    *  build's recovery override). */
   readonly expectDetectionBank?: 'a' | 'b' | 'r';
 }): Promise<void> {
-  const plain = new Uint8Array(readFileSync(spec.plainFile));
-  const created: CreatedPreserveRun = await createPreserveRun(plain, {
-    expectedVersion: spec.version,
+  /* NO image input: the run is created empty and self-sources at the backup
+   * step (double read -> derive -> gate). The expectedSlotPrefix is an
+   * OFFLINE oracle — the donor's known key — not an input. */
+  const created: CreatedPreserveRun = await createPreserveRun({
     runId: `families-${spec.label}`,
     drainChunk: 64,
     expectedSlotPrefix: spec.expectedSlotPrefix,
   });
-  const store = memoryStore(plain);
-  expect(created.state.buildId).toBeDefined();
-  process.stderr.write(
-    `[families] ${spec.label}: build ${created.state.buildId ?? '?'}, staged ` +
-      `${created.state.stagedForm ?? '?'}, capability wholePart=` +
-      `${String(created.state.capability?.wholePart ?? '?')}\n`,
-  );
+  const store = memoryStore();
 
   /* ---- SERVER A: backup, patch, commit ------------------------------------
    * THE FIRST-SESSION SHAPE (doc 35.4): the first session opened on a
@@ -568,7 +572,7 @@ async function runFullInPlace(spec: {
     try {
       const session = await attach(restoreServer, 'restore post-reset touch');
       try {
-        expect(await readVersion(session.seek)).toBe(spec.version);
+        expect(await readVersion(session.seek)).toBe(state.expectedVersion);
       } finally {
         await session.close();
       }
@@ -644,15 +648,16 @@ describe.skipIf(missingPlain('1.3.0.8 8 Hz', PLAIN_8HZ) !== null)(
   'family compact-1.3.0.8-8hz — full in-place on the 2014 donor (emulator)',
   () => {
     it(
-      'backup, patch (one site), commit, whole-part drain, restore, verify; delivered == as-booted',
+      'self-sourced: backup derives the image from the slot, then patch (one site), commit, whole-part drain, restore, verify; delivered == as-booted',
       { timeout: 5_400_000 },
       async () => {
+        /* The expectedSlotPrefix is the offline oracle only: the 2014 donor's
+         * banks are plaintext, so the capture must be the corpus image's own
+         * bytes — checked by the run's gate, not fed to it as input. */
         const plain = new Uint8Array(readFileSync(PLAIN_8HZ!));
         await runFullInPlace({
           label: '1308-8hz',
-          plainFile: PLAIN_8HZ!,
-          version: '1.3.0.8',
-          expectedSlotPrefix: plain /* the 2014 donor's banks are plaintext */,
+          expectedSlotPrefix: plain,
           expectedDiffOffsets: [0x239, 0x3cbd] /* word 142 + the widen byte */,
           bankFlashOffset: 0x50000 /* bank A: the donor's blank cfg boots A */,
           boot: { entry: '11.16.17', donor: DONOR_2014 },
@@ -669,28 +674,90 @@ describe.skipIf(missingPlain('1.3.0.8 8 Hz', PLAIN_8HZ) !== null)(
  * ==================================================================== */
 
 describe.skipIf(missingPlain('1.0.3.0', PLAIN_1030) !== null)(
-  'family compact-pro-1.0.3.0 — full in-place on the native 2016 dump (emulator)',
+  'family compact-pro-1.0.3.0 — the ciphered capture refuses at the solver seam (emulator)',
   () => {
     it(
-      'staged = plain ^ ks0 through the app two-stream transform; delivered == the vendored dump',
-      { timeout: 5_400_000 },
+      'the native dump self-sources up to the solver: identity parses the verbatim header and refuses on the build gates; the cipher solvers are not here yet; nothing write-shaped is sent',
+      { timeout: 1_800_000 },
       async () => {
-        const plain = new Uint8Array(readFileSync(PLAIN_1030!));
         /* The donor's KeyB == the app's key block 1 (measured full length in
          * the RE record), so the as-booted bank IS plain ^ ks1 — the expected
-         * prefix the pre-write capture gate checks. */
+         * prefix the run's capture gate checks (an offline oracle, not an
+         * input). The capture is CIPHERED, so the identity path parses the
+         * verbatim header window and then fails the build gates — and the
+         * compact-2016 keystream solver is the one seam this build does not
+         * carry. The run must refuse at the backup step, before anything is
+         * recorded or written, with the reason naming the families. */
+        const plain = new Uint8Array(readFileSync(PLAIN_1030!));
         const patch = buildV1Patch(plain);
+        expect(patch.buildId).toBe('compact-pro-1.0.3.0');
         const ks1 = keystream(keyWordsOf(patch.keys?.block1Hex ?? ''), plain.length >> 2);
-        await runFullInPlace({
-          label: '1030',
-          plainFile: PLAIN_1030!,
-          version: '1.0.3.0',
+        const created = await createPreserveRun({
+          runId: 'families-1030-cipher',
           expectedSlotPrefix: xorWindowVerbatim(plain, ks1),
-          expectedDiffOffsets: [0x239, 0x23b, 0x352f, 0x3639] /* the doc-33 four bytes */,
-          bankFlashOffset: 0x50000,
-          boot: { entry: '0C21A1M5KP15/dump' },
-          restore: true,
         });
+        const store = memoryStore();
+        const row = new RowEmulators('1030 A (backup: the solver refusal)');
+        const emu = await boot(row, { entry: '0C21A1M5KP15/dump' });
+        try {
+          await warmServer(emu, '1030 seam server');
+          /* The step is read-only, so a first-session stall (doc 35.4) can be
+           * retried on a fresh session; the SOLVER refusal is the expected
+           * answer and ends the ladder. */
+          let error: unknown = null;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            error = await row
+              .guard(emu, () =>
+                runPreserveStep(
+                  'backup',
+                  singleServerOpener(emu),
+                  created.state,
+                  store.load,
+                  silentReporter,
+                ),
+              )
+              .catch((e: unknown) => e);
+            if (
+              error instanceof SeekError &&
+              error.message.includes('do not yield the factory plaintext')
+            ) {
+              break;
+            }
+            process.stderr.write(
+              `[families] 1030 seam attempt ${String(attempt)} failed with ` +
+                `${error instanceof Error ? error.message : String(error)}; retrying\n`,
+            );
+          }
+          expect(error).toBeInstanceOf(SeekError);
+          expect((error as Error).message).toMatch(/do not yield the factory plaintext/);
+          /* The identity candidate got as far as the build gates (the
+           * verbatim header window parses straight through the cipher)... */
+          expect((error as Error).message).toMatch(/failed its build gates/);
+          /* ...and the cipher families' solvers are the named way out. */
+          expect((error as Error).message).toMatch(
+            /compact-2016 keystream solver is not implemented/,
+          );
+          expect((error as Error).message).toMatch(
+            /v1-2014-ff keystream solver is not implemented/,
+          );
+        } catch (error) {
+          process.stderr.write(
+            `--- emulator log tail after the solver-refusal failure ---\n${emu.log(80)}\n`,
+          );
+          throw error;
+        } finally {
+          await emu.stop(120_000);
+        }
+        await assertDelivery(row);
+        /* NOTHING WRITE-SHAPED went out: the refusal precedes every stage and
+         * every commit, on the wire ledger of the whole server. */
+        const requests = emu.ledger.snapshot().requests;
+        for (const opcode of ['0x50', '0x81', '0x59']) {
+          expect(
+            requests[`0x41/${opcode}`]?.sent ?? 0,
+            `no 0x41/${opcode} may go out against the ciphered capture`,
+          ).toBe(0);
+        }
         expect(liveEmulatorCount()).toBe(0);
       },
     );
@@ -705,7 +772,7 @@ describe.skipIf(missingPlain('1.3.0.8-FF', PLAIN_FF) !== null)(
   'family compact-1.3.0.8-ff — commit+drain through the recovery route (emulator)',
   () => {
     it(
-      'the blank-cfg factory chimera: detection names RECOVERY, the commit passes the app\u2019s two accepts, the whole part drains; restore refuses as documented',
+      'the blank-cfg factory chimera, self-sourced: detection names RECOVERY, the commit passes the app\u2019s two accepts, the whole part drains; restore refuses as documented',
       { timeout: 5_400_000 },
       async () => {
         /* THE PROVEN ROUTE (doc 35.3.3): the factory FF chimera on the
@@ -715,7 +782,9 @@ describe.skipIf(missingPlain('1.3.0.8-FF', PLAIN_FF) !== null)(
          * though a blank record makes the cfg-derived detection name A. The
          * pipeline re-points the detection at recovery (effectiveDetection):
          * the capture, the commit, the delivered-dump swap-back and the
-         * restore all act on 0x14070000 and never on A/B.
+         * restore all act on 0x14070000 and never on A/B. The run
+         * self-sources: the donor stores the FF image as-is, so the identity
+         * solve derives it and the build table names the FF build.
          *
          * (A part whose record EXPLICITLY selects recovery was also tried:
          * the donor bootloader faults booting it — the explicit-record path
@@ -725,8 +794,6 @@ describe.skipIf(missingPlain('1.3.0.8-FF', PLAIN_FF) !== null)(
         const plain = new Uint8Array(readFileSync(PLAIN_FF!));
         await runFullInPlace({
           label: '1308-ff',
-          plainFile: PLAIN_FF!,
-          version: '1.3.0.8',
           expectedSlotPrefix: plain /* the plaintext donor stores the image as-is */,
           expectedDiffOffsets: [
             0x238, 0x239, 0x23a, 0x23b, 0x3d69, 0x3e71,

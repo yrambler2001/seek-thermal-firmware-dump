@@ -3,6 +3,14 @@
  * booted from the REAL 4 MiB flash dump of the 2014 Compact (the corpus
  * entry, as the four-phase suite at 2488fcc boots it).
  *
+ * THE RUN SELF-SOURCES. No image is passed to `createPreserveRun` and no
+ * plaintext is seeded into the checkpoint store: the backup step reads the
+ * active slot TWICE, requires the two reads to agree, derives the factory
+ * plaintext from the agreed capture (identity — the 2014 banks hold the
+ * image as-is), and emits it as the run artifact the later steps load. The
+ * run needs nothing but the camera — exactly what `--resume` needs on disk:
+ * the run directory and nothing else.
+ *
  * THE SCENARIO IS THE ONE THE STEPWISE SHAPE EXISTS FOR. On one boot
  * description, and in one process:
  *
@@ -28,7 +36,8 @@
  *     sec. 11.6; the commit is never replayed). OFFLINE: the raw dump ==
  *     the commit server's `.final` (0 diffs), and the delivered dump — the
  *     active bank swapped back from the backup artifact — == the as-booted
- *     image (0 diffs).
+ *     image (0 diffs), pinned to the shas the hardware campaign measured
+ *     (TESTING.md sec. 28.2): the flow's outputs must stay byte-identical.
  *
  *   SERVER C (--flash <truth>, --flash-out) — the RESTORE step: the original
  *     bank staged back verbatim from the backup artifact, reset; the same
@@ -57,7 +66,6 @@ import { FLASH_SIZE } from '../../src/profiles/modern-4x.js';
 import {
   PRESERVE_DUMP_ORIGINAL_FILE,
   PRESERVE_DUMP_POSTWRITE_FILE,
-  PRESERVE_PLAIN_NAME,
   createPreserveRun,
   readVersion,
   runPreserveStep,
@@ -82,24 +90,15 @@ const JEDEC = '010215';
 const EXPECTED_VERSION = '1.3.0.0';
 /** The corpus entry IS the vendored dump — 6.bin byte for byte (TESTING.md
  *  sec. 23 pins the sha; a swapped or edited file fails here, before any wire
- *  traffic). */
+ *  traffic). The self-sourced run's DELIVERED dump is this same part content
+ *  (the active bank swapped back), and its RAW dump is the post-commit part —
+ *  both pinned to the hardware campaign's shas (TESTING.md sec. 28.2), so the
+ *  flow's outputs cannot drift a byte without this suite saying so. */
 const CORPUS_FLASH_SHA = '40447c7e6da5cbc84621f4694ffff5bda0f783e7807a45e80443383b19a8eb72';
+const CORPUS_RAW_DUMP_SHA = '7ada1be6b211329189ff3e87d109e9d5ac5f2fcb9e891d054127e72f53d499f9';
 /** A wire-89 mid-session leaves its own URB unanswered; the reboot wait is the
  *  measured shape (the part re-initializes USB within it, on this emulator). */
 const REBOOT_WAIT_MS = 15_000;
-
-function corpusFile(...parts: readonly string[]): string | null {
-  if (EMU_DIR === null) return null;
-  const file = path.join(EMU_DIR, 'data', 'corpus', ...parts);
-  return existsSync(file) ? file : null;
-}
-
-const PLAIN_FILE = corpusFile(
-  'compact',
-  '2014.10.21-14.58.29-1.3.0.0',
-  'no-serial',
-  'subi_lpc43xx_lpcopen_1.3.0.0_-_compact_oct_21_2014_14-58-29_99.28_gabiz_ro_firmware.bin',
-);
 
 function unsupportedReason(): string | null {
   if (EMU_DIR === null) return 'no emulator found (SEEK_EMU_DIR)';
@@ -109,7 +108,6 @@ function unsupportedReason(): string | null {
   for (const flag of ['--jedec', '--flash', '--flash-out', '--corpus-entry', '--usbip-clock']) {
     if (!text.includes(flag)) return `the emulator at ${EMU_DIR} does not support ${flag}`;
   }
-  if (PLAIN_FILE === null) return 'the corpus does not carry the Compact 1.3.0.0 plaintext';
   return null;
 }
 
@@ -291,14 +289,14 @@ describe.skipIf(UNSUPPORTED !== null)('v1 preservation run — resumed (emulator
     'backup+patch+commit on one server; the crash; drain, restore and verify on fresh servers',
     { timeout: 5_400_000 },
     async () => {
-      const plain = new Uint8Array(readFileSync(PLAIN_FILE!));
-      const { state: created } = await createPreserveRun(plain, {
-        expectedVersion: EXPECTED_VERSION,
+      /* NO image input anywhere: the run derives its factory plaintext from
+       * the camera's active slot (the backup step), and the derived artifact
+       * rides the store from there — the shape `--resume` needs. */
+      const { state: created } = await createPreserveRun({
         runId: 'resume-emulator',
         drainChunk: 64 /* the measured ask: one EP0 packet, serve == ask */,
       });
       const store = memoryStore();
-      store.keep({ artifacts: [{ name: PRESERVE_PLAIN_NAME, data: plain }] });
 
       /* ---- SERVER A: backup, patch, commit — the crash comes after ------ */
       const commitRow = new RowEmulators('resume A (backup+patch+commit)');
@@ -374,14 +372,25 @@ describe.skipIf(UNSUPPORTED !== null)('v1 preservation run — resumed (emulator
        * reset server carries the tolerated one-orphan shape. */
       await assertDelivery(drainRow);
 
-      /* OFFLINE: raw == the post-commit state; delivered == the as-booted. */
+      /* OFFLINE: raw == the post-commit state; delivered == the as-booted.
+       * Both pinned to the hardware campaign's shas (TESTING.md sec. 28.2):
+       * the same 10-byte commit on the same part content must drain to the
+       * same bytes here as it did on the bench, or the flow has drifted. */
       const asbooted = new Uint8Array(readFileSync(asbootedPath));
+      expect(sha256(asbooted)).toBe(CORPUS_FLASH_SHA);
       const raw = new Uint8Array(
         drained.artifacts.find((a) => a.name === PRESERVE_DUMP_POSTWRITE_FILE)!.data,
       );
       expect(diffOffsets(raw, truth), 'raw dump vs the post-commit state').toEqual([]);
+      expect(
+        sha256(raw),
+        'the raw post-write dump, byte-identical to the hardware campaign’s',
+      ).toBe(CORPUS_RAW_DUMP_SHA);
       const delivered = new Uint8Array((await store.load(PRESERVE_DUMP_ORIGINAL_FILE))!);
       expect(diffOffsets(delivered, asbooted), 'delivered dump vs the as-booted part').toEqual([]);
+      expect(sha256(delivered), 'the delivered dump == the as-booted part content').toBe(
+        CORPUS_FLASH_SHA,
+      );
       process.stderr.write(
         `[resume] raw sha256 ${sha256(raw)}; delivered sha256 ${sha256(delivered)}\n`,
       );
