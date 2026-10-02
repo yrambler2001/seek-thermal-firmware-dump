@@ -420,6 +420,7 @@ export {
   resetOpPayload,
   runPreserveStep,
   runPreservationPipeline,
+  solvePlainFromCapture,
   sum16,
   verifyAgainstBackup,
   verifyCapture,
@@ -444,6 +445,7 @@ export type {
   PreserveStepRecord,
   SessionOpener,
   SlotDetection,
+  SolvePlainResult,
   V1Patch,
   WindowBytes,
 } from './preservation/index.js';

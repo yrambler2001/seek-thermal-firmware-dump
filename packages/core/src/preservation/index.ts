@@ -122,3 +122,6 @@ export type {
   PreserveStepOutcome,
   PreserveStepRecord,
 } from './steps.js';
+
+export { solvePlainFromCapture } from './solve.js';
+export type { SolvePlainResult } from './solve.js';
