@@ -56,6 +56,7 @@ import {
   backupResultFromImage,
   createPreserveRun,
   describeStepGate,
+  detectActiveSlot,
   doubleReadWindows,
   parseBootConfig,
   planWindowAt,
@@ -211,20 +212,21 @@ class StalledWire79Device extends SeekDevice {
 }
 
 /**
- * A device whose wire-79 reads go bad once a given window is armed a THIRD
+ * A device whose wire-79 reads go bad once a given window is armed a SECOND
  * time — the read glitch the double read exists to catch. The arms of the
- * watched window come in a fixed order: the backup sweep's arm (clean), the
- * double read's FIRST arm — the bank window (clean), and the double read's
- * SECOND arm — the plan window, from which every serve carries one flipped
- * byte per chunk. The two captures then disagree, and the step must refuse;
- * a build that collapsed the double read onto one arm would serve both reads
+ * watched window come in a fixed order: the backup sweep's arm (clean), then
+ * the fresh arm of the double read, from which every serve carries one
+ * flipped byte per chunk — at byte 4 of each packet, so the image magic at
+ * 0x200 stays readable and the read stays PLAUSIBLE. The two reads then
+ * disagree while both parsing, which is the byte-agreement refusal; a build
+ * that collapsed the double read onto the sweep alone would serve both reads
  * clean and this test would not refuse.
  */
 class GlitchySecondReadDevice extends SeekDevice {
   private readonly watchSubcmd: number;
   private readonly glitchFromArm: number;
   private armed = 0;
-  constructor(camera: FakeCamera, watchSubcmd: number, glitchFromArm = 3) {
+  constructor(camera: FakeCamera, watchSubcmd: number, glitchFromArm = 2) {
     super(camera, { reporter: silentReporter });
     this.watchSubcmd = watchSubcmd;
     this.glitchFromArm = glitchFromArm;
@@ -237,8 +239,69 @@ class GlitchySecondReadDevice extends SeekDevice {
     const data = await super.rpcIn(op, length, timeoutMs);
     if (op === OP.GET_FEATURED_FIRMWARE_DATA && this.armed >= this.glitchFromArm) {
       const out = new Uint8Array(data);
-      out[0] = (out[0] ?? 0) ^ 0xff;
+      out[4] = (out[4] ?? 0) ^ 0xff;
       return out;
+    }
+    return data;
+  }
+}
+
+/**
+ * A device whose SWEEP read of the bank's window serves 0xFF — the swallowed
+ * arm the verified-arm ladder exists for (the 2026-10-02 probe: a mode-3 read
+ * served blank while the immediately-following mode-7 read served correctly)
+ * — while every later arm's serves pass through clean. The sweep row is then
+ * garbage, the fresh arm reads a real image, and the ladder must use the
+ * re-read and repair the archive row.
+ */
+class SwallowBankRowDevice extends SeekDevice {
+  private readonly watchSubcmd: number;
+  private arms = 0;
+  private blanking = false;
+  constructor(camera: FakeCamera, watchSubcmd = 7) {
+    super(camera, { reporter: silentReporter });
+    this.watchSubcmd = watchSubcmd;
+  }
+  override async armWindow(...args: Parameters<SeekDevice['armWindow']>): Promise<void> {
+    if (args[0].subcmd === this.watchSubcmd) this.arms += 1;
+    this.blanking = args[0].subcmd === this.watchSubcmd && this.arms === 1;
+    return super.armWindow(...args);
+  }
+  override async rpcIn(op: number, length: number, timeoutMs?: number): Promise<Uint8Array> {
+    const data = await super.rpcIn(op, length, timeoutMs);
+    if (op === OP.GET_FEATURED_FIRMWARE_DATA && this.blanking) {
+      return new Uint8Array(data.length).fill(0xff);
+    }
+    return data;
+  }
+}
+
+/**
+ * A device whose mode-3 (boot-config) serves are overridden per arm: serve
+ * entry N is what the Nth mode-3 arm's reads return (null passes through).
+ * Everything else passes through untouched — the stand-in for the arm-swallow
+ * shapes the verified-arm ladder on the boot-config read exists for.
+ */
+class CfgServeDevice extends SeekDevice {
+  private readonly serves: readonly (Uint8Array | null)[];
+  private mode3Arms = 0;
+  constructor(camera: FakeCamera, serves: readonly (Uint8Array | null)[]) {
+    super(camera, { reporter: silentReporter });
+    this.serves = serves;
+  }
+  /** How many mode-3 arms went out — the ladder's retry count lives here. */
+  mode3ArmCount(): number {
+    return this.mode3Arms;
+  }
+  override async armWindow(...args: Parameters<SeekDevice['armWindow']>): Promise<void> {
+    if (args[0].subcmd === 3) this.mode3Arms += 1;
+    return super.armWindow(...args);
+  }
+  override async rpcIn(op: number, length: number, timeoutMs?: number): Promise<Uint8Array> {
+    const data = await super.rpcIn(op, length, timeoutMs);
+    if (op === OP.GET_FEATURED_FIRMWARE_DATA) {
+      const override = this.serves[this.mode3Arms - 1];
+      if (override !== undefined && override !== null) return override.subarray(0, length);
     }
     return data;
   }
@@ -325,9 +388,10 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
     const camera = v1Camera(plain);
     const store = memoryStore();
     const created = await createPreserveRun({ runId: 'double-read' });
-    /* Bank A's window is mode 7: the backup armed it once (clean), the double
-     * read's first arm — the bank window — reads clean, and from the second
-     * arm — the plan window — every wire-79 serve carries one flipped byte. */
+    /* Bank A's window is mode 7: the sweep armed it once (clean) and the
+     * fresh arm reads from the second arm on — one flipped byte per packet at
+     * offset 4, so the read stays plausible (the magic survives) and the two
+     * reads disagree while both parsing. */
     const corruptedOpener: SessionOpener = {
       open: async () => {
         await camera.open();
@@ -354,15 +418,16 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
   });
 
   it(
-    'refuses a scrambled slot at the derivation — no guess, no write',
+    'refuses a scrambled slot at the verified-arm ladder — garbage twice, the remedy first',
     { timeout: 120_000 },
     async () => {
       /* The bank holds the image XOR 0x5A over EVERY byte, the header window
-       * included: no bootloader could read the length from it, so the
-       * identity path refuses on the magic and both cipher families refuse
-       * at their first gate (a real at-rest capture stores that window in
-       * clear — these bytes are not one). The run refuses; nothing is
-       * recorded, nothing written. */
+       * included: no bootloader could read the length from it, so NEITHER the
+       * sweep row nor the fresh arm parses as an image — the verified-arm
+       * ladder sees garbage twice and refuses with the power-cycle remedy
+       * before any solver runs (a real camera serving these bytes is a spent
+       * reader, not a cipher puzzle). The run refuses; nothing is recorded,
+       * nothing written. */
       const ciphered = new Uint8Array(plain);
       for (let i = 0; i < ciphered.length; i++) ciphered[i] = (ciphered[i] ?? 0) ^ 0x5a;
       const camera = v1Camera(ciphered);
@@ -372,10 +437,12 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
         (e: unknown) => e,
       );
       expect(error).toBeInstanceOf(SeekError);
-      expect((error as Error).message).toMatch(/do not yield the factory plaintext/);
-      expect((error as Error).message).toMatch(/v1-2014-ff/);
-      expect((error as Error).message).toMatch(/compact-2016/);
-      expect((error as Error).message).toMatch(/verbatim window itself is scrambled/);
+      const message = (error as Error).message;
+      expect(message.startsWith('the camera’s window reader is budgeted per boot')).toBe(true);
+      expect(message).toMatch(/preserve --resume/);
+      expect(message).toMatch(/served garbage twice/);
+      expect(message).toMatch(/no image header parses at 0x200/);
+      expect(message).not.toMatch(/do not yield the factory plaintext/);
     },
   );
 
@@ -451,14 +518,15 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
       expect([...derived!]).toEqual([...plain]);
       expect(state.steps.backup?.notes).toMatch(/both reads agree/);
       expect(state.steps.backup?.notes).toMatch(
-        /two arms \(bank window mode 7, plan window mode 7\)/,
+        /served twice \(the sweep’s plan-window row, mode 7, \+ one fresh arm of the bank window, mode 7\)/,
       );
       expect(state.steps.backup?.notes).toMatch(/identity/);
-      /* THE TWO ARMS, on the wire: mode 7 went out THREE times — the sweep's
-       * arm, then the double read's bank-window arm and its plan-window arm,
-       * with the boot-config read (mode 3) between sweep and double read. */
-      expect(camera.arms.slice(-3)).toEqual([3, 7, 7]);
-      expect(camera.arms.filter((mode) => mode === 7)).toHaveLength(3);
+      /* THE SERVE BUDGET, on the wire: mode 7 went out TWICE — the sweep's arm
+       * (whose row is read #1) and the fresh arm (read #2) — and mode 3 twice
+       * (the boot-config read and its verified-arm re-arm; the fake's record
+       * is unprogrammed fill, so the ladder re-arms once). */
+      expect(camera.arms.slice(-3)).toEqual([3, 3, 7]);
+      expect(camera.arms.filter((mode) => mode === 7)).toHaveLength(2);
       /* The capture, as before, is the bank verbatim. */
       const capture = await store.load(PRESERVE_BANK_CAPTURE_FILE);
       expect(capture?.length).toBe(0x10000);
@@ -505,6 +573,58 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
       expect(state.slotReadShas?.[0]).toBe(await sha256hex(window));
       expect(state.slotReadShas?.[1]).toBe(state.slotReadShas?.[0]);
       expect(state.steps.backup?.notes).toMatch(/re-pointed at the recovery bank/);
+    },
+  );
+
+  it(
+    'a swallowed sweep row flips to the fresh arm’s read, and the archive row is repaired',
+    { timeout: 120_000 },
+    async () => {
+      /* The 2026-10-02 probe's arm swallow, on the slot read: the sweep's
+       * mode-7 arm serves 0xFF while the immediately-following fresh arm
+       * serves correctly. The ladder uses the re-read as the capture, notes
+       * the verification, and repairs the assembled backup's row so the run
+       * directory stays self-consistent. */
+      const camera = v1Camera(plain);
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'swallow' });
+      const swallowedOpener: SessionOpener = {
+        open: async () => {
+          await camera.open();
+          return new SwallowBankRowDevice(camera);
+        },
+        close: async () => {
+          await camera.close();
+        },
+      };
+      const outcome = await runPreserveStep(
+        'backup',
+        swallowedOpener,
+        created.state,
+        store.load,
+        silentReporter,
+      );
+      store.add(outcome);
+      const state = outcome.state;
+
+      /* The capture is the fresh arm's read: the real image. */
+      const capture = (await store.load(PRESERVE_BANK_CAPTURE_FILE))!;
+      expect([...capture.subarray(0, plain.length)]).toEqual([...plain]);
+      expect(state.imageSha256).toBe(await sha256hex(plain));
+      /* slotReadShas record what actually happened: the garbage sweep row
+       * first, the verified capture second. */
+      const ffRow = new Uint8Array(0x10000).fill(0xff);
+      expect(state.slotReadShas?.[0]).toBe(await sha256hex(ffRow));
+      expect(state.slotReadShas?.[1]).toBe(await sha256hex(capture));
+      expect(state.slotReadShas?.[0]).not.toBe(state.slotReadShas?.[1]);
+      /* The note names the verification. */
+      expect(state.steps.backup?.notes).toMatch(
+        /the sweep’s row served garbage and was re-verified — the fresh arm’s read is the capture/,
+      );
+      /* The assembled backup's bank row is the verified capture, not the
+       * garbage the sweep served. */
+      const windows = (await store.load(PRESERVE_BACKUP_FILE))!;
+      expect(windows[BANK_A_OFFSET + 5]).toBe(plain[5]);
     },
   );
 
@@ -748,6 +868,112 @@ describe('the spent-reader refusals and the two-arm double read', () => {
     dv.setUint32(4, 0x1008066d, true);
     dv.setUint32(0x200, 0xa1b2c3d4, true);
     expect(spentReaderSignature(capture)).toBeNull();
+  });
+});
+
+/* ==================================================================== *
+ * the verified-arm ladder on the boot-config read — a written record is
+ * accepted as served; an unprogrammed or stale read is re-armed ONCE; the
+ * re-read is used when it names a record; two agreeing unprogrammed reads
+ * accept the blank verdict; garbage twice refuses with the remedy
+ * ==================================================================== */
+
+describe('the verified-arm ladder on the boot-config read', () => {
+  const plain = syntheticPlain();
+  const blank = (): Uint8Array => new Uint8Array(BOOT_CONFIG_BYTES).fill(0xff);
+  const stale = (): Uint8Array => {
+    const b = new Uint8Array(BOOT_CONFIG_BYTES).fill(0xff);
+    new DataView(b.buffer).setUint32(0, 0x10018000, true);
+    return b;
+  };
+  const record = (cfg0: number): Uint8Array => {
+    const b = new Uint8Array(BOOT_CONFIG_BYTES).fill(0xff);
+    new DataView(b.buffer).setUint32(0, cfg0, true);
+    return b;
+  };
+
+  async function detectWith(
+    camera: FakeCamera,
+    serves: readonly (Uint8Array | null)[],
+  ): Promise<{ detection: Awaited<ReturnType<typeof detectActiveSlot>>; arms3: number }> {
+    await camera.open();
+    try {
+      const device = new CfgServeDevice(camera, serves);
+      const detection = await detectActiveSlot(device);
+      return { detection, arms3: device.mode3ArmCount() };
+    } finally {
+      await camera.close();
+    }
+  }
+
+  it('a written record is accepted as served, with no re-arm', { timeout: 120_000 }, async () => {
+    /* The donor's real record shape: cfg[0]=0 with the record written. */
+    const camera = v1Camera(plain);
+    const { detection, arms3 } = await detectWith(camera, [record(0)]);
+    expect(detection.bank).toBe('a');
+    expect(detection.cfg0).toBe(0);
+    expect(detection.verdict).not.toMatch(/re-verified/);
+    expect(arms3).toBe(1);
+  });
+
+  it(
+    'an unprogrammed record is re-armed once; two agreeing blanks accept the blank verdict, with the verification said',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const { detection, arms3 } = await detectWith(camera, [null, null]);
+      expect(detection.bank).toBe('a');
+      expect(detection.verdict).toMatch(/re-verified: the record read as unprogrammed twice/);
+      expect(detection.verdict).toMatch(/two agreeing reads/);
+      expect(arms3).toBe(2);
+    },
+  );
+
+  it(
+    'a blank first read that flips to a real record uses the re-read, and the run state says so',
+    { timeout: 120_000 },
+    async () => {
+      const camera = v1Camera(plain);
+      const { detection, arms3 } = await detectWith(camera, [blank(), record(1)]);
+      expect(detection.bank).toBe('b');
+      expect(detection.cfg0).toBe(1);
+      expect(detection.verdict).toMatch(
+        /re-verified: the first read served an unprogrammed 0xFF-fill record — re-armed once and this re-read is the record used/,
+      );
+      expect(arms3).toBe(2);
+    },
+  );
+
+  it(
+    'a stale-descriptor first read that flips to a real record uses the re-read too',
+    { timeout: 120_000 },
+    async () => {
+      /* The incident's exact cfg shape: 0x10018000 served where a record
+       * should be — and the re-arm naming the record instead of refusing. */
+      const camera = v1Camera(plain);
+      const { detection } = await detectWith(camera, [stale(), record(1)]);
+      expect(detection.bank).toBe('b');
+      expect(detection.verdict).toMatch(
+        /re-verified: the first read served an SRAM-shaped word \(the bootloader vector’s initial SP\)/,
+      );
+    },
+  );
+
+  it('garbage twice refuses with the power-cycle remedy', { timeout: 120_000 }, async () => {
+    const camera = v1Camera(plain);
+    const error: unknown = await detectWith(camera, [stale(), stale()]).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(SeekError);
+    expect(
+      (error as Error).message.startsWith('the camera’s window reader is budgeted per boot'),
+    ).toBe(true);
+    expect((error as Error).message).toMatch(/served garbage twice/);
+    expect((error as Error).message).toMatch(/preserve --resume/);
+
+    /* Blank-then-stale is not an agreeing pair either. */
+    const camera2 = v1Camera(plain);
+    const error2: unknown = await detectWith(camera2, [blank(), stale()]).catch((e: unknown) => e);
+    expect(error2).toBeInstanceOf(SeekError);
+    expect((error2 as Error).message).toMatch(/power-cycle the camera/);
   });
 });
 

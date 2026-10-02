@@ -8,11 +8,13 @@
  * at the joints a crash actually leaves behind, so each step ends with
  * everything it produced in the caller's hands:
  *
- *   backup  — the 31 stock windows, the active-bank capture read TWICE (two
- *             independent captures through TWO ARMS — the bank window and the
- *             matching plan window, two descriptor lifetimes — that must agree
- *             byte for byte; a read glitch becomes a refusal, never a write),
- *             the factory plaintext DERIVED from that capture (`solve.ts`:
+ *   backup  — the 31 stock windows, the active-bank capture read TWICE under
+ *             the serve budget (the sweep's own row at the bank address, then
+ *             ONE fresh arm — the active slot is served exactly twice per
+ *             boot) with the verified-arm ladder on both reads (a swallowed
+ *             arm is re-armed once; garbage twice refuses with the power-cycle
+ *             remedy; two plausible reads that differ stay a refusal), the
+ *             factory plaintext DERIVED from that capture (`solve.ts`:
  *             identity on the plain chain, the family's keystream solver on a
  *             cipher family), the whole gate set run on the derived image, and
  *             the standard dump archive (decrypted slots, reports, manifest)
@@ -70,7 +72,7 @@ import {
 import { bytesToHex, equalBytes, hexToBytes, hexUp, isoStamp, sha256hex, utf8 } from '../bytes.js';
 import { CancelledError, SeekError } from '../errors.js';
 import type { Artifact, Reporter } from '../events.js';
-import { HEADER_OFFSET, HEADER_SIZE, parseImageHeader } from '../image/header.js';
+import { HEADER_OFFSET, HEADER_SIZE, IMAGE_MAGIC, parseImageHeader } from '../image/header.js';
 import { FLASH_BASE, FLASH_SIZE } from '../profiles/modern-4x.js';
 import { legacyReaderOp } from '../profiles/legacy-auth.js';
 import { getProfile } from '../profiles/registry.js';
@@ -89,6 +91,7 @@ import {
   detectActiveSlot,
   drainExact,
   drainWholePart,
+  isWireStall,
   postProcessDump,
   probeWidenedWindow,
   readVersion,
@@ -810,18 +813,6 @@ function expectedPrefixOf(state: PreserveRunState): Uint8Array | undefined {
   return state.expectedSlotPrefix === undefined ? undefined : hexToBytes(state.expectedSlotPrefix);
 }
 
-/** True when the error, or something it wraps, is the wire's stall answer:
- *  both transports map a stalled endpoint to `usb/stalled`, and `drainExact`
- *  rethrows the transport's error as `cause` — the exhausted reader's
- *  measured signature (TESTING.md sec. 28.4: `control IN 0x4f -> stall`,
- *  four reads in a row). */
-function isWireStall(error: unknown): boolean {
-  for (let cause: unknown = error; cause instanceof Error; cause = cause.cause) {
-    if (cause instanceof SeekError && cause.code === 'usb/stalled') return true;
-  }
-  return false;
-}
-
 function fail(message: string): never {
   throw new SeekError('pipeline/refused', message);
 }
@@ -932,35 +923,46 @@ async function armAndDrainSlot(
   }
 }
 
-/** The active slot's double read, as TWO INDEPENDENT ARMS covering the same
- *  64 KiB block (`doubleReadWindows`: the bank window, mode 7/8/9 per
- *  detection, and the plain plan window whose address equals the bank's). Two
- *  arms = two BeginFirmwareUpgrade descriptors = two independent read
- *  budgets; the reader of the real Compact is budgeted per boot, and one arm
- *  asked twice for 64 KiB truncates mid-stream (TESTING.md secs. 23.3, 28.4).
- *  THE RULE, unchanged: the two reads must agree byte for byte. A read glitch
- *  must become a refusal, never a write — the capture is the restore source
- *  and the patch's derivation input, and a camera that cannot serve its own
- *  slot twice in a row is not a camera to write to. */
-async function readSlotTwice(
+/** The active slot's SECOND read: one fresh arm of the bank's own window
+ *  (mode 7/8/9 per detection), the whole 64 KiB through the drain path. The
+ *  FIRST read is the sweep's own captured row at the bank address — served
+ *  through the sweep's plan-window arm — so the active slot is served exactly
+ *  TWICE per boot: the sweep's row, then this arm. The reader of the real
+ *  Compact is budgeted per boot, so no block may be served a third time
+ *  (TESTING.md secs. 23.3, 28.4). */
+async function readSlotFreshArm(
   device: SeekDevice,
   bank: BankKey,
   signal: AbortSignal | undefined,
-): Promise<{ reads: readonly [Uint8Array, Uint8Array]; modes: readonly [number, number] }> {
-  const [bankEntry, planEntry] = doubleReadWindows(bank);
-  const first = await armAndDrainSlot(
+): Promise<{ read: Uint8Array; mode: number }> {
+  const bankEntry = bankWindow(bank);
+  const read = await armAndDrainSlot(
     device,
     bankEntry,
-    `the active slot’s first read (the bank window, mode ${String(bankEntry.subcmd)})`,
+    `the active slot’s fresh-arm read (the bank window, mode ${String(bankEntry.subcmd)})`,
     signal,
   );
-  const second = await armAndDrainSlot(
-    device,
-    planEntry,
-    `the active slot’s second read (the plan window, mode ${String(planEntry.subcmd)})`,
-    signal,
-  );
-  return { reads: [first, second], modes: [bankEntry.subcmd, planEntry.subcmd] };
+  return { read, mode: bankEntry.subcmd };
+}
+
+/**
+ * The expectation a slot read is sanity-checked against (the verified-arm
+ * ladder): every family on this line stores the image header VERBATIM at
+ * 0x200 — the cipher's cleartext window, the solver's own first step — so a
+ * real read parses with the image magic. A read that fails this is garbage
+ * (a swallowed arm serves blank or stale descriptor bytes — the 2026-10-02
+ * probe: a mode-3 read served blank while the immediately-following mode-7
+ * read served correctly), and the ladder re-arms ONCE, never loops.
+ */
+function slotReadIsPlausible(read: Uint8Array): boolean {
+  const header = parseImageHeader(read);
+  return header !== null && header.magic === IMAGE_MAGIC;
+}
+
+/** The spent-reader signature of a garbage slot read, for the refusal text;
+ *  a read carrying no known signature is described by its header failure. */
+function slotGarbageNoun(read: Uint8Array): string {
+  return spentReaderSignature(read) ?? 'no image header parses at 0x200';
 }
 
 /**
@@ -1075,10 +1077,11 @@ function deriveFactoryImage(
 }
 
 /** One capture-and-derive pass, against the bank `detection` names: the
- *  double read (two independent arms — see `readSlotTwice`), the
- *  expected-prefix gate (when the slot key is known), and the derivation with
- *  its gate set. The FF route's re-point runs this twice — the first pass
- *  names the build, the second captures the bank that runs. */
+ *  double read under the serve budget (the sweep's row + ONE fresh arm — the
+ *  active slot is served exactly twice per boot), the verified-arm ladder on
+ *  those reads, the expected-prefix gate (when the slot key is known), and
+ *  the derivation with its gate set. The FF route's re-point runs this twice —
+ *  the first pass names the build, the second captures the bank that runs. */
 async function captureAndDerive(
   device: SeekDevice,
   byAddress: ReadonlyMap<number, Uint8Array>,
@@ -1092,32 +1095,98 @@ async function captureAndDerive(
   capture: Uint8Array;
   slotReadShas: readonly [string, string];
   readModes: readonly [number, number];
+  byAddress: ReadonlyMap<number, Uint8Array>;
+  serveNote: string;
   derived: ReturnType<typeof deriveFactoryImage>;
 }> {
-  const captured = byAddress.get(detection.bankAddress);
-  if (captured === undefined) {
+  const sweepRow = byAddress.get(detection.bankAddress);
+  if (sweepRow === undefined) {
     fail(
       `the backup does not hold the active bank ` +
         `${detection.bankAddress.toString(16)} — the stock windows cannot serve it`,
     );
   }
-  const { reads, modes } = await readSlotTwice(device, detection.bank, signal);
-  const [capture, second] = reads;
-  const sha1 = await sha256hex(capture);
-  const sha2 = await sha256hex(second);
-  if (!equalBytes(capture, second)) {
-    fail(
-      `the two reads of the active slot disagree (sha256 ${sha1} vs ${sha2}) — a camera ` +
-        'that cannot serve its own slot twice in a row is not a camera to write to; the ' +
-        'capture is the restore source and the patch’s derivation input',
-    );
+  const [bankEntry, planEntry] = doubleReadWindows(detection.bank);
+  const { read: fresh, mode: freshMode } = await readSlotFreshArm(device, detection.bank, signal);
+
+  /* THE VERIFIED-ARM LADDER on the slot reads. `sweepRow` is the first read
+   * (the sweep's plan-window arm); `fresh` is the second (one fresh arm of
+   * the bank window). Both are sanity-checked against the header expectation;
+   * garbage is re-armed ONCE; a second consecutive garbage read refuses with
+   * the power-cycle remedy. Two plausible reads that differ stay a refusal —
+   * the byte-agreement rule is the trust anchor. */
+  let capture = sweepRow;
+  let verifiedSecond: Uint8Array = fresh;
+  let serveNote = 'both reads agree';
+  if (!slotReadIsPlausible(sweepRow)) {
+    if (!slotReadIsPlausible(fresh)) {
+      fail(
+        spentReaderRefusal(
+          `the active slot’s reads served garbage twice (${slotGarbageNoun(sweepRow)}; then ` +
+            `${slotGarbageNoun(fresh)})`,
+        ),
+      );
+    }
+    /* The flip: the sweep's arm was swallowed and the fresh arm reads a real
+     * image — the re-read is the capture, and the archive's row is repaired
+     * to it so the run directory stays self-consistent. */
+    capture = fresh;
+    serveNote =
+      'the sweep’s row served garbage and was re-verified — the fresh arm’s read is the capture';
+  } else if (!equalBytes(sweepRow, fresh)) {
+    const sha1 = await sha256hex(sweepRow);
+    const sha2 = await sha256hex(fresh);
+    if (!slotReadIsPlausible(fresh)) {
+      /* The fresh arm was swallowed: re-arm ONCE. */
+      const again = await armAndDrainSlot(
+        device,
+        bankEntry,
+        'the active slot’s re-armed read (the bank window)',
+        signal,
+      );
+      if (equalBytes(again, sweepRow)) {
+        verifiedSecond = again;
+        serveNote =
+          'the fresh arm served garbage and was re-armed once — the re-read agrees with the ' +
+          'sweep’s row';
+      } else if (!slotReadIsPlausible(again)) {
+        fail(
+          spentReaderRefusal(
+            `the active slot’s fresh arm served garbage twice (${slotGarbageNoun(fresh)}; then ` +
+              `${slotGarbageNoun(again)})`,
+          ),
+        );
+      } else {
+        fail(
+          `the two reads of the active slot disagree (sha256 ${sha1} vs ${sha2}) — a camera ` +
+            'that cannot serve its own slot twice in a row is not a camera to write to; the ' +
+            'capture is the restore source and the patch’s derivation input',
+        );
+      }
+    } else {
+      fail(
+        `the two reads of the active slot disagree (sha256 ${sha1} vs ${sha2}) — a camera ` +
+          'that cannot serve its own slot twice in a row is not a camera to write to; the ' +
+          'capture is the restore source and the patch’s derivation input',
+      );
+    }
   }
+
+  const slotReadShas: readonly [string, string] = [
+    await sha256hex(sweepRow),
+    await sha256hex(verifiedSecond),
+  ];
   reporter.log(
-    `the active slot read twice, through two arms (bank window mode ` +
-      `${String(modes[0])}, plan window mode ${String(modes[1])}): both reads agree ` +
-      `(sha256 ${sha1})`,
+    `the active slot served twice (the sweep’s plan-window row, mode ` +
+      `${String(planEntry.subcmd)}, + one fresh arm of the bank window, mode ` +
+      `${String(freshMode)}): ${serveNote} (sha256 ${slotReadShas[1]})`,
     'detail',
   );
+  /* The archive's row at the bank address is the verified capture when the
+   * sweep's own row was the swallowed one — the assembled backup must agree
+   * with the capture the run derives from and verify compares against. */
+  const archiveRows: ReadonlyMap<number, Uint8Array> =
+    capture === sweepRow ? byAddress : new Map(byAddress).set(detection.bankAddress, capture);
 
   /* The strongest keyless gate that survives, when the slot key is known
    * (the emulator's donor): the capture must be the factory image as the
@@ -1140,7 +1209,15 @@ async function captureAndDerive(
       `build ${derived.patch.buildId} (family ${derived.patch.family})`,
     'detail',
   );
-  return { detection, capture, slotReadShas: [sha1, sha2] as const, readModes: modes, derived };
+  return {
+    detection,
+    capture,
+    slotReadShas,
+    readModes: [planEntry.subcmd, freshMode] as const,
+    byAddress: archiveRows,
+    serveNote,
+    derived,
+  };
 }
 
 async function runBackupStep(
@@ -1180,6 +1257,9 @@ async function runBackupStep(
       reporter,
       signal,
     );
+    /* The archive rows may have been repaired by the verified-arm ladder (a
+     * swallowed sweep row is replaced by the verified capture). */
+    let archiveRows: ReadonlyMap<number, Uint8Array> = read2.byAddress;
     /* THE RECOVERY RE-POINT, IN-STEP. A build whose route is recovery-only
      * (the FF build) cannot run from the cfg-named bank: the 2014 bootloader
      * rejects its 0xFFFF-sum image at slots A/B and boots the recovery bank
@@ -1193,13 +1273,14 @@ async function runBackupStep(
       reporter.log(`slot re-pointed: ${repointed.verdict}`, 'detail');
       read2 = await captureAndDerive(
         device,
-        byAddress,
+        archiveRows,
         repointed,
         version,
         expectedPrefix,
         reporter,
         signal,
       );
+      archiveRows = read2.byAddress;
       didRepoint = true;
     }
     return {
@@ -1208,9 +1289,10 @@ async function runBackupStep(
       capture: read2.capture,
       slotReadShas: read2.slotReadShas,
       readModes: read2.readModes,
+      serveNote: read2.serveNote,
       derived: read2.derived,
       repointed: didRepoint,
-      assembled: assembleBackupImage(byAddress),
+      assembled: assembleBackupImage(archiveRows),
     };
   });
 
@@ -1277,9 +1359,10 @@ async function runBackupStep(
         startedAt,
         `${String(BACKUP_WINDOW_COUNT)} windows (${String(
           BACKUP_WINDOW_COUNT * WINDOW_BYTES,
-        )} B) backed up; ${read.detection.verdict}; the active slot read twice through two ` +
-          `arms (bank window mode ${String(read.readModes[0])}, plan window mode ` +
-          `${String(read.readModes[1])}), both reads agree (sha256 ${read.slotReadShas[0]}); ` +
+        )} B) backed up; ${read.detection.verdict}; the active slot served twice (the sweep’s ` +
+          `plan-window row, mode ${String(read.readModes[0])}, + one fresh arm of the bank ` +
+          `window, mode ${String(read.readModes[1])}), ${read.serveNote} ` +
+          `(sha256 ${read.slotReadShas[1]}); ` +
           'the factory plaintext derived from the ' +
           `capture (${read.derived.method}, ${String(read.derived.plain.length)} B) and gated; ` +
           `build ${patch.buildId}` +

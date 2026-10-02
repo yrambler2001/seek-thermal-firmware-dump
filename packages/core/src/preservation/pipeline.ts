@@ -86,8 +86,10 @@ import {
   BACKUP_WINDOW_COUNT,
   bankWindow,
   cfgWindow,
+  isStaleDescriptorWord,
   parseBootConfig,
   preservationWindows,
+  spentReaderRefusal,
   widenedWindow,
   BOOT_CONFIG_BYTES,
   WINDOW_BYTES,
@@ -125,6 +127,18 @@ function sleep(ms: number): Promise<void> {
  *  device's own — a device constructed without a signal still stops. */
 function assertLive(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) throw new CancelledError();
+}
+
+/** True when the error, or something it wraps, is the wire's stall answer:
+ *  both transports map a stalled endpoint to `usb/stalled`, and `drainExact`
+ *  rethrows the transport's error as `cause` — the exhausted reader's
+ *  measured signature (TESTING.md sec. 28.4: `control IN 0x4f -> stall`,
+ *  four reads in a row). */
+export function isWireStall(error: unknown): boolean {
+  for (let cause: unknown = error; cause instanceof Error; cause = cause.cause) {
+    if (cause instanceof SeekError && cause.code === 'usb/stalled') return true;
+  }
+  return false;
 }
 
 /**
@@ -206,14 +220,102 @@ export async function backupWindows(
 
 /**
  * Read the 28-byte boot-config record and name the active slot. Read-only.
+ *
+ * THE VERIFIED ARM (measured on the real Compact, 2026-10-02 probe files): a
+ * first-session arm swallow comes and goes between boots — in one fresh-boot
+ * run the mode-3 read served BLANK while the immediately-following mode-7
+ * read served correctly, and the J-Link ground truth shows a real camera's
+ * record is WRITTEN (cfg[0]=0, then the A/B addresses), so an unprogrammed
+ * 0xFF-fill record is not taken at face value. The ladder: a record that
+ * parses (cfg[0] 0, 1 or 2 written) is accepted as served; an unprogrammed
+ * fill or a stale-SRAM word is re-armed ONCE and re-read — the re-read is
+ * used when it names a record, two agreeing unprogrammed reads accept the
+ * blank verdict (a genuinely blank record), and a second consecutive garbage
+ * read refuses with the power-cycle remedy. One retry, never loops.
  */
 export async function detectActiveSlot(device: SeekDevice): Promise<SlotDetection> {
-  await device.armWindow(cfgWindow());
-  const block = await drainExact(device, BOOT_CONFIG_BYTES, 'boot-config read', {
-    retries: 3,
-    timeoutMs: 5000,
-  });
-  return parseBootConfig(block);
+  const read = async (label: string): Promise<Uint8Array> => {
+    await device.armWindow(cfgWindow());
+    try {
+      return await drainExact(device, BOOT_CONFIG_BYTES, label, {
+        retries: 3,
+        timeoutMs: 5000,
+      });
+    } catch (error) {
+      if (isWireStall(error)) {
+        throw new SeekError('pipeline/refused', spentReaderRefusal(`${label} stalled`), {
+          cause: error,
+        });
+      }
+      throw error;
+    }
+  };
+
+  const block = await read('boot-config read');
+  const shape = cfgRecordShape(block);
+  if (shape === 'written') return parseBootConfig(block);
+
+  const again = await read('boot-config read (re-armed)');
+  const againShape = cfgRecordShape(again);
+  if (againShape === 'written') {
+    const detection = parseBootConfig(again);
+    return {
+      ...detection,
+      verdict:
+        `${detection.verdict}; re-verified: the first read served ` +
+        `${shapeNoun(shape)} — re-armed once and this re-read is the record used`,
+    };
+  }
+  if (shape === 'unprogrammed' && againShape === 'unprogrammed') {
+    const detection = parseBootConfig(again);
+    return {
+      ...detection,
+      verdict:
+        `${detection.verdict}; re-verified: the record read as unprogrammed twice — re-armed ` +
+        'once, the re-read agreed, and the blank verdict stands on two agreeing reads',
+    };
+  }
+  throw new SeekError(
+    'pipeline/refused',
+    spentReaderRefusal(
+      `the boot-config read served garbage twice (${shapeNoun(shape)}, then ` +
+        `${shapeNoun(againShape)}) — no record can be read from either`,
+    ),
+  );
+}
+
+/** Which of the three known shapes a 28-byte boot-config read carries:
+ *  'written' (parses toward parseBootConfig as served), 'unprogrammed'
+ *  (0xFF-fill — suspect, verified by re-arm), 'stale' (an SRAM-shaped
+ *  selector word — suspect, verified by re-arm). */
+function cfgRecordShape(block: Uint8Array): 'written' | 'unprogrammed' | 'stale' {
+  let allBlank = true;
+  for (const byte of block) {
+    if (byte !== 0xff) {
+      allBlank = false;
+      break;
+    }
+  }
+  if (allBlank) return 'unprogrammed';
+  if (
+    isStaleDescriptorWord(
+      new DataView(block.buffer, block.byteOffset, block.byteLength).getUint32(0, true),
+    )
+  ) {
+    return 'stale';
+  }
+  return 'written';
+}
+
+function shapeNoun(shape: 'written' | 'unprogrammed' | 'stale'): string {
+  switch (shape) {
+    case 'written':
+      return 'a written record';
+    case 'unprogrammed':
+      return 'an unprogrammed 0xFF-fill record';
+    case 'stale':
+      return 'an SRAM-shaped word (the bootloader vector’s initial SP)';
+  }
 }
 
 /**

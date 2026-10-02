@@ -58,6 +58,7 @@ export {
   bankWindow,
   cfgWindow,
   doubleReadWindows,
+  isStaleDescriptorWord,
   parseBootConfig,
   planWindowAt,
   preservationWindows,

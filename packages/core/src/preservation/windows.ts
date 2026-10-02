@@ -150,6 +150,14 @@ export function spentReaderRefusal(signature: string): string {
   );
 }
 
+/** True when a boot-config word is the stale-descriptor shape: an SRAM address
+ *  (the bootloader vector's initial SP, 0x10018000 measured on the real
+ *  Compact) served where a record selector should be. */
+export function isStaleDescriptorWord(word: number): boolean {
+  const w = word >>> 0;
+  return w >= 0x10000000 && w < 0x20000000;
+}
+
 /** The widened mode-2 window entry (P3's drain). */
 export function widenedWindow(): WindowEntry {
   return {
@@ -231,7 +239,7 @@ export function parseBootConfig(block: Uint8Array): SlotDetection {
    * the boot-config read. That is a reader state, not a boot-config puzzle —
    * the refusal leads with the power-cycle remedy, never with the slot table.
    */
-  if (cfg0 >= 0x10000000 && cfg0 < 0x20000000) {
+  if (isStaleDescriptorWord(cfg0)) {
     throw new SeekError(
       'pipeline/refused',
       spentReaderRefusal(
