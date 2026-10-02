@@ -108,7 +108,7 @@ export const STAGE_CHUNK = EP0_BUF;
 export const DRAIN_RETRIES = 5;
 
 /** ResetDevice (0x59). Payload u16 0 = plain reset; a NON-zero value arms the
- *  TIMER1 exploit path, which this pipeline must never send. */
+ *  TIMER1-driven arm route, which this pipeline must never send. */
 export const RESET_OP = 0x59;
 
 /** How far past the stock 16-bit cursor wrap the patch-live probe reads. */

@@ -606,7 +606,7 @@ describe.skipIf(UNSUPPORTED !== null)(
                 await withDevice(emu, 'P1+P2 session', async (seek) => {
                   expect(await readVersion(seek)).toBe(EXPECTED_VERSION);
                   /* The reset payload this pipeline sends is u16 0 — never the
-                   * non-zero value that arms the TIMER1 exploit path. */
+                   * non-zero value that arms the TIMER1-driven arm route. */
                   expect([...resetOpPayload()]).toEqual([0, 0]);
 
                   /* ---- P1: the backup (read-only) ------------------------- */
