@@ -56,10 +56,20 @@ export function useDevice(): DeviceHandle {
   const [description, setDescription] = useState(NO_DEVICE);
   const [generation, setGeneration] = useState(0);
   const current = useRef<USBDevice | null>(null);
+  /* The unit that just dropped off the bus, as its vid/pid. This camera has
+   * no USB serial string, so vid/pid is the only identity a reconnect can be
+   * judged by — and the preserve wizard's reset (the drain step's wire-89)
+   * re-enumerates the same unit after roughly ten seconds of boot silence.
+   * A connect event is auto-adopted only when it matches what dropped (or
+   * when nothing dropped — the page-load case, where the vendor match alone
+   * decides as it always has). A different model is never adopted silently:
+   * swapping cameras is a user decision. */
+  const dropped = useRef<{ vid: number; pid: number } | null>(null);
 
   const adopt = useCallback((next: USBDevice | null, reason: string): void => {
     if (current.current === next) return;
     current.current = next;
+    if (next !== null) dropped.current = null;
     setDevice(next);
     setDescription(next === null ? reason : describeUsbDevice(next));
     setGeneration((value) => value + 1);
@@ -88,12 +98,19 @@ export function useDevice(): DeviceHandle {
     const usb = getWebUsb();
     if (usb === null) return;
     const onConnect = (event: USBConnectionEvent): void => {
-      if (current.current === null && event.device.vendorId === SEEK_VENDOR_ID) {
+      const last = dropped.current;
+      const sameShape =
+        last === null ||
+        (event.device.vendorId === last.vid && event.device.productId === last.pid);
+      if (current.current === null && event.device.vendorId === SEEK_VENDOR_ID && sameShape) {
         adopt(event.device, NO_DEVICE);
       }
     };
     const onDisconnect = (event: USBConnectionEvent): void => {
-      if (current.current === event.device) adopt(null, 'Device disconnected.');
+      if (current.current === event.device) {
+        dropped.current = { vid: event.device.vendorId, pid: event.device.productId };
+        adopt(null, 'Device disconnected.');
+      }
     };
     usb.addEventListener('connect', onConnect);
     usb.addEventListener('disconnect', onDisconnect);
@@ -127,18 +144,21 @@ export function useDevice(): DeviceHandle {
     }
   }, [adopt]);
 
-  const makeTransport = useCallback(
-    (options: TransportOptions): WebUsbTransport => {
-      if (device === null) throw new Error('no device is connected');
-      return new WebUsbTransport(asWebUsbDevice(device), {
-        recipient: options.recipient,
-        api: 'WebUSB',
-        host: typeof navigator === 'undefined' ? null : navigator.userAgent,
-        ...(options.onWarning ? { onWarning: options.onWarning } : {}),
-      });
-    },
-    [device],
-  );
+  const makeTransport = useCallback((options: TransportOptions): WebUsbTransport => {
+    /* Read through the ref, not the state: the preserve wizard's opener
+     * ladder holds this closure across a reset — the camera that
+     * re-enumerates after the ~10 s boot silence is a NEW USBDevice
+     * object, and the ladder's next attempt must open that one, not the
+     * dead object the phase started with. */
+    const held = current.current;
+    if (held === null) throw new Error('no device is connected');
+    return new WebUsbTransport(asWebUsbDevice(held), {
+      recipient: options.recipient,
+      api: 'WebUSB',
+      host: typeof navigator === 'undefined' ? null : navigator.userAgent,
+      ...(options.onWarning ? { onWarning: options.onWarning } : {}),
+    });
+  }, []);
 
   return useMemo(
     () => ({

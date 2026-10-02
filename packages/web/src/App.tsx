@@ -94,7 +94,7 @@ export function App({ support }: AppProps = {}): ReactElement {
     route === 'flash'
       ? flash.infoReporter
       : route === 'preserve'
-        ? preserve.planReporter
+        ? preserve.phaseReporters['read-build']
         : dump.reporter;
   const { testing, test } = useConnectionTest({
     runner,

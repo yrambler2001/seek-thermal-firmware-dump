@@ -1,7 +1,9 @@
 /**
  * The run-file round trip: state and checkpoints go into a ZIP, the same
  * state and the same bytes come back out — and a damaged or foreign archive
- * is refused rather than half-resumed.
+ * is refused rather than half-resumed. The version-2 state round-trips with
+ * its self-sourcing fields, and the derived factory plaintext
+ * (`preserve_image_plain.bin`) is a checkpoint like the rest.
  */
 
 import { crc32, equalBytes, utf8 } from '@seek-fw/core';
@@ -11,15 +13,22 @@ import { runFileName, type CheckpointName, type PreserveRunState } from './types
 
 function state(overrides: Partial<PreserveRunState> = {}): PreserveRunState {
   return {
-    version: 1,
+    version: 2,
     runId: 'preserve-2026-10-01T10-00-00Z',
+    imageSource: 'device',
+    slotReadShas: ['4'.repeat(64), '5'.repeat(64)],
     buildFamily: 'v1-2014',
+    buildId: 'compact-1.3.0.8-8hz',
+    buildLabel: 'Compact 1.3.0.8 (8 Hz)',
     imageSha256: '1'.repeat(64),
-    expectedVersion: '1.3.0.0',
+    expectedVersion: '1.3.0.8',
     createdAt: '2026-10-01T10:00:00.000Z',
     nextStep: 'drain',
+    stagedForm: 'plain',
+    restoreForm: 'capture-verbatim',
+    route: 'active-bank',
     steps: {
-      backup: { status: 'done', notes: '31 windows' },
+      backup: { status: 'done', notes: '31 windows; two agreeing slot reads' },
       patch: { status: 'done' },
       commit: { status: 'done', notes: 'reset sent' },
     },
@@ -38,6 +47,7 @@ function state(overrides: Partial<PreserveRunState> = {}): PreserveRunState {
       stagedLength: 0x4000,
       chunkCount: 256,
       patchedSha256: '2'.repeat(64),
+      diffCount: 10,
     },
     rawDumpSha256: '3'.repeat(64),
     ...overrides,
@@ -47,6 +57,7 @@ function state(overrides: Partial<PreserveRunState> = {}): PreserveRunState {
 const CHECKPOINTS: readonly (readonly [CheckpointName, Uint8Array])[] = [
   ['preserve_backup_windows.bin', utf8('31 windows of backup bytes')],
   ['preserve_bank_capture.bin', new Uint8Array([0xde, 0xad, 0xbe, 0xef])],
+  ['preserve_image_plain.bin', utf8('the derived factory plaintext')],
 ];
 
 interface RawEntry {
@@ -126,12 +137,21 @@ describe('the run-file round trip', () => {
     expect(parsed.extra.size).toBe(0);
   });
 
+  it('a version-2 state survives JSON.stringify, self-sourcing fields included', () => {
+    const parsed = parseRunFile(buildRunFile(state(), new Map(CHECKPOINTS)));
+    expect(parsed.state.version).toBe(2);
+    expect(parsed.state.imageSource).toBe('device');
+    expect(parsed.state.slotReadShas).toEqual(['4'.repeat(64), '5'.repeat(64)]);
+    expect(parsed.state.buildLabel).toBe('Compact 1.3.0.8 (8 Hz)');
+  });
+
   it('carries only the checkpoints that exist so far, state file first', () => {
-    const zip = buildRunFile(state(), new Map(CHECKPOINTS.slice(0, 1)));
+    const zip = buildRunFile(state(), new Map(CHECKPOINTS.slice(0, 2)));
     const entries = parseZipEntries(zip);
     expect(entries.map((entry) => entry.name)).toEqual([
       'preserve_run.json',
       'preserve_backup_windows.bin',
+      'preserve_bank_capture.bin',
     ]);
   });
 
@@ -159,9 +179,19 @@ describe('parseRunFile refusals', () => {
     expect(() => parseRunFile(zip)).toThrow(/holds no preserve_run\.json/);
   });
 
-  it('refuses a run state from another version', () => {
-    const future = { ...state(), version: 2 } as unknown as PreserveRunState;
-    expect(() => parseRunFile(buildRunFile(future, new Map()))).toThrow(/reads version 1/);
+  it('reads version 1 — the older schema still loads', () => {
+    const legacy = {
+      ...state(),
+      version: 1,
+      imageSource: undefined,
+    } as unknown as PreserveRunState;
+    const parsed = parseRunFile(buildRunFile(legacy, new Map()));
+    expect(parsed.state.version).toBe(1);
+  });
+
+  it('refuses a run state from a version the wizard does not read', () => {
+    const future = { ...state(), version: 3 } as unknown as PreserveRunState;
+    expect(() => parseRunFile(buildRunFile(future, new Map()))).toThrow(/reads version 1 and 2/);
   });
 
   it('refuses a truncated archive', () => {

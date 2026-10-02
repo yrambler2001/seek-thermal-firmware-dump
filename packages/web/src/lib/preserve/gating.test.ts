@@ -1,13 +1,15 @@
 /**
  * The gating table, walked row by row — the wizard's sync mirror of core's
- * `describeStepGate`: strict order, no re-runs of done steps, and the loud
- * `pastCommit` context on every step that concerns the patched part while the
- * commit is not on record.
+ * `describeStepGate`, regrouped at PHASE granularity: a phase's gate is the
+ * gate of every core step it will run, with the ordering preconditions the
+ * phase satisfies itself (patch's backup, drain's commit) treated as met.
+ * The loud `pastCommit` context, the danger-dialog set, and the explicit
+ * jump (`allowJump`) all live here.
  */
 
 import { describe, expect, it } from 'vitest';
-import { canRunStep } from './gating';
-import type { PreserveRunState, PreserveStepId } from './types';
+import { canRunPhase } from './gating';
+import type { PreservePhaseId, PreserveRunState } from './types';
 
 function runState(
   overrides: {
@@ -17,46 +19,52 @@ function runState(
     drain?: 'done' | 'failed';
     restore?: 'done' | 'failed';
     verify?: 'done' | 'failed';
-    withPlan?: boolean;
-    /** Default: present once the backup is done (the backup step records it). */
     detection?: boolean;
     nextStep?: PreserveRunState['nextStep'];
+    /** The FF build: the restore refuses and the route is recovery-only. */
+    restoreNone?: boolean;
+    /** A cipher family: the restore stages the derived plaintext. */
+    ciphered?: boolean;
   } = {},
 ): PreserveRunState {
   const step = (status: 'done' | 'failed' | undefined) =>
     status === undefined ? undefined : { status };
   const detection = overrides.detection ?? (overrides.backup === 'done' ? true : false);
   return {
-    version: 1,
+    version: 2,
     runId: 'preserve-test',
+    imageSource: 'device',
     buildFamily: 'v1-2014',
+    buildId: 'compact-1.3.0.8-8hz',
+    buildLabel: 'Compact 1.3.0.8 (8 Hz)',
     imageSha256: 'a'.repeat(64),
-    expectedVersion: '1.3.0.0',
+    expectedVersion: '1.3.0.8',
     createdAt: '2026-10-01T00:00:00Z',
     nextStep: overrides.nextStep ?? 'backup',
-    patch:
-      overrides.withPlan === false
-        ? undefined
-        : {
-            sites: [],
-            rebalanceWord: 0x30006240,
-            stagedLength: 0x4000,
-            chunkCount: 256,
-            patchedSha256: 'b'.repeat(64),
-          },
+    stagedForm: overrides.ciphered === true ? 'xor-ks0' : 'plain',
+    restoreForm: overrides.restoreNone === true ? 'none' : 'capture-verbatim',
+    route: overrides.restoreNone === true ? 'recovery-only' : 'active-bank',
     ...(detection
       ? {
           detection: {
             cfgHex: 'ff',
             cfg0: 0,
             blank: true,
-            bank: 'a',
-            bankAddress: 0x14050000,
-            bankMode: 7,
-            verdict: 'blank -> bank A',
+            bank: overrides.restoreNone === true ? 'r' : 'a',
+            bankAddress: overrides.restoreNone === true ? 0x14070000 : 0x14050000,
+            bankMode: overrides.restoreNone === true ? 9 : 7,
+            verdict: 'test',
           },
         }
       : {}),
+    patch: {
+      sites: [],
+      rebalanceWord: 0x30006240,
+      stagedLength: 0x4000,
+      chunkCount: 256,
+      patchedSha256: 'b'.repeat(64),
+      diffCount: 10,
+    },
     steps: {
       backup: step(overrides.backup),
       patch: step(overrides.patch),
@@ -68,95 +76,79 @@ function runState(
   } as unknown as PreserveRunState;
 }
 
-const NOTHING = () => false;
-const WITH_CAPTURE = (name: string): boolean =>
-  name === 'preserve_bank_capture.bin' || name === 'preserve_backup_windows.bin';
-const WITH_PLAIN = true;
+const NOTHING = (): boolean => false;
+const HAS_ALL = (): boolean => true;
 
 function gate(
   state: PreserveRunState | null,
-  step: PreserveStepId,
-  has: (name: string) => boolean = NOTHING,
-  hasPlain = WITH_PLAIN,
+  phase: PreservePhaseId,
+  has: (name: string) => boolean = HAS_ALL,
 ) {
-  return canRunStep({ state, step, has, hasPlain });
+  return canRunPhase({ state, phase, has });
 }
 
-describe('canRunStep — the run’s gate, as the buttons show it', () => {
-  it('refuses every step before a run exists', () => {
-    for (const step of ['backup', 'patch', 'commit', 'drain', 'restore', 'verify'] as const) {
-      const g = gate(null, step);
-      expect(g.ok, step).toBe(false);
-      expect(g.pastCommit, step).toBe(false);
+const ALL_PHASES: readonly PreservePhaseId[] = ['read-build', 'patch-dump', 'restore-verify'];
+
+describe('canRunPhase — the run’s gate, as the buttons show it', () => {
+  it('before a run exists only the first phase is armed — it creates the run', () => {
+    expect(gate(null, 'read-build').ok).toBe(true);
+    for (const phase of ['patch-dump', 'restore-verify'] as const) {
+      const g = gate(null, phase);
+      expect(g.ok, phase).toBe(false);
+      expect(g.missing[0], phase).toContain('no run is active');
+      expect(g.pastCommit, phase).toBe(false);
+      expect(g.jumpable, phase).toBe(false);
     }
   });
 
-  it('a fresh run: only the backup is armed, and only with the image attached', () => {
+  it('a fresh run: phase ① armed; the later phases wait, in the run’s normal order', () => {
     const state = runState();
-    expect(gate(state, 'backup')).toMatchObject({ ok: true, pastCommit: false });
-    expect(gate(state, 'backup', NOTHING, false).ok).toBe(false);
-    for (const step of ['patch', 'commit', 'drain', 'restore', 'verify'] as const) {
-      expect(gate(state, step).ok, step).toBe(false);
-    }
-    /* patch waits for the backup — core's order, stricter than the plan's */
-    expect(gate(state, 'patch').missing).toEqual(['the flash backup (run the backup step first)']);
-    expect(gate(state, 'drain').pastCommit).toBe(true);
+    const first = gate(state, 'read-build');
+    expect(first).toMatchObject({ ok: true, pastCommit: false, startStep: 'backup' });
+
+    const second = gate(state, 'patch-dump');
+    expect(second.ok).toBe(false);
+    expect(second.pastCommit).toBe(false); /* a fresh run is not the anomalous case */
+    expect(second.missing).toEqual(['the flash backup', 'the patch step', 'the slot detection']);
+
+    const third = gate(state, 'restore-verify');
+    expect(third.ok).toBe(false);
+    expect(third.pastCommit).toBe(false);
+    expect(third.missing[0]).toContain('the commit');
+    expect(third.jumpable).toBe(false); /* detection and the patch summary are missing too */
   });
 
-  it('after the backup: the patch arms, the commit waits for it', () => {
-    const state = runState({ backup: 'done', nextStep: 'patch' });
-    expect(gate(state, 'backup').ok).toBe(false); /* a done run never re-runs backup */
-    expect(gate(state, 'backup').missing[0]).toContain('already done');
-    expect(gate(state, 'patch')).toMatchObject({ ok: true, pastCommit: false });
-    expect(gate(state, 'patch', NOTHING, false).ok).toBe(false);
-    expect(gate(state, 'commit', WITH_CAPTURE).ok).toBe(false);
-    expect(gate(state, 'commit', WITH_CAPTURE).missing).toEqual(['the patch step']);
+  it('after phase ①: phase ② arms, phase ③ is jump-only and loud', () => {
+    const state = runState({ backup: 'done', patch: 'done', nextStep: 'commit' });
+    expect(gate(state, 'read-build').missing[0]).toContain('already done');
+
+    const second = gate(state, 'patch-dump');
+    expect(second).toMatchObject({ ok: true, confirm: true, startStep: 'commit', jumpable: false });
+    expect(second.pastCommit).toBe(false);
+
+    const third = gate(state, 'restore-verify');
+    expect(third.ok).toBe(false);
+    expect(third.pastCommit).toBe(true);
+    expect(third.jumpable).toBe(true);
+    expect(third.missing).toEqual(['the commit (run or resume at it first)']);
+    expect(third.jumpStartStep).toBe('restore');
   });
 
-  it('the commit gate reads the whole checklist, in core’s order', () => {
-    const state = runState({
-      backup: 'done',
-      patch: 'done',
-      detection: false,
-      nextStep: 'commit',
-    });
-    const g = gate(state, 'commit', NOTHING);
-    expect(g.missing).toEqual([
-      'the slot detection',
-      'the backup windows file',
-      'the bank capture',
-    ]);
-    expect(gate(state, 'commit', WITH_CAPTURE).missing).toEqual(['the slot detection']);
-  });
-
-  it('a done commit disarms nothing but stops warning the reads', () => {
+  it('after the commit: phase ② starts at the drain (no dialog needed for it), phase ③ arms', () => {
     const state = runState({
       backup: 'done',
       patch: 'done',
       commit: 'done',
       nextStep: 'drain',
     });
-    expect(gate(state, 'drain', WITH_CAPTURE)).toMatchObject({ ok: true, pastCommit: false });
-    expect(gate(state, 'restore', WITH_CAPTURE)).toMatchObject({ ok: true, pastCommit: false });
-    expect(gate(state, 'verify').ok).toBe(false);
+    const second = gate(state, 'patch-dump');
+    expect(second).toMatchObject({ ok: true, startStep: 'drain' });
+    expect(second.confirm).toBe(false); /* only the drain is left, and the drain reads */
+    const third = gate(state, 'restore-verify');
+    expect(third).toMatchObject({ ok: true, confirm: true, pastCommit: false });
   });
 
-  it('a FAILED commit is not a recorded commit: the reads stay shut and loud', () => {
-    const state = runState({
-      backup: 'done',
-      patch: 'done',
-      commit: 'failed',
-      nextStep: 'commit',
-    });
-    const drain = gate(state, 'drain', WITH_CAPTURE);
-    expect(drain.ok).toBe(false);
-    expect(drain.pastCommit).toBe(true);
-    expect(drain.missing[0]).toContain('the commit');
-    expect(gate(state, 'restore').pastCommit).toBe(true);
-    expect(gate(state, 'verify').pastCommit).toBe(true);
-  });
-
-  it('each stage arms exactly the next one', () => {
+  it('each phase arms exactly the next one', () => {
     const drained = runState({
       backup: 'done',
       patch: 'done',
@@ -164,8 +156,8 @@ describe('canRunStep — the run’s gate, as the buttons show it', () => {
       drain: 'done',
       nextStep: 'restore',
     });
-    expect(gate(drained, 'restore', WITH_CAPTURE)).toMatchObject({ ok: true });
-    expect(gate(drained, 'verify').ok).toBe(false);
+    expect(gate(drained, 'patch-dump').missing[0]).toContain('already done');
+    expect(gate(drained, 'restore-verify')).toMatchObject({ ok: true, startStep: 'restore' });
 
     const restored = runState({
       backup: 'done',
@@ -175,10 +167,9 @@ describe('canRunStep — the run’s gate, as the buttons show it', () => {
       restore: 'done',
       nextStep: 'verify',
     });
-    expect(gate(restored, 'verify', WITH_CAPTURE)).toMatchObject({
-      ok: true,
-      pastCommit: false,
-    });
+    const third = gate(restored, 'restore-verify');
+    expect(third).toMatchObject({ ok: true, startStep: 'verify' });
+    expect(third.confirm).toBe(false); /* only the verify read is left */
   });
 
   it('a done run refuses everything', () => {
@@ -191,49 +182,118 @@ describe('canRunStep — the run’s gate, as the buttons show it', () => {
       verify: 'done',
       nextStep: 'done',
     });
-    for (const step of ['backup', 'patch', 'commit', 'drain', 'restore', 'verify'] as const) {
-      const g = gate(state, step, WITH_CAPTURE);
-      expect(g.ok, step).toBe(false);
-      expect(g.missing[0], step).toContain('this run is done');
+    for (const phase of ALL_PHASES) {
+      const g = gate(state, phase);
+      expect(g.ok, phase).toBe(false);
+      expect(g.jumpable, phase).toBe(false);
+      expect(g.missing[0], phase).toContain('this run is done');
     }
+  });
+
+  it('missing checkpoints keep the phase dark, in core’s order, without repeats', () => {
+    const state = runState({ backup: 'done', patch: 'done', nextStep: 'commit' });
+    const g = gate(state, 'patch-dump', NOTHING);
+    expect(g.ok).toBe(false);
+    expect(g.jumpable).toBe(false); /* a jump cannot fabricate the capture */
+    /* The capture is wanted by both the commit and the drain; named once. */
+    expect(g.missing).toEqual(['the backup windows file', 'the bank capture']);
   });
 });
 
-describe('canRunStep — the past-commit context', () => {
-  it('marks drain, restore and verify while the commit is not on record', () => {
-    const state = runState();
-    for (const step of ['drain', 'restore', 'verify'] as const) {
-      expect(gate(state, step).pastCommit, step).toBe(true);
-    }
+describe('canRunPhase — the past-commit context and the jump', () => {
+  it('a FAILED commit offers both ways forward: the re-run and the jump past it', () => {
+    const state = runState({
+      backup: 'done',
+      patch: 'done',
+      commit: 'failed',
+      nextStep: 'commit',
+    });
+    const second = gate(state, 'patch-dump');
+    /* The normal run stays available — the commit's own pre-check sorts
+     * landed from not-landed. */
+    expect(second.ok).toBe(true);
+    expect(second.pastCommit).toBe(true);
+    expect(second.jumpable).toBe(true);
+    expect(second.startStep).toBe('commit');
+    expect(second.jumpStartStep).toBe('drain');
+    expect(second.confirm).toBe(true);
+    /* And phase ③ is jump-only, as after any commit-less state. */
+    const third = gate(state, 'restore-verify');
+    expect(third.ok).toBe(false);
+    expect(third.jumpable).toBe(true);
+    expect(third.pastCommit).toBe(true);
   });
 
-  it('never marks the steps up to and including the commit, or a done run', () => {
-    const state = runState();
-    for (const step of ['backup', 'patch', 'commit'] as const) {
-      expect(gate(state, step).pastCommit, step).toBe(false);
-    }
-    const done = runState({
+  it('the jump refuses when anything beyond the ordering gate is missing', () => {
+    const state = runState({ backup: 'done', patch: 'done', nextStep: 'commit' });
+    const g = gate(state, 'restore-verify', NOTHING);
+    expect(g.ok).toBe(false);
+    expect(g.jumpable).toBe(false); /* the capture is gone; allowJump cannot help */
+    expect(g.missing.length).toBeGreaterThan(1);
+  });
+
+  it('the FF build’s restore refusal is a hard stop, not a jump', () => {
+    const state = runState({
       backup: 'done',
       patch: 'done',
       commit: 'done',
       drain: 'done',
-      restore: 'done',
-      verify: 'done',
-      nextStep: 'done',
+      restoreNone: true,
+      nextStep: 'restore',
     });
-    for (const step of ['drain', 'restore', 'verify'] as const) {
-      expect(gate(done, step).pastCommit, step).toBe(false);
+    const third = gate(state, 'restore-verify');
+    expect(third.ok).toBe(false);
+    expect(third.jumpable).toBe(false);
+    expect(third.missing.join(' ')).toContain('restore refuses');
+  });
+
+  it('a cipher family’s restore wants the derived plaintext artifact', () => {
+    const base = {
+      backup: 'done',
+      patch: 'done',
+      commit: 'done',
+      drain: 'done',
+      ciphered: true,
+      nextStep: 'restore',
+    } as const;
+    const without = gate(
+      runState(base),
+      'restore-verify',
+      (name) => name !== 'preserve_image_plain.bin',
+    );
+    expect(without.ok).toBe(false);
+    expect(without.missing.join(' ')).toContain('preserve_image_plain.bin');
+
+    const withPlain = gate(runState(base), 'restore-verify');
+    expect(withPlain.ok).toBe(true);
+  });
+
+  it('never flags pastCommit before the run stands past phase ①', () => {
+    const fresh = runState();
+    for (const phase of ALL_PHASES) {
+      expect(gate(fresh, phase).pastCommit, phase).toBe(false);
     }
   });
 });
 
-describe('canRunStep — the danger dialog', () => {
-  it('asks before the two writes, and never before a read', () => {
+describe('canRunPhase — the danger dialog', () => {
+  it('asks before the write phases, and never before the read phase', () => {
     const fresh = runState();
-    expect(gate(fresh, 'commit').confirm).toBe(true);
-    expect(gate(fresh, 'restore').confirm).toBe(true);
-    for (const step of ['backup', 'patch', 'drain', 'verify'] as const) {
-      expect(gate(fresh, step).confirm, step).toBe(false);
-    }
+    expect(gate(fresh, 'read-build').confirm).toBe(false);
+    /* The flag is about the phase's pending steps, not about whether the
+     * gate arms them — a refused ② still contains the commit. */
+    expect(gate(fresh, 'patch-dump').confirm).toBe(true);
+    expect(gate(fresh, 'restore-verify').confirm).toBe(true);
+    const afterFirst = runState({ backup: 'done', patch: 'done', nextStep: 'commit' });
+    expect(gate(afterFirst, 'patch-dump').confirm).toBe(true);
+    expect(gate(afterFirst, 'restore-verify').confirm).toBe(true);
+    /* A resumed ② at the drain (the write already landed) runs without one. */
+    const atDrain = runState({
+      backup: 'done',
+      patch: 'done',
+      commit: 'done',
+      nextStep: 'drain',
+    });
+    expect(gate(atDrain, 'patch-dump').confirm).toBe(false);
   });
 });

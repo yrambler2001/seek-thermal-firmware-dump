@@ -1,8 +1,9 @@
 /**
  * The adapter against the real core steps API, offline paths only:
- * `createPreserveRun`'s plan from a synthetic v1 plaintext, the patch step —
- * the one step with no camera — and the refusals the loader's answers
- * produce. The camera steps are the emulator suite's business
+ * `createPreserveRun` — the empty, self-sourcing shell (no image argument,
+ * because the image always derives from the camera) — and the patch step,
+ * the one step with no camera, driven off the DERIVED plaintext served as a
+ * run artifact. The camera steps are the emulator suite's business
  * (packages/core/test/preservation); here they are only checked to refuse
  * before anything opens a session.
  */
@@ -13,22 +14,16 @@ import {
   SeekError,
   V1_2014_PATCH_SITES,
   buildV1Patch,
+  equalBytes,
   sha256hex,
   silentReporter,
   wordSum,
   type SessionOpener,
 } from '@seek-fw/core';
 import { describe, expect, it } from 'vitest';
-import {
-  RESERVED_PLAIN_NAME,
-  buildPatchSummary,
-  createPreserveRun,
-  isCancelledStep,
-  plainLoader,
-  runPreserveStep,
-} from './client';
+import { artifactLoader, createPreserveRun, isCancelledStep, runPreserveStep } from './client';
 import { buildRunFile, parseRunFile } from './run-file';
-import type { CheckpointName, PreserveRunState } from './types';
+import { PRESERVE_PLAIN_NAME, type CheckpointName, type PreserveRunState } from './types';
 
 /** A synthetic factory plaintext that carries the four patch sites — the
  * same recipe core's patch.test.ts uses, with a header version word. */
@@ -61,68 +56,45 @@ const NO_CAMERA: SessionOpener = {
   close: () => Promise.resolve(),
 };
 
-function bytesOf(bytes: Uint8Array | undefined): Uint8Array {
-  return bytes ?? new Uint8Array();
-}
-
-function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
-
-describe('createPreserveRun', () => {
-  it('builds the plan offline: version from the header, no steps, next backup', async () => {
-    const image = syntheticPlain();
-    const created = await createPreserveRun(image, {
+describe('createPreserveRun — the empty, self-sourcing shell', () => {
+  it('takes no image: schema 2, the image source is the device, next step backup', async () => {
+    const created = await createPreserveRun({
       runId: 'preserve-test',
       now: (): Date => new Date('2026-10-01T10:00:00Z'),
     });
 
-    expect(created.state.version).toBe(1);
+    expect(created.state.version).toBe(2);
     expect(created.state.runId).toBe('preserve-test');
-    expect(created.state.buildFamily).toBe('v1-2014');
-    expect(created.state.expectedVersion).toBe('1.3.0.0');
+    expect(created.state.imageSource).toBe('device');
     expect(created.state.nextStep).toBe('backup');
     expect(created.state.steps).toEqual({});
-    /* The patch itself rides beside the state; the run state carries the
-     * summary only after the patch step records it. */
+    /* The build fields fill in when the backup step derives the image. */
+    expect(created.state.buildFamily).toBeUndefined();
+    expect(created.state.imageSha256).toBeUndefined();
+    expect(created.state.expectedVersion).toBeUndefined();
+    /* There is no patch anything on a fresh run — nothing is built before
+     * the camera speaks. */
     expect(created.state.patch).toBeUndefined();
-    expect(created.patch.diffOffsets.length).toBeGreaterThan(0);
+    expect('patch' in created).toBe(false);
   });
 
-  it('the plan screen summary mirrors what the patch step will record', async () => {
-    const image = syntheticPlain();
-    const created = await createPreserveRun(image);
-    const summary = await buildPatchSummary(created.patch);
-
-    expect(summary.sites).toHaveLength(V1_2014_PATCH_SITES.length);
-    expect(summary.rebalanceWord).toBe(created.patch.rebalanceWord);
-    expect(summary.stagedLength).toBe(image.length);
-    expect(summary.chunkCount).toBe(Math.ceil(image.length / 64));
-    /* The instruction sites, in the builder's order — the rebalance word is
-     * carried beside them, not as a fifth site. */
-    expect(summary.sites.map((site) => site.offset)).toEqual(
-      V1_2014_PATCH_SITES.map((site) => site.offset),
-    );
-    /* The recorded sha is the patched plaintext's — the patch step
-     * re-derives and re-checks exactly this from the loader's image. */
-    await expect(sha256hex(buildV1Patch(image).patched)).resolves.toBe(summary.patchedSha256);
-  });
-
-  it('refuses an image that is not a balanced v1 plaintext', async () => {
-    const broken = syntheticPlain();
-    broken[0x1000] = (broken[0x1000] ?? 0) ^ 0xff; /* the word sum is no longer 0 */
-    await expect(createPreserveRun(broken)).rejects.toThrow(SeekError);
+  it('the form’s chunk rides in as the drain ask size', async () => {
+    const created = await createPreserveRun({ drainChunk: 64 });
+    expect(created.state.drainChunk).toBe(64);
   });
 });
 
-/** A checkpoint doc as it stands after the backup step — what the patch
- * step's gate demands before it will run offline. */
-function stateAfterBackup(state: PreserveRunState): PreserveRunState {
+/** A checkpoint doc as it stands after the backup step — exactly what the
+ *  real step records, including the sha the derived plaintext is checked
+ *  against on every later load. */
+async function stateAfterBackup(plain: Uint8Array): Promise<PreserveRunState> {
+  const created = await createPreserveRun();
   return {
-    ...state,
+    ...created.state,
     nextStep: 'patch',
+    buildFamily: 'v1-2014',
+    imageSha256: await sha256hex(plain),
+    expectedVersion: '1.3.0.0',
     detection: {
       cfgHex: 'ff',
       cfg0: 0,
@@ -138,87 +110,98 @@ function stateAfterBackup(state: PreserveRunState): PreserveRunState {
         startedAt: '2026-10-01T10:00:01Z',
         finishedAt: '2026-10-01T10:00:20Z',
         notes: 'test fixture',
+        artifactShas: {
+          [PRESERVE_PLAIN_NAME]: await sha256hex(plain),
+          'preserve_bank_capture.bin': 'c'.repeat(64),
+        },
       },
     },
   } as unknown as PreserveRunState;
 }
 
-describe('runPreserveStep — the patch step, offline', () => {
+describe('runPreserveStep — the patch step, offline, off the derived artifact', () => {
   it('files the patched plaintext and advances the run to commit', async () => {
-    const image = syntheticPlain();
-    const created = await createPreserveRun(image);
-    const loader = plainLoader(new Map(), new Map(), { bytes: image });
-    const state = stateAfterBackup(created.state);
+    const plain = syntheticPlain();
+    const state = await stateAfterBackup(plain);
+    const loader = artifactLoader(new Map([[PRESERVE_PLAIN_NAME, plain]]), new Map());
 
     const outcome = await runPreserveStep('patch', NO_CAMERA, state, loader, silentReporter);
     expect(outcome.artifacts).toHaveLength(1);
     expect(outcome.artifacts[0]?.name).toBe('preserve_patch_plain_patched.bin');
-    expect(equalBytes(bytesOf(outcome.artifacts[0]?.data), buildV1Patch(image).patched)).toBe(true);
+    expect(
+      equalBytes(outcome.artifacts[0]?.data ?? new Uint8Array(), buildV1Patch(plain).patched),
+    ).toBe(true);
     expect(outcome.state.nextStep).toBe('commit');
     expect(outcome.state.steps.patch?.status).toBe('done');
     expect(outcome.state.patch?.patchedSha256).toBe(
       outcome.state.steps.patch?.artifactShas?.['preserve_patch_plain_patched.bin'],
     );
+    /* The enumerated change, recorded for the plan screen. */
+    expect(outcome.state.patch?.diffCount).toBeGreaterThan(0);
   });
 
-  it('a checkpoint loader serves the run file’s bytes back, by name', async () => {
-    const image = syntheticPlain();
-    const created = await createPreserveRun(image);
-    const patched = buildV1Patch(image).patched;
-    /* A resumed run: the patch step's file came back inside the run ZIP. */
+  it('a run zip carries the derived plaintext, and the loader serves it back by name', async () => {
+    const plain = syntheticPlain();
+    const state = await stateAfterBackup(plain);
+    const patched = buildV1Patch(plain).patched;
+    /* A resumed run: the backup step's artifacts came back inside the run ZIP. */
     const zip = buildRunFile(
-      created.state,
-      new Map([['preserve_patch_plain_patched.bin', patched] as [CheckpointName, Uint8Array]]),
+      state,
+      new Map<CheckpointName, Uint8Array>([
+        [PRESERVE_PLAIN_NAME, plain],
+        ['preserve_patch_plain_patched.bin', patched],
+      ]),
     );
     const parsed = parseRunFile(zip);
-    const loader = plainLoader(parsed.checkpoints, parsed.extra, null);
-    await expect(loader('preserve_patch_plain_patched.bin')).resolves.not.toBeNull();
-    await expect(loader(RESERVED_PLAIN_NAME)).resolves.toBeNull();
+    expect(parsed.checkpoints.has(PRESERVE_PLAIN_NAME)).toBe(true);
+    const loader = artifactLoader(parsed.checkpoints, parsed.extra);
+    await expect(loader(PRESERVE_PLAIN_NAME)).resolves.toEqual(plain);
+    await expect(loader('preserve_patch_plain_patched.bin')).resolves.toEqual(patched);
   });
 
-  it('refuses when the plaintext is not attached', async () => {
-    const image = syntheticPlain();
-    const created = await createPreserveRun(image);
+  it('refuses when the derived plaintext artifact is not in the run', async () => {
+    const plain = syntheticPlain();
+    const state = await stateAfterBackup(plain);
     await expect(
       runPreserveStep(
         'patch',
         NO_CAMERA,
-        stateAfterBackup(created.state),
-        plainLoader(new Map(), new Map(), null),
+        state,
+        artifactLoader(new Map(), new Map()),
         silentReporter,
       ),
     ).rejects.toThrow(/factory plaintext/);
   });
 
-  it('refuses a plaintext that is not the run’s image', async () => {
-    const image = syntheticPlain();
-    const created = await createPreserveRun(image);
-    /* Different bytes — the sha check fires before anything is derived. */
-    const other = syntheticPlain();
-    other[0x1000] = (other[0x1000] ?? 0) ^ 0xff;
+  it('refuses a plaintext artifact that changed since the backup recorded it', async () => {
+    const plain = syntheticPlain();
+    const state = await stateAfterBackup(plain);
+    /* Different bytes under the same name — the sha check fires before
+     * anything is derived. */
+    const tampered = syntheticPlain();
+    tampered[0x1000] = (tampered[0x1000] ?? 0) ^ 0xff;
     await expect(
       runPreserveStep(
         'patch',
         NO_CAMERA,
-        stateAfterBackup(created.state),
-        plainLoader(new Map(), new Map(), { bytes: other }),
+        state,
+        artifactLoader(new Map([[PRESERVE_PLAIN_NAME, tampered]]), new Map()),
         silentReporter,
       ),
-    ).rejects.toThrow(/not the one this run was created from/);
+    ).rejects.toThrow(/changed since the backup step recorded it/);
   });
 
   it('the commit refuses at the gate before any session opens on a fresh run', async () => {
-    const image = syntheticPlain();
-    const created = await createPreserveRun(image);
+    const created = await createPreserveRun();
     await expect(
       runPreserveStep(
         'commit',
         NO_CAMERA,
         created.state,
-        plainLoader(new Map(), new Map(), { bytes: image }),
+        artifactLoader(new Map(), new Map()),
         silentReporter,
       ),
-    ).rejects.toThrow(/backup/);
+    ).rejects.toThrow(SeekError);
   });
 });
 

@@ -249,9 +249,11 @@ function hex8(word: number): string {
 }
 
 /**
- * Parses a run ZIP: the state file must be present and must be a version-1
- * run; known checkpoints come back by name, unknown files ride along in
- * `extra` so a later save keeps them.
+ * Parses a run ZIP: the state file must be present and must be a version the
+ * wizard reads — 2 (the current schema, whose image derives from the camera)
+ * or 1 (the older schema, whose steps still work off the same artifacts when
+ * they carry the derived plaintext). Known checkpoints come back by name,
+ * unknown files ride along in `extra` so a later save keeps them.
  */
 export function parseRunFile(zip: Uint8Array): PreserveRunFile {
   const entries = parseZipEntries(zip);
@@ -276,9 +278,9 @@ export function parseRunFile(zip: Uint8Array): PreserveRunFile {
   /* The version is checked on the untyped parse, because the typed shape
    * cannot hold a foreign version — that is exactly what it must refuse. */
   const version: unknown = (raw as { version?: unknown }).version;
-  if (version !== 1) {
+  if (version !== 1 && version !== 2) {
     throw new Error(
-      `${RUN_STATE_FILE} says version ${String(version)}; this wizard reads version 1. ` +
+      `${RUN_STATE_FILE} says version ${String(version)}; this wizard reads version 1 and 2. ` +
         'Update the app (or re-run the run) to a matching version.',
     );
   }
