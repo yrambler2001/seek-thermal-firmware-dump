@@ -19,9 +19,9 @@
  * earns its place:
  *  - the state document round-trips through JSON (it IS the checkpoint);
  *  - the derivation gates refuse, with their reason: two reads that
- *    disagree, a ciphered slot the solver cannot open yet, a camera whose
- *    version contradicts the slot image's header, and an already-patched
- *    bank (the before-byte gate on the DERIVED image);
+ *    disagree, a scrambled slot whose verbatim header window no family can
+ *    read, a camera whose version contradicts the slot image's header, and
+ *    an already-patched bank (the before-byte gate on the DERIVED image);
  *  - every step-ordering gate refuses, with its reason (a --from-step must
  *    never run against a torn run directory);
  *  - a completed commit moves nextStep to drain, and a re-run of commit
@@ -342,12 +342,15 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
   });
 
   it(
-    'refuses a ciphered slot with the solver reason — no guess, no write',
+    'refuses a scrambled slot at the derivation — no guess, no write',
     { timeout: 120_000 },
     async () => {
-      /* The bank holds the image XOR 0x5A: the header window is ciphered too,
-       * so the identity path refuses on the magic, and the cipher families'
-       * solvers are the only way in — which this build does not carry yet. */
+      /* The bank holds the image XOR 0x5A over EVERY byte, the header window
+       * included: no bootloader could read the length from it, so the
+       * identity path refuses on the magic and both cipher families refuse
+       * at their first gate (a real at-rest capture stores that window in
+       * clear — these bytes are not one). The run refuses; nothing is
+       * recorded, nothing written. */
       const ciphered = new Uint8Array(plain);
       for (let i = 0; i < ciphered.length; i++) ciphered[i] = (ciphered[i] ?? 0) ^ 0x5a;
       const camera = v1Camera(ciphered);
@@ -358,9 +361,9 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
       );
       expect(error).toBeInstanceOf(SeekError);
       expect((error as Error).message).toMatch(/do not yield the factory plaintext/);
-      expect((error as Error).message).toMatch(/keystream solver is not implemented/);
       expect((error as Error).message).toMatch(/v1-2014-ff/);
       expect((error as Error).message).toMatch(/compact-2016/);
+      expect((error as Error).message).toMatch(/verbatim window itself is scrambled/);
     },
   );
 

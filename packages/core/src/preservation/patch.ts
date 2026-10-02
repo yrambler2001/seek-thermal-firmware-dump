@@ -243,18 +243,27 @@ export function keyWordsOf(keyHex: string): [number, number, number, number] {
  */
 
 /** `14060000 14050000 14020000 14000000` — the head of the mode->window pool
- *  ladder every build here carries in BeginFirmwareUpgrade's literal pool. */
-const NEEDLE_LADDER = '00000614000005140000021400000014';
+ *  ladder every build here carries in BeginFirmwareUpgrade's literal pool.
+ *  Exported for the cipher solvers (`solve.ts`), whose post-decrypt structural
+ *  gates read the same RE-recorded shapes — one copy, so they cannot drift. */
+export const NEEDLE_LADDER = '00000614000005140000021400000014';
 /** The 2014-chain widen tail: `mov.w r3,#0x10000` feeding the d4 (+4) and
  *  dc (+12) stores (1.3.0.8, both variants). */
-const NEEDLE_WIDEN_2014 = '4ff480336360e360';
+export const NEEDLE_WIDEN_2014 = '4ff480336360e360';
 /** The 2016-chain widen tail: `str r3,[r4,#20]` / `mov.w r3,#0x10000` /
  *  `str r3,[r4,#8]` (d4) / `str r3,[r4,#16]` (dc) — also the 1.3.0.0
  *  generation's tail. */
-const NEEDLE_WIDEN_2016 = '63614ff48033a3602361';
+export const NEEDLE_WIDEN_2016 = '63614ff48033a3602361';
 /** The mode-2 guard: `cmp r3,#2` / `bne.n +6` / `movs r0,#4` (the refusal's
  *  first move). The patched byte is the `06 d1` at shape + 2. */
-const NEEDLE_GUARD = '022b06d10420';
+export const NEEDLE_GUARD = '022b06d10420';
+/** The wire-82 token form's 16-byte constant — the ONE constant across the
+ *  whole line (doc 33 sec. 11; doc 1032 sec. 3), carried by every build the
+ *  table and the solvers name. */
+export const NEEDLE_TOKEN_82 = '5316103180dd00b74af9e417c594bed4';
+/** How far before the window ladder the Begin bodies sit (measured spans:
+ *  guard->ladder 0x154, widen->ladder 0x4A..0x4C). */
+export const CODE_WINDOW_BEFORE_LADDER = 0x800;
 /** The Begin arm-tail ending: `mov r0,r5` / `pop {r4,r5,r6,pc}` — the return
  *  pair the tail's refresh call precedes. (The call's own bytes move with its
  *  call site, so the SHAPE is the tail; `tailHookCall` reads the BL before it
@@ -262,13 +271,10 @@ const NEEDLE_GUARD = '022b06d10420';
 const NEEDLE_TAIL = '284670bd';
 /** `bx lr` — the stub callee that makes a tail hook harmless. */
 const NEEDLE_BX_LR = '7047';
+
 /** The FSM/op-mode struct 0x10003028: the one the 1.0.3.2 arm-tail refresh
  *  drives, whose state-2 dispatch wedges an accepting arm. */
 const HOOK_WEDGE_STRUCT = 0x10003028;
-
-/** How far before the window ladder the Begin bodies sit (measured spans:
- *  guard->ladder 0x154, widen->ladder 0x4A..0x4C). */
-const CODE_WINDOW_BEFORE_LADDER = 0x800;
 
 function occurrences(plain: Uint8Array, hexNeedle: string, from = 0, to = plain.length): number[] {
   const needle = hexToBytes(hexNeedle);
@@ -442,7 +448,11 @@ function tailHookSite(plain: Uint8Array, ladder: number): PatchSite | null {
 
 /* ---- the key blocks, found by value ---------------------------------------- */
 
-const KEY_PAIRS = {
+/** The build line's key pairs, by value. Shared with the cipher solvers
+ *  (`solve.ts`): a decrypted capture vouches for itself by carrying exactly
+ *  one of these pairs, and the at-rest stream is then recomputed from the
+ *  FOUND blocks. Exported so the pair table stays single-sourced. */
+export const KEY_PAIRS = {
   /** 1.3.0.8-FF (the R16-shaped 0xFFFF build): ks0/ksD seeds. */
   ff1308: {
     block0: '5d7984797c47eb9354fa35898ab11701',
@@ -453,7 +463,8 @@ const KEY_PAIRS = {
     block0: '67a3ea21824fecc4b3c3b0a8da514669',
     block1: 'faacb3c6f1412469bd122fb82d78160d',
   },
-  /** The 1.0.3.2 18 Hz FF pair (new to the record; proven on the wire). */
+  /** The 1.0.3.2 18 Hz FF pair (new to the record; proven on the wire) — and
+   *  the 1.0.3.0-FF build's pair, measured the same (doc 1032 sec. 3). */
   cp1032ff: {
     block0: '58d6abe5a94e4de650ae3a84f9f8f281',
     block1: '6da05a33f540100034e2c8947d05708c',
