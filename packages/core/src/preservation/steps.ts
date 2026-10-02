@@ -966,7 +966,7 @@ async function runBackupStep(
     const detection = effectiveDetection(state, await detectActiveSlot(device));
     reporter.log(`slot: ${detection.verdict}`, 'detail');
 
-    let repointed_ = false;
+    let didRepoint = false;
     let read2 = await captureAndDerive(
       device,
       byAddress,
@@ -996,7 +996,7 @@ async function runBackupStep(
         reporter,
         signal,
       );
-      repointed_ = true;
+      didRepoint = true;
     }
     return {
       version,
@@ -1004,7 +1004,7 @@ async function runBackupStep(
       capture: read2.capture,
       slotReadShas: read2.slotReadShas,
       derived: read2.derived,
-      repointed: repointed_,
+      repointed: didRepoint,
       assembled: assembleBackupImage(byAddress),
     };
   });

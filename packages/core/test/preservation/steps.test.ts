@@ -461,7 +461,7 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
       flash.set(ff, RECOVERY_OFFSET); /* the bank that runs */
       const camera = v1Camera(ff, {
         flash,
-        version: [1, 3, 0, 8, 0, 0, 0, 0], /* the FF build reports 1.3.0.8 */
+        version: [1, 3, 0, 8, 0, 0, 0, 0] /* the FF build reports 1.3.0.8 */,
       });
       const store = memoryStore();
       const created = await createPreserveRun({ runId: 'repoint' });
