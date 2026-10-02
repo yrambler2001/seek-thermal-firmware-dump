@@ -101,6 +101,34 @@ describe('canRunPhase — the run’s gate, as the buttons show it', () => {
     }
   });
 
+  it('a failed backup with powerCycleRequired holds phase ① for the power-cycle assertion', () => {
+    const state = {
+      ...runState({ backup: 'failed' }),
+      steps: {
+        ...runState({ backup: 'failed' }).steps,
+        backup: { status: 'failed', powerCycleRequired: true, error: 'spent reader' },
+      },
+    } as unknown as PreserveRunState;
+    const g = gate(state, 'read-build');
+    expect(g.ok).toBe(false);
+    expect(g.needsPowerCycle).toBe(true);
+    expect(g.jumpable).toBe(false);
+    expect(g.missing.join('; ')).toMatch(/power-cycle assertion/);
+    /* The other phases are untouched by the backup's retry gate. */
+    expect(gate(state, 'patch-dump').needsPowerCycle).toBe(false);
+    /* A failed backup WITHOUT the flag (any other failure shape) is a normal
+     * re-run: the phase arms as before. */
+    const other = {
+      ...runState({ backup: 'failed' }),
+      steps: {
+        ...runState({ backup: 'failed' }).steps,
+        backup: { status: 'failed', error: 'something else' },
+      },
+    } as unknown as PreserveRunState;
+    expect(gate(other, 'read-build').ok).toBe(true);
+    expect(gate(other, 'read-build').needsPowerCycle).toBe(false);
+  });
+
   it('a fresh run: phase ① armed; the later phases wait, in the run’s normal order', () => {
     const state = runState();
     const first = gate(state, 'read-build');

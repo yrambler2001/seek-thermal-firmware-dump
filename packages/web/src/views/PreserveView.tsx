@@ -412,6 +412,17 @@ function PhaseRow({
             </Button>
           ) : (
             <>
+              {gate.needsPowerCycle && (
+                <Button
+                  variant="destructive"
+                  disabled={busy || (needsCamera && !connected)}
+                  onClick={() => {
+                    void preserve.runPhase(phase, { powerCycled: true });
+                  }}
+                >
+                  I power-cycled the camera — re-run the phase
+                </Button>
+              )}
               {gate.ok && gate.jumpable && (
                 <Button
                   variant="destructive"
@@ -442,6 +453,13 @@ function PhaseRow({
       <StepChips steps={meta.steps} state={state} />
 
       {reason !== null && <p className="text-[0.78rem] text-warn">This phase {reason}.</p>}
+      {gate.needsPowerCycle && (
+        <p className="text-[0.78rem] text-warn">
+          The previous backup attempt failed, and the camera must be power-cycled before it re-runs
+          (unplug and replug it, or use its power switch). The re-run button above asserts that you
+          did — the camera cannot report a power cycle itself.
+        </p>
+      )}
       {gate.pastCommit && (
         <p className="text-[0.78rem] font-medium text-warn">
           Concerns the patched part while the commit is not on record — the camera may already be

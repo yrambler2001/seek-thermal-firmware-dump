@@ -110,6 +110,12 @@ export interface PreservePanelParams {
 export interface PreservePhaseRunOptions {
   /** The explicit past-commit jump, armed through the danger dialog. */
   readonly allowJump?: boolean;
+  /**
+   * The power-cycle assertion core's backup retry gate waits for: the row's
+   * "I power-cycled the camera" control arms it after a failed backup, and
+   * the press itself is the assertion — core cannot observe a power cycle.
+   */
+  readonly powerCycled?: boolean;
 }
 
 export interface PreservePanelApi {
@@ -418,7 +424,10 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
               load,
               rep.reporter,
               signal,
-              allowJump ? { allowJump: true } : {},
+              {
+                ...(allowJump ? { allowJump: true } : {}),
+                ...(options.powerCycled === true ? { powerCycled: true } : {}),
+              },
             );
             stepInFlight = null;
             for (const artifact of outcome.artifacts) {

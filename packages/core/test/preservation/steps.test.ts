@@ -584,8 +584,16 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
        * mode-7 arm serves 0xFF while the immediately-following fresh arm
        * serves correctly. The ladder uses the re-read as the capture, notes
        * the verification, and repairs the assembled backup's row so the run
-       * directory stays self-consistent. */
-      const camera = v1Camera(plain);
+       * directory stays self-consistent.
+       *
+       * The cfg record is WRITTEN (cfg[0]=0, the measured real-camera state)
+       * so the sweep's canary stays silent — a non-blank boot-config row
+       * cannot co-occur with a spent reader — and the swallow reaches the
+       * capture ladder unchanged. */
+      const flash = new Uint8Array(FLASH_SIZE).fill(0xff);
+      new DataView(flash.buffer).setUint32(BOOT_CFG_OFFSET, 0, true); /* written -> A */
+      flash.set(plain, BANK_A_OFFSET);
+      const camera = v1Camera(plain, { flash });
       const store = memoryStore();
       const created = await createPreserveRun({ runId: 'swallow' });
       const swallowedOpener: SessionOpener = {
@@ -771,13 +779,17 @@ describe('the spent-reader refusals and the two-arm double read', () => {
   });
 
   it(
-    'an all-blank capture refuses with the power-cycle remedy first',
+    'an all-blank reader refuses in the sweep — the canary fires at bank A',
     { timeout: 120_000 },
     async () => {
-      /* The bank holds nothing but 0xFF: the sweep reads it fine, the two
-       * arms agree on an all-blank capture, and the derivation refuses with
-       * the spent-reader diagnosis — a reader state, not an image — before
-       * any cipher talk. */
+      /* The whole flash is 0xFF: a spent reader serves blank at FULL length,
+       * so the sweep's length check passes for every window and the step
+       * would burn all 31 before the slot ladder refused. The canary refuses
+       * at the fifth window instead — the boot-config block and bank A cannot
+       * both read unprogrammed on a camera that is running (a blank record is
+       * what makes the bootloader boot bank A, so bank A must hold the
+       * running image) — with the power-cycle remedy, long before any cipher
+       * talk. Measured live as run preserve-2026-10-02T22-39-43Z. */
       const flash = new Uint8Array(FLASH_SIZE).fill(0xff);
       new DataView(flash.buffer).setUint32(BOOT_CFG_OFFSET, 0xffffffff, true);
       const camera = v1Camera(plain, { flash });
@@ -793,9 +805,48 @@ describe('the spent-reader refusals and the two-arm double read', () => {
         /power-cycle the camera \(unplug and replug it, or use its power switch\)/,
       );
       expect(message).toMatch(/preserve --resume/);
-      expect(message).toMatch(/every byte of the capture is 0xFF \(an all-blank read\)/);
+      expect(message).toMatch(/boot-config block \(0x14010000\) and bank A \(0x14050000\)/);
+      expect(message).toMatch(/both served entirely unprogrammed 0xFF fill/);
       /* The generic puzzle text stays out of this shape. */
       expect(message).not.toMatch(/do not yield the factory plaintext/);
+    },
+  );
+
+  it(
+    'the canary re-arms a swallowed bank-A row once and repairs it — the run completes',
+    { timeout: 120_000 },
+    async () => {
+      /* The canary's honest exception: a genuinely blank boot-config record
+       * (the fixture default) plus the measured single-arm swallow on the
+       * bank-A sweep arm. The two rows co-occur blank, the re-arm serves the
+       * real image, and the repaired read becomes the row — the run completes
+       * instead of refusing, and the capture ladder downstream sees two
+       * agreeing reads. */
+      const camera = v1Camera(plain);
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'canary-repair' });
+      const swallowedOpener: SessionOpener = {
+        open: async () => {
+          await camera.open();
+          return new SwallowBankRowDevice(camera);
+        },
+        close: async () => {
+          await camera.close();
+        },
+      };
+      const outcome = await runPreserveStep(
+        'backup',
+        swallowedOpener,
+        created.state,
+        store.load,
+        silentReporter,
+      );
+      store.add(outcome);
+      const capture = (await store.load(PRESERVE_BANK_CAPTURE_FILE))!;
+      expect([...capture.subarray(0, plain.length)]).toEqual([...plain]);
+      /* The repaired row is in the assembled backup too. */
+      const windows = (await store.load(PRESERVE_BACKUP_FILE))!;
+      expect(windows[BANK_A_OFFSET + 5]).toBe(plain[5]);
     },
   );
 

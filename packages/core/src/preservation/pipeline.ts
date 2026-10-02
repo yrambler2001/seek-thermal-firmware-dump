@@ -84,8 +84,10 @@ import {
 import { sum16 } from './patch.js';
 import {
   BACKUP_WINDOW_COUNT,
+  BANKS,
   bankWindow,
   cfgWindow,
+  isBlankWindow,
   isStaleDescriptorWord,
   parseBootConfig,
   preservationWindows,
@@ -175,6 +177,25 @@ export interface BackupResult {
 
 /**
  * Read all 31 stock windows, each one complete. Read-only.
+ *
+ * THE READER CANARY (measured 2026-10-02, run preserve-2026-10-02T22-39-43Z): a
+ * camera whose window reader was spent by earlier same-boot attempts serves
+ * BLANK at full length, so every window here passes the length check and the
+ * step burns the whole sweep before the slot ladder refuses far downstream —
+ * with the boot-config read along the way accepting the blank fill as a genuine
+ * blank record ("boots bank A"). The canary watches the two rows whose BOTH
+ * being unprogrammed no honest reader can serve: the boot-config block (the
+ * sweep's first window, 0x14010000) and bank A (0x14050000). A blank record is
+ * what makes the bootloader's fixed validate order boot bank A, so bank A must
+ * then hold the image that is running; a record naming bank B or recovery is
+ * written, not blank. The one honest exception is the measured arm swallow —
+ * a single arm serving blank while the reader is alive — so the co-occurrence
+ * is settled the way every ladder here settles a suspect read: bank A is
+ * re-armed ONCE and re-read. Blank again is the spent reader (deterministic
+ * fill) and the refusal fires five windows in, naming the power cycle; a real
+ * re-read was a swallowed arm, and the re-read replaces the row, logged. With
+ * the canary passed, `detectActiveSlot`'s blank verdict stands on a reader
+ * proven to serve real bytes this boot.
  */
 export async function backupWindows(
   device: SeekDevice,
@@ -186,6 +207,11 @@ export async function backupWindows(
   const out: WindowBytes[] = [];
   const byAddress = new Map<number, Uint8Array>();
   let index = 0;
+  /* The canary state: whether the boot-config row (the sweep's first window)
+   * came back entirely unprogrammed. Bank A is the sweep's fifth window; the
+   * check fires there. */
+  let cfgRowBlank = false;
+  const bankAAddress = BANKS[0].address;
   for (const entry of windows) {
     assertLive(signal);
     device.assertNotCancelled();
@@ -196,7 +222,7 @@ export async function backupWindows(
       'items',
     );
     await device.armWindow(entry);
-    const read = await device.readArmed(chunk, WINDOW_BYTES);
+    let read = await device.readArmed(chunk, WINDOW_BYTES);
     if (read.data.length !== WINDOW_BYTES) {
       const why = read.stopReason === null ? '' : ` (${read.stopReason})`;
       throw new Error(
@@ -205,6 +231,34 @@ export async function backupWindows(
           why +
           ' — the backup must be complete before anything is written',
       );
+    }
+    if (entry.address === 0x14010000) cfgRowBlank = isBlankWindow(read.data);
+    if (entry.address === bankAAddress && cfgRowBlank && isBlankWindow(read.data)) {
+      /* Both canary rows blank. One re-arm separates a spent reader from the
+       * measured single-arm swallow (the third descriptor lifetime this costs
+       * bank A is the canary's own, and it runs only on this path). */
+      await device.armWindow(entry);
+      const again = await device.readArmed(chunk, WINDOW_BYTES);
+      if (again.data.length !== WINDOW_BYTES || isBlankWindow(again.data)) {
+        throw new SeekError(
+          'pipeline/refused',
+          spentReaderRefusal(
+            `the sweep's boot-config block (${hexUp(0x14010000, 8)}) and bank A ` +
+              `(${hexUp(bankAAddress, 8)}) both served entirely unprogrammed 0xFF fill, and ` +
+              'bank A’s re-armed read agreed — a running camera cannot hold both (a blank ' +
+              'record is what makes the bootloader boot bank A, so bank A must then hold the ' +
+              'running image), so the reader is serving blank and every window so far is ' +
+              'fill, not flash content',
+          ),
+        );
+      }
+      reporter.log(
+        `the sweep’s bank A row (${hexUp(bankAAddress, 8)}) served blank and was ` +
+          're-verified on a fresh arm — the re-read is the row (the measured single-arm ' +
+          'swallow, not a spent reader: the boot-config row is blank because the record is)',
+        'detail',
+      );
+      read = again;
     }
     out.push({ mode: entry.subcmd, address: entry.address, bytes: read.data });
     byAddress.set(entry.address, read.data);
@@ -232,6 +286,11 @@ export async function backupWindows(
  * used when it names a record, two agreeing unprogrammed reads accept the
  * blank verdict (a genuinely blank record), and a second consecutive garbage
  * read refuses with the power-cycle remedy. One retry, never loops.
+ *
+ * The two-agreeing-blanks acceptance is sound because `backupWindows`' canary
+ * has already run by the time this is called: a reader that serves blank for
+ * BOTH the boot-config row and bank A was refused in the sweep, so a blank
+ * verdict here comes from a reader proven to serve real bytes this boot.
  */
 export async function detectActiveSlot(device: SeekDevice): Promise<SlotDetection> {
   const read = async (label: string): Promise<Uint8Array> => {

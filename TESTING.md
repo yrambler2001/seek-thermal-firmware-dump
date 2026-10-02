@@ -4940,3 +4940,47 @@ gate).
   exhaustion; the refusal is a STALL with wire 53 = `0x30200`); 0.7.x's unpatched mode-2 serves
   the slot window (0.7.0.7) or 0 B (0.7.0.8); 0.8.0.0's faults the guest. The 64-B single-token
   ask is the drain shape everywhere (READ_CHUNK default), one drain per server.
+
+## 33. The reader canary: a spent boot is refused five windows into the sweep, and the wizard can assert the power cycle (2026-10-03)
+
+### 33.1 The live signature, and what it was
+
+Run `preserve-2026-10-02T22-39-43Z` (the web wizard, the real Compact 1.3.0.0) failed with the
+boot-config record reading as unprogrammed TWICE (the two agreeing reads accepted the blank
+verdict — "boots bank A") and then the active slot's reads serving all-0xFF twice. A fresh boot
+never does this: every fresh-boot probe reads the written record on the first arm, and the
+fresh-boot backup step (sweep, detect, capture, derive) completed byte-exact earlier the same
+day. The camera had not been power-cycled since earlier failed attempts: the reader was spent,
+serving unprogrammed fill at full length, and the sweep's length check passed for every window
+on the way to the refusal.
+
+### 33.2 The canary
+
+`backupWindows` now watches the two rows whose BOTH being unprogrammed no honest reader can
+serve: the boot-config block (the sweep's first window, 0x14010000) and bank A (0x14050000).
+A blank record is what makes the bootloader's fixed validate order boot bank A, so bank A must
+then hold the running image; a record naming bank B or recovery is written, not blank. The one
+honest exception is the measured single-arm swallow, so the co-occurrence is settled the way
+every ladder in the pipeline settles a suspect read: bank A is re-armed ONCE and re-read. Blank
+again is the spent reader (its fill is deterministic) and the refusal fires at window 5 with the
+power-cycle remedy; a real re-read was a swallowed arm, the re-read replaces the row, and the
+run continues. With the canary passed, `detectActiveSlot`'s two-agreeing-blanks verdict stands
+on a reader proven to serve real bytes this boot.
+
+### 33.3 The wizard's assertion
+
+The web never passed `powerCycled`, so after any failed backup core's retry gate could never
+pass in the browser — the only escape was a fresh run, which skipped the gate and burned a full
+doomed sweep. Phase ① now arms a loud re-run control once the gate holds for it
+(`needsPowerCycle` in the gating table, mirroring core's retry gate); pressing it asserts the
+cycle, which the camera cannot report itself, exactly as the CLI's prompt and `--yes` do.
+
+### 33.4 What the tests pin
+
+`steps.test.ts` — an all-blank part refuses in the sweep with the canary's signature (both
+blocks named, the re-arm agreeing, the remedy leading); a genuinely blank record plus a
+swallowed bank-A sweep arm completes (the canary re-arm repairs the row); the swallowed-row
+flip ladder runs on a written record (cfg[0]=0, the measured real-camera state), where the
+canary stays silent.
+`gating.test.ts` — a failed backup with `powerCycleRequired` holds phase ① for the assertion
+and leaves the other phases untouched; a failed backup without the flag re-runs normally.

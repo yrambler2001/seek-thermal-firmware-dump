@@ -150,6 +150,16 @@ export function spentReaderRefusal(signature: string): string {
   );
 }
 
+/** True when a whole window read is unprogrammed fill, every byte 0xFF. The
+ *  canary reads in `backupWindows` use it on two rows whose co-occurrence no
+ *  running camera can produce (see the canary comment there). */
+export function isBlankWindow(bytes: Uint8Array): boolean {
+  for (const byte of bytes) {
+    if (byte !== 0xff) return false;
+  }
+  return true;
+}
+
 /** True when a boot-config word is the stale-descriptor shape: an SRAM address
  *  (the bootloader vector's initial SP, 0x10018000 measured on the real
  *  Compact) served where a record selector should be. */

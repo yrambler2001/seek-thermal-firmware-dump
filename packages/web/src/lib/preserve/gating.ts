@@ -59,6 +59,14 @@ export interface PreserveGate {
   readonly jumpStartStep: PreserveStepId | null;
   /** Needs the danger confirmation (a write among the pending steps, or a jump). */
   readonly confirm: boolean;
+  /**
+   * The backup step failed with `powerCycleRequired` on record — core's retry
+   * gate refuses the re-run until the front end asserts the camera was
+   * power-cycled, and core cannot observe one. The UI arms the assertion with
+   * its own loud control (the "I power-cycled the camera" re-run button),
+   * which passes `powerCycled: true` down to core.
+   */
+  readonly needsPowerCycle: boolean;
 }
 
 export interface PreserveGateInput {
@@ -88,6 +96,7 @@ export function canRunPhase(input: PreserveGateInput): PreserveGate {
       startStep: first,
       jumpStartStep: null,
       confirm: false,
+      needsPowerCycle: false,
     };
   }
   if (state.nextStep === 'done') {
@@ -99,6 +108,7 @@ export function canRunPhase(input: PreserveGateInput): PreserveGate {
       startStep: first,
       jumpStartStep: null,
       confirm: false,
+      needsPowerCycle: false,
     };
   }
 
@@ -112,6 +122,7 @@ export function canRunPhase(input: PreserveGateInput): PreserveGate {
       startStep: first,
       jumpStartStep: null,
       confirm: false,
+      needsPowerCycle: false,
     };
   }
 
@@ -195,6 +206,23 @@ export function canRunPhase(input: PreserveGateInput): PreserveGate {
     effDone.add(step);
   }
 
+  /* Core's retry gate: a FAILED backup with `powerCycleRequired` on record
+   * re-runs only past the front end's assertion that the camera was
+   * power-cycled since. Only phase ① runs the backup step. The gap lands in
+   * `missing` BEFORE `ok` is computed, so the plain Run button stays dark —
+   * core would refuse it — and the row's own re-run control arms the
+   * assertion. */
+  const needsPowerCycle =
+    phase === 'read-build' &&
+    startStep === 'backup' &&
+    state.steps.backup?.status === 'failed' &&
+    state.steps.backup.powerCycleRequired === true;
+  if (needsPowerCycle) {
+    missing.push(
+      'the power-cycle assertion — power-cycle the camera (unplug and replug it, or use its power switch), then use the re-run control',
+    );
+  }
+
   /* allowJump relaxes exactly the ordering gates past the commit — nothing
    * else. A phase whose only gaps are those runs ONLY as a jump; a phase
    * with no gaps at all runs normally and may additionally offer the
@@ -228,6 +256,7 @@ export function canRunPhase(input: PreserveGateInput): PreserveGate {
     startStep,
     jumpStartStep: stuckJump ? 'drain' : orderOnly ? startStep : null,
     confirm: meta.steps.some((step) => !done(state, step) && NEEDS_CONFIRM.has(step)),
+    needsPowerCycle,
   };
 }
 
