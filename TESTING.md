@@ -4461,7 +4461,8 @@ solved plain on its own: the gates above decide. Measured on the real thing: the
 corpus dump (whose as-booted bank is plain ⊕ ks1) self-sources up to the seam — the expectedSlotPrefix
 gate passes, the identity candidate fails the build gates, the two cipher reasons name the way
 out, and the wire ledger of the whole server shows no `0x50`, no `0x81`, no `0x59`: nothing
-write-shaped went out.
+write-shaped went out. (Section 31 lands the two solvers behind this same signature; the
+refusal this section measured becomes the corrupt-capture negative of §31.4.)
 
 ### 29.3 The CLI, and the front-end contract
 
@@ -4507,3 +4508,150 @@ commit. `--yes` skips both. The `--json` document's `image` field is now
 What the web package still owes is its own workstream: the wizard's plan-from-image screen and
 its `plainLoader` served the removed input, and its preserve tests are the ones this change
 deliberately leaves red until that rework lands against these exports.
+
+---
+
+## 30. The preserve wizard, reworked: three phases, no image picker, and the reset that adopts itself (2026-10-02)
+
+Web-only scope, landing against the self-sourcing core of §29 — this is the workstream §29
+ended by naming. The wizard loses the firmware-image picker ENTIRELY (the ruling: the image
+always comes from the camera; there is nothing to pick), regroups the six core steps under
+THREE phase rows, and fixes the bug that started it all: the mid-phase reset used to cancel
+the run as "the camera changed on the bus". Nothing here re-proves the wire — every step is
+core's `runPreserveStep` untouched; the wizard orchestrates and the §29 proofs carry.
+
+### 30.1 What was removed, and what replaced it
+
+| removed                                                              | what replaced it                                                                                                           |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| the "Pick the firmware image" section, `pickImage`, the re-pick flow | phase ① creates the run (`createPreserveRun()` — no image argument) and the backup step derives the image on the camera    |
+| `buildPatchSummary` and the pre-run `V1Patch` plan screen            | the plan prints FROM THE RUN STATE after phase ① — build, two agreeing slot reads, sites, diff count, staged form, route   |
+| `plainLoader`'s picked-file branch (`RESERVED_PLAIN_NAME`)           | `artifactLoader` — checkpoints and run-zip extras only; `PRESERVE_PLAIN_NAME` is a real checkpoint the backup step emitted |
+| run files gated to `version: 1`                                      | version 1 and 2 both load (§29's schema 2 is the native one now); a foreign version still refuses                          |
+| six per-step rows, six reporters, six runner tasks                   | three phase rows, three reporters, ONE `runner.start()` per phase running its core steps back-to-back                      |
+
+The grep proof: `pickImage`, `hasImage`, `resumeNeedsImage`, `buildPatchSummary`,
+`plainLoader`, `RESERVED_PLAIN_NAME`, `confirmPlan` return nothing under
+`src/lib/preserve/`, `usePreservePanel.ts` or `PreserveView.tsx`. (The FLASH view's own
+picker is a different feature — that view flashes an image the user supplies; the preserve
+wizard never does.)
+
+The phase map, as landed:
+
+| phase              | core steps      | what the user does                                                                                                | zip |
+| ------------------ | --------------- | ----------------------------------------------------------------------------------------------------------------- | --- |
+| ① Read & build     | backup, patch   | connect, press Run: device info, the 31 windows, the double read, the derivation and its gates, the offline patch | ✓   |
+| ② Patch & dump     | commit, drain   | danger dialog (names THE COMMIT as the irreversible write), then the reset and the whole 4 MiB drain              | ✓   |
+| ③ Restore & verify | restore, verify | the other write behind its dialog, the reset, then the 31-window re-read and the verdict                          | ✓   |
+
+The zip is downloaded at each phase's end — state plus every artifact so far, the derived
+plaintext included from the backup step onward — and also when a phase FAILS or is
+CANCELLED: the steps record their checkpoints as they finish inside the phase, so a
+mid-phase death must not take a recorded commit with it. A cancelled step is still not
+RECORDED (core's rule); what the file keeps is the steps that did finish.
+
+### 30.2 The reset is not a swap — the adoption logic, trigger by trigger
+
+Phase ② and phase ③ reset the camera mid-phase (the drain's and the restore's wire-89). The
+unit drops off the bus, stays silent ~10 s while it boots the patched image, and
+re-enumerates — same vid/pid 289d:0010, and this camera has NO USB serial string, so
+vid/pid plus the active run context is the whole discriminator. Three cooperating pieces:
+
+1. **`useDevice` remembers what dropped.** On disconnect it records the unit's vid/pid; a
+   `connect` event is auto-adopted only when the seat is empty AND the vendor matches AND
+   the product id matches what dropped (or nothing had dropped — the page-load case, where
+   the vendor match alone decides as it always has). A different model is never adopted
+   silently: swapping cameras stays a user decision. This needs no user gesture — the
+   permission from the first open carries.
+2. **`useDevice.makeTransport` reads the LIVE device**, not the state snapshot the opener
+   ladder was built with — an attempt that lands after the re-enumeration opens the camera
+   that came back, not the dead object the phase started with.
+3. **The generation guard in `usePreservePanel` re-branched.** On any device change while a
+   phase runs:
+   - a DISCONNECT during a phase in `RESETS_CAMERA` (② ③): NOT a cancel — "the reset was
+     expected", the status line becomes the familiar "Camera rebooting …", and the opener
+     ladder rides through the silence;
+   - the reconnect AFTER such a disconnect: the count check — `getDevices()` must hold
+     exactly ONE Seek unit, else WHICH unit came back cannot be proven and the run stops
+     loudly; with one, "adopting it and continuing";
+   - a device appearing with NO drop before it (the seat was never empty), or any bump
+     during phase ①: the old rule — "the camera changed on the bus — stopping the phase".
+
+   A true swap that slips the guard anyway is caught DOWNSTREAM, and the tests assert the
+   hand-off that makes that true: each core step receives exactly the state the previous
+   step returned, and every write-shaped session re-checks the firmware version against the
+   run's (`gateVersion`) and the restore re-checks the bank against the backup's detection.
+   The adoption test drives the REAL `useDevice` and the REAL guard against a fake
+   `navigator.usb` (disconnect during a hanging phase-② drain → adopts, continues,
+   completes; a second authorized unit answering `getDevices()` → stops; a disconnect in
+   phase ① → stops; same-pid reconnect adopts, different-pid reconnect does not).
+
+### 30.3 The gating table, at phase granularity
+
+`canRunPhase` (`src/lib/preserve/gating.ts`) mirrors core's `describeStepGate` per
+UNDERLYING step, in core's order, with the ordering preconditions a phase satisfies itself
+(the patch's backup, the drain's commit) treated as met — by the time that step runs, the
+step it waits for has just finished inside the same task. `confirm` marks the danger-dialog
+set (the phase's pending writes); a jump always goes through the dialog too.
+
+| state                                  | ① read-build | ② patch-dump            | ③ restore-verify           |
+| -------------------------------------- | ------------ | ----------------------- | -------------------------- |
+| no run                                 | ✓ (creates)  | —                       | —                          |
+| fresh (created, nothing done)          | ✓            | — (normal order, quiet) | — (normal order, quiet)    |
+| ① done (backup+patch, nextStep commit) | done         | ✓ (dialog)              | — ¹ jump-only              |
+| commit done (nextStep drain)           | done         | ✓ (starts at the drain) | ✓ (dialog)                 |
+| drain done (nextStep restore)          | done         | done                    | ✓ (dialog)                 |
+| restore done (nextStep verify)         | done         | done                    | ✓ (verify only, no dialog) |
+| run done                               | —            | —                       | —                          |
+| commit FAILED, nextStep commit         | done         | ✓ AND ²                 | — ¹ jump-only              |
+
+¹ refused AND flagged `pastCommit` (loud, once the run stands past phase ①): the commit is
+not on record and the phase concerns the patched part. Core's own recovery is the explicit
+jump (`allowJump`, which relaxes exactly the ordering gates past the commit), offered as
+"Run past the unrecorded commit" and armed only through its own dialog — whose text is the
+operator's assertion: the writes landed without their checkpoints. The steps' own checks
+still run. A fresh run is NOT flagged: the ordering gaps there are the run's normal order.
+
+² THE STUCK JUMP: a FAILED commit record means an attempt happened and the run file cannot
+prove whether the write landed. The row offers BOTH ways forward — the normal re-run (the
+commit's own pre-check reads the bank and sorts landed from not-landed) and "Skip the
+commit — start at the drain", which passes `allowJump` and starts past the failed step
+instead of replaying a write that may already be on the camera. Core's own refusal text for
+a landed commit is the remedy this button implements.
+
+Hard stops that no jump clears, mirrored from core: missing checkpoints (a jump cannot
+fabricate a restore source), the slot detection, the FF build's `restoreForm: 'none'`
+refusal, the recovery-route mismatch, and a cipher family's missing
+`preserve_image_plain.bin`.
+
+### 30.4 The verdict, unmistakably
+
+Phase ③'s tail shows the 31-window re-read as a named verdict: **VERIFY: MATCH** (green,
+"31/31 windows at 0 differing byte(s)") when `state.verify` lands, or **VERIFY: NO MATCH**
+(red, with core's recorded refusal — "the verify read N differing byte(s) over X/31
+windows") when the verify step failed. The user asked for exactly this to be impossible to
+miss; it is a labelled alert on the row, not a log line.
+
+### 30.5 What is proven, and what is not
+
+- **Proven here (web suite, 160 tests, all green; eslint, `tsc` and prettier clean on the
+  package):** the phase gating table incl. past-commit, the jump and the stuck-jump
+  (`gating.test.ts`, 13 tests); the run-file round trip with a version-2 state, both
+  schema versions loading, a foreign version refusing, and the derived plaintext riding as
+  a checkpoint (`run-file.test.ts`); the adapter against the REAL core exports — the empty
+  self-sourcing shell (no image argument, no patch on it), the patch step run off the
+  derived artifact served from a run zip, the tampered-artifact sha refusal
+  (`client.test.ts`); the view (the picker gone, the dialog texts, the jump, the stuck
+  row's two buttons, the plan from state, both verdicts, the final sha screen); the
+  adoption suite of §30.2 (6 tests).
+- **Not proven here:** no camera was attached. The wire behavior is core's, proven in §28,
+  §29 and `packages/core/test/preservation/`; the browser adds orchestration, and the
+  adoption logic's fake-USB suite is the one web-side stand-in for silicon. The first
+  hardware run of the three-phase wizard is still owed — with the bench unit's USB-flash
+  habit (MEMORY: it adopts flashes its bootloader refuses to boot) kept in mind, since a
+  botched commit on it is exactly the landed-commit case the stuck jump exists for.
+- **Deliberate divergences:** the zip now lands per PHASE, not per step — the phase-① zip
+  already carries the whole restore source, and a mid-phase-② crash resumes from it via
+  the stuck jump; the wizard offers the past-commit jump the six-step version refused to
+  offer (core's `allowJump` exists, and the task that rework answered asked for it wired
+  to a dialog).
