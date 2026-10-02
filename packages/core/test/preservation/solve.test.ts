@@ -481,6 +481,16 @@ describe('solvePlainFromCapture — the shared first gate (every family)', () =>
       if (!solved.ok) expect(solved.reason).toMatch(/bootloader's own bound/);
     }
   });
+
+  it('a length too small for the segmented container refuses before the solve', () => {
+    const image = plainImage();
+    new DataView(image.buffer).setUint32(0x204, 0x280, true);
+    for (const family of ['v1-2014-ff', 'compact-2016'] as const) {
+      const solved = solvePlainFromCapture(family, bankWindow(image));
+      expect(solved.ok).toBe(false);
+      if (!solved.ok) expect(solved.reason).toMatch(/segmented container/);
+    }
+  });
 });
 
 /* ===================================================================== *
