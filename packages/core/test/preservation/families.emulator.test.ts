@@ -8,16 +8,15 @@
  *      image input anywhere — the backup step reads the active slot twice,
  *      agrees the captures, derives the plaintext (identity: the donor's
  *      banks hold the image as-is), and the run proceeds from that.
- *   2. Compact Pro 1.0.3.0 — the NATIVE 2016 dump 0C21A1M5KP15: the run
- *      self-sources UP TO the solver — the capture is CIPHERED (the
- *      as-booted bank is plain ^ ks1; the header window rides verbatim, so
- *      the identity path parses it and refuses on the build gates), and the
- *      compact-2016 keystream solver is the one seam this build does not
- *      carry yet. The row proves the refusal on the real ciphered capture:
- *      the run stops at the backup step, nothing write-shaped is sent, and
- *      the expectedSlotPrefix gate (the donor's known key, an offline
- *      oracle) passes first. The six-step route here waits on the solver
- *      landing behind `solvePlainFromCapture`.
+ *   2. Compact Pro 1.0.3.0 — the NATIVE 2016 dump 0C21A1M5KP15, the only
+ *      fixture with a GENUINELY CIPHERED at-rest bank (as-booted = plain ^
+ *      ks(key block 1); the header window rides verbatim): the six steps,
+ *      self-sourced through the compact-2016 keystream solver — the backup
+ *      solves the slot state from the crib (GF(2), reserved vector words
+ *      7..10), decrypts, and the run proceeds; delivered == the corpus
+ *      dump's own bytes. Plus the NEGATIVE: one flipped capture byte (a
+ *      copy of the same dump with one byte of the slot image corrupted) —
+ *      the solve refuses at the sum rule and nothing write-shaped is sent.
  *   3. Compact 1.3.0.8-FF — the recovery-slot route: the part synthesized
  *      from the same plaintext donor with cfg[0]=2 (selecting recovery,
  *      where the 2014 bootloader boots the 0xFFFF-sum image UNCHECKED) and
@@ -25,10 +24,12 @@
  *      TWO accepts, drain through the patched guard, 6 patch bytes vs
  *      as-booted. The FF chimera self-sources like the 8 Hz row: the donor
  *      stores the image as-is, so identity solves it and the build table
- *      names the FF build. Plus the NEGATIVE: the factory FF chimera on the
- *      same donor with its blank cfg (detection names bank A) refuses the
- *      commit and the drain — the bootloader would not boot the patch from
- *      there — and never stages a byte.
+ *      names the FF build. (No native FF camera dump exists — the FF
+ *      family's genuinely ciphered at-rest forms are proven in
+ *      solve.test.ts, on the real FF image.) Plus the NEGATIVE: the factory
+ *      FF chimera on the same donor with its blank cfg (detection names
+ *      bank A) refuses the commit and the drain — the bootloader would not
+ *      boot the patch from there — and never stages a byte.
  *
  * Everything wire-shaped reuses the §23/§24 machinery: RowEmulators, the
  * delivery audit with the reset's one tolerated orphan, the camera's clock
@@ -108,6 +109,14 @@ const PLAIN_1030 = corpusFile(
   '2016.07.06-17.04.49-1.0.3.0',
   'no-serial',
   '80k_4330_1.0.3.0-9hz_public_-_compact_pro_jul_6_2016_17-04-49_84.00_gabiz_ro_firmware.bin',
+);
+/** The native 2016 dump 0C21A1M5KP15: bank A holds the 1.0.3.0 image
+ *  ciphered at rest (plain ^ ks(key block 1), doc 33 sec. 11.2). */
+const DUMP_1030 = corpusFile(
+  'compact_pro',
+  '2016.07.06-17.04.49-1.0.3.0',
+  '0C21A1M5KP15',
+  'compact_pro_android_uq-aaa.bin',
 );
 
 function unsupported(): string | null {
@@ -346,6 +355,9 @@ async function runFullInPlace(spec: {
   /** The bank the run's detection must name after the backup (the FF
    *  build's recovery override). */
   readonly expectDetectionBank?: 'a' | 'b' | 'r';
+  /** Offline oracle for the delivered dump: the bytes the part must have
+   *  carried before the run (the corpus dump itself, for a native boot). */
+  readonly expectDelivered?: Uint8Array;
 }): Promise<void> {
   /* NO image input: the run is created empty and self-sources at the backup
    * step (double read -> derive -> gate). The expectedSlotPrefix is an
@@ -506,6 +518,11 @@ async function runFullInPlace(spec: {
   expect(diffOffsets(raw, truth), 'raw dump vs the post-commit state').toEqual([]);
   const delivered = new Uint8Array((await store.load(PRESERVE_DUMP_ORIGINAL_FILE))!);
   expect(diffOffsets(delivered, asbooted), 'delivered dump vs the as-booted part').toEqual([]);
+  if (spec.expectDelivered !== undefined) {
+    expect(diffOffsets(delivered, spec.expectDelivered), 'delivered dump vs the oracle').toEqual(
+      [],
+    );
+  }
   process.stderr.write(
     `[families] ${spec.label} GREEN: raw sha256 ${sha256(raw)}; delivered sha256 ` +
       `${sha256(delivered)}; as-booted sha256 ${sha256(asbooted)}\n`,
@@ -670,40 +687,71 @@ describe.skipIf(missingPlain('1.3.0.8 8 Hz', PLAIN_8HZ) !== null)(
 );
 
 /* ==================================================================== *
- * 2 — Compact Pro 1.0.3.0, the native 2016 dump (doc 33 sec. 11.7)
+ * 2 — Compact Pro 1.0.3.0, the native 2016 dump (doc 33 sec. 11): the only
+ * fixture whose at-rest bank is genuinely ciphered — the solver's fixture
  * ==================================================================== */
 
-describe.skipIf(missingPlain('1.0.3.0', PLAIN_1030) !== null)(
-  'family compact-pro-1.0.3.0 — the ciphered capture refuses at the solver seam (emulator)',
+describe.skipIf(
+  missingPlain('1.0.3.0', PLAIN_1030) ??
+    (DUMP_1030 === null ? 'the corpus does not carry the native 1.0.3.0 dump' : null),
+)(
+  'family compact-pro-1.0.3.0 — full in-place on the native dump, solved from the ciphered capture (emulator)',
   () => {
     it(
-      'the native dump self-sources up to the solver: identity parses the verbatim header and refuses on the build gates; the cipher solvers are not here yet; nothing write-shaped is sent',
-      { timeout: 1_800_000 },
+      'self-sourced through the cipher solver: the crib-solved capture derives the image, then patch, commit, whole-part drain, restore, verify; delivered == the dump’s own sha',
+      { timeout: 5_400_000 },
       async () => {
-        /* The donor's KeyB == the app's key block 1 (measured full length in
-         * the RE record), so the as-booted bank IS plain ^ ks1 — the expected
-         * prefix the run's capture gate checks (an offline oracle, not an
-         * input). The capture is CIPHERED, so the identity path parses the
-         * verbatim header window and then fails the build gates — and the
-         * compact-2016 keystream solver is the one seam this build does not
-         * carry. The run must refuse at the backup step, before anything is
-         * recorded or written, with the reason naming the families. */
+        /* The donor's KeyB == the app's key block 1 (measured full length,
+         * doc 1032 sec. 3), so the as-booted bank IS plain ^ ks1 — the
+         * expected prefix the run's capture gate checks (an offline oracle,
+         * not an input). The backup solves the slot state from the verbatim
+         * crib, decrypts the capture, and the run proceeds from that. */
         const plain = new Uint8Array(readFileSync(PLAIN_1030!));
         const patch = buildV1Patch(plain);
         expect(patch.buildId).toBe('compact-pro-1.0.3.0');
         const ks1 = keystream(keyWordsOf(patch.keys?.block1Hex ?? ''), plain.length >> 2);
-        const created = await createPreserveRun({
-          runId: 'families-1030-cipher',
+        await runFullInPlace({
+          label: '1030-native',
           expectedSlotPrefix: xorWindowVerbatim(plain, ks1),
+          expectedDiffOffsets: [
+            0x239, 0x23b, 0x352f, 0x3639,
+          ] /* the rebalance word + the guard + the widen byte (doc 33 sec. 11.5) */,
+          bankFlashOffset: 0x50000 /* bank A: the dump's blank cfg boots A */,
+          boot: { flash: DUMP_1030! },
+          restore: true,
+          expectDetectionBank: 'a',
+          expectDelivered: new Uint8Array(readFileSync(DUMP_1030!)),
         });
+        expect(liveEmulatorCount()).toBe(0);
+      },
+    );
+
+    it(
+      'one flipped capture byte: the solve refuses at the sum rule and nothing write-shaped is sent',
+      { timeout: 1_800_000 },
+      async () => {
+        /* A copy of the same dump with ONE byte of the bank-A image
+         * corrupted (in the tables past the code payload — the part still
+         * boots, from bank B: the corrupted sum fails the bootloader's
+         * validation). The expected-prefix oracle is deliberately absent so
+         * the SOLVER's own refusal is what fires, not the capture gate. The
+         * identity candidate dies on the build gates (the ciphered bytes
+         * are not balanced), both cipher families die on the sum rule, and
+         * the run refuses before anything is recorded or written. */
+        const corruptedPath = scratchFile('families_1030_corrupted.bin');
+        writeFileSync(corruptedPath, readFileSync(DUMP_1030!));
+        const corrupted = new Uint8Array(readFileSync(corruptedPath));
+        corrupted[0x50000 + 0xc500] = (corrupted[0x50000 + 0xc500] ?? 0) ^ 0x40;
+        writeFileSync(corruptedPath, corrupted);
+        const created = await createPreserveRun({ runId: 'families-1030-corrupt' });
         const store = memoryStore();
-        const row = new RowEmulators('1030 A (backup: the solver refusal)');
-        const emu = await boot(row, { entry: '0C21A1M5KP15/dump' });
+        const row = new RowEmulators('1030 N (backup: the corrupt-byte refusal)');
+        const emu = await boot(row, { flash: corruptedPath });
         try {
-          await warmServer(emu, '1030 seam server');
-          /* The step is read-only, so a first-session stall (doc 35.4) can be
-           * retried on a fresh session; the SOLVER refusal is the expected
-           * answer and ends the ladder. */
+          await warmServer(emu, '1030 corrupt server');
+          /* The step is read-only, so a first-session stall (doc 35.4) can
+           * be retried on a fresh session; the SOLVER refusal is the
+           * expected answer and ends the ladder. */
           let error: unknown = null;
           for (let attempt = 0; attempt < 2; attempt++) {
             error = await row
@@ -724,7 +772,7 @@ describe.skipIf(missingPlain('1.0.3.0', PLAIN_1030) !== null)(
               break;
             }
             process.stderr.write(
-              `[families] 1030 seam attempt ${String(attempt)} failed with ` +
+              `[families] 1030 corrupt attempt ${String(attempt)} failed with ` +
                 `${error instanceof Error ? error.message : String(error)}; retrying\n`,
             );
           }
@@ -733,16 +781,13 @@ describe.skipIf(missingPlain('1.0.3.0', PLAIN_1030) !== null)(
           /* The identity candidate got as far as the build gates (the
            * verbatim header window parses straight through the cipher)... */
           expect((error as Error).message).toMatch(/failed its build gates/);
-          /* ...and the cipher families' solvers are the named way out. */
-          expect((error as Error).message).toMatch(
-            /compact-2016 keystream solver is not implemented/,
-          );
-          expect((error as Error).message).toMatch(
-            /v1-2014-ff keystream solver is not implemented/,
-          );
+          /* ...and both cipher families refuse on the sum rule. */
+          expect((error as Error).message).toMatch(/v1-2014-ff/);
+          expect((error as Error).message).toMatch(/compact-2016/);
+          expect((error as Error).message).toMatch(/word sum is 0x/);
         } catch (error) {
           process.stderr.write(
-            `--- emulator log tail after the solver-refusal failure ---\n${emu.log(80)}\n`,
+            `--- emulator log tail after the corrupt-byte refusal ---\n${emu.log(80)}\n`,
           );
           throw error;
         } finally {
@@ -755,7 +800,7 @@ describe.skipIf(missingPlain('1.0.3.0', PLAIN_1030) !== null)(
         for (const opcode of ['0x50', '0x81', '0x59']) {
           expect(
             requests[`0x41/${opcode}`]?.sent ?? 0,
-            `no 0x41/${opcode} may go out against the ciphered capture`,
+            `no 0x41/${opcode} may go out against the corrupted capture`,
           ).toBe(0);
         }
         expect(liveEmulatorCount()).toBe(0);
