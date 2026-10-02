@@ -44,6 +44,12 @@ import {
 } from '../image/header.js';
 import { WINDOW_SIZE } from '../protocol/ops.js';
 import type { SeekDevice } from '../protocol/client.js';
+/* The stale-descriptor predicate, shared with the preservation pipeline's
+ * boot-config check rather than re-worded: a spent reader serves the same
+ * shape into any window. `preservation/windows.ts` imports nothing from
+ * `workflows/`, so this edge is acyclic. Its `spentReaderRefusal` TEXT is not
+ * reused — that remedy names `preserve --resume`, which is wrong advice here. */
+import { isStaleDescriptorWord } from '../preservation/windows.js';
 import { legacyUpgradeTargetBuild } from '../profiles/legacy-auth.js';
 import { detectProfile, requireCapability } from '../profiles/registry.js';
 import type {
@@ -81,9 +87,81 @@ interface RawSlot {
    * for it and nothing was armed. A clean read of an empty slot is false.
    */
   readonly unread?: boolean;
+  /**
+   * The window came back blank — every byte of the capture's header window is
+   * 0xFF. An erased bank reads exactly this, so on its own it is NOT an unread
+   * slot; `readDeviceInfo` reclassifies only when every window served blank.
+   */
+  readonly blank?: boolean;
+  /**
+   * The window served a spent reader's stale descriptor — the previous arm's
+   * head, not this bank's content. Unlike a blank capture this is unambiguous
+   * (an erased bank holds 0xFF, not a vector table), so the slot is unread.
+   */
+  readonly spent?: boolean;
   readonly header: ImageHeader | null;
   readonly raw: Uint8Array | null;
   readonly footer: ImageFooter | null;
+}
+
+/* ---- what a spent window reader serves -------------------------------- */
+
+/**
+ * The remedy every spent-reader diagnosis here names. Worded for the info and
+ * dump paths: `preservation/windows.ts`' `spentReaderRefusal` sends the user to
+ * `preserve --resume`, which is the wrong instruction after `seek-fw info`.
+ */
+export const SPENT_READER_REMEDY =
+  'the window reader may be spent for this boot; power-cycle the camera and retry';
+
+/** The whole-read refusal, when no window served bank content. */
+export function spentReaderDiagnosis(): string {
+  return `the camera's slots could not be read — ${SPENT_READER_REMEDY}`;
+}
+
+/**
+ * True when the header window of a slot capture is blank — every byte 0xFF.
+ *
+ * `head` is the capture's first `HEADER_OFFSET + HEADER_SIZE` bytes, the part
+ * every later stage parses, so a capture blank there has no image to analyse
+ * whatever followed. An all-0xFF capture is this case read wide.
+ */
+export function blankSlotCapture(head: Uint8Array): boolean {
+  return head.every((byte) => byte === 0xff);
+}
+
+/**
+ * Why a slot capture reads as a spent reader's stale descriptor rather than as
+ * the bank's content, or null when it does not.
+ *
+ * THE SIGNATURE IS MEASURED, on the 2026-10-02 incident. A spent reader re-serves
+ * its staged buffer from offset 0, so the next window's read gets the PREVIOUS
+ * window's head — on that run, the bootloader block's vector table: word 0 an
+ * SRAM address (0x10018000, the bootloader's initial SP) and word 1 a reset
+ * vector pointing into the bootloader block itself (0x1400xxxx). A real bank's
+ * capture never carries that pair: its word 0 is an SRAM stack pointer too, but
+ * its reset vector points into its OWN bank (0x1405xxxx and up), never at
+ * 0x14000000's block. The SRAM half is `isStaleDescriptorWord`, the same stale
+ * descriptor the boot-config check catches.
+ *
+ * WHY IT IS CHECKED BEFORE THE HEADER PARSE: wrong bytes solve to a keystream
+ * that sums to anything, and on that run a profile probe scored the camera
+ * `compact-2016` (0.9, "a slot decrypts to the 0x00000000 acceptance sum") on
+ * bytes no bank ever held. A capture with this signature never reaches the
+ * cipher analysis that feeds family scoring.
+ */
+export function staleDescriptorCapture(head: Uint8Array): string | null {
+  if (head.length < 8) return null;
+  const dv = viewOf(head);
+  const word0 = dv.getUint32(0, true);
+  const reset = dv.getUint32(4, true);
+  if (!isStaleDescriptorWord(word0)) return null;
+  if (reset >>> 16 !== 0x1400) return null;
+  return (
+    `the window served a stale reader descriptor's bytes — word 0 ${hexUp(word0)} with reset ` +
+    `${hexUp(reset)} is 0x14000000's vector table, not this bank's content, so nothing was ` +
+    `analysed from it: ${SPENT_READER_REMEDY}`
+  );
 }
 
 /**
@@ -110,6 +188,39 @@ async function readSlot(
   const head = await device.readArmed(chunk, probeLen, onChunk);
   if (head.data.length < probeLen) {
     return none(`short read (${String(head.data.length)} B)`, null);
+  }
+
+  /* A spent reader's bytes parse into no honest header, and they must never
+   * reach the cipher analysis that feeds family scoring — so both signatures
+   * are checked before `parseImageHeader`, which will happily build a header
+   * out of 0xFFFFFFFF or out of a stale descriptor's tail. See the helpers
+   * above for the measured signatures. */
+  const stale = staleDescriptorCapture(head.data);
+  if (stale !== null) {
+    return {
+      present: false,
+      reason: stale,
+      unread: true,
+      spent: true,
+      header: null,
+      raw: null,
+      footer: null,
+    };
+  }
+  if (blankSlotCapture(head.data)) {
+    /* A blank window is an erased bank as often as a spent reader — a stock
+     * camera legitimately carries an erased bank — so this keeps today's
+     * classification (a clean read that holds no image, NOT an unread slot);
+     * `readDeviceInfo` reclassifies only when EVERY window served blank. The
+     * reason is the same line a blank capture has always reported. */
+    return {
+      present: false,
+      reason: `no image header (magic ${hexUp(0xffffffff)})`,
+      blank: true,
+      header: null,
+      raw: null,
+      footer: null,
+    };
   }
 
   const header = parseImageHeader(head.data);
@@ -474,6 +585,28 @@ export async function readDeviceInfo(
   }
   reporter.progress(1, 1, 'Analysing ...');
 
+  /* ---- the spent-reader verdict over the whole read ------------------- */
+  /* One blank capture is an erased bank. Blank or stale captures at EVERY slot
+   * the plan reached are a reader that served no bank content at all — the
+   * 2026-10-02 incident's shape (two backup reads of blank/stale bytes that
+   * only a power cycle cleared). Those captures are reclassified as unread, so
+   * they report as spent rather than as empty banks and the flash gate refuses
+   * on them, and the refusal names the remedy once. A read that got bank
+   * content from any slot keeps every other slot's own reading: an empty bank
+   * beside a read one is the truth about that bank, not a spent reader, and
+   * scoring draws only on the captures that actually read. */
+  const served = analysed.filter((s) => s.present || s.blank === true || s.spent === true);
+  if (served.length > 0 && served.every((s) => s.blank === true || s.spent === true)) {
+    for (let i = 0; i < analysed.length; i++) {
+      const slot = analysed[i];
+      if (slot?.blank === true) {
+        analysed[i] = { ...slot, unread: true, reason: spentReaderDiagnosis() };
+      }
+    }
+    reporter.log('');
+    reporter.log(spentReaderDiagnosis(), 'error');
+  }
+
   /* ---- the 2014 plaintext chain -------------------------------------- */
   const plainChain = analysed.some(storedPlain);
   if (plainChain) {
@@ -578,6 +711,20 @@ export async function readDeviceInfo(
 
     if (!slot.present) {
       reporter.log(`${descriptor.name}: ${slot.reason ?? 'not readable'}`, 'warn');
+    } else if (storedPlain(slot)) {
+      /* THE CHAIN'S OWN VERDICT. The clauses below are a keystream bank's
+       * questions — which key decrypts it, does it hit the cipher's target,
+       * does it carry a footer — and this bank answers none of them: the slot
+       * bytes ARE the image, the bootloader's acceptance is the stored word
+       * sum, and this bootloader generation has no footer. The camera boots
+       * this exact slot, so the verdict comes from the chain's model, not
+       * from a cipher's. */
+      reporter.log(
+        `${descriptor.name}: firmware ${slot.plainHeader?.versionStr ?? '?'}, ` +
+          `${String(slot.header?.length ?? 0)} B, plaintext chain, ` +
+          `stored word sum ${String(slot.recovered?.checksum ?? 0)} — valid`,
+        'ok',
+      );
     } else {
       reporter.log(
         `${descriptor.name}: firmware ${slot.plainHeader?.versionStr ?? '?'}, ` +

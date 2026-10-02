@@ -211,6 +211,34 @@ describe('the 2014 plaintext chain on the normal flash path', () => {
     expect(state.updateTargetSubcmd).toBe(0);
   }, 60_000);
 
+  it('renders the chain’s own per-slot verdict, never the cipher clauses', async () => {
+    /* The bank that is literally booting used to be reported as "unknown key,
+     * acceptance FAILS, footer BAD -> NOT bootable" — every clause a cipher
+     * chain's question, and every answer wrong on this chain: there IS no key,
+     * the bootloader's acceptance is the stored word sum (which the image
+     * passes), and this bootloader generation has no footer. The verdict is
+     * the chain's model: identity solve, sum 0, valid. */
+    const reporter = collectingReporter();
+    const state = await readDeviceInfo(await contextFor(camera2014(), reporter));
+    const log = logsOf(reporter);
+
+    /* both banks that hold the image, booting bank A and recovery */
+    expect(state.plainChain).toBe(true);
+    expect(log).toContain(
+      'App image bank 0x14050000: firmware 1.3.0.0, 47768 B, plaintext chain, ' +
+        'stored word sum 0 — valid',
+    );
+    expect(log).toContain(
+      'App image bank 0x14070000: firmware 1.3.0.0, 47768 B, plaintext chain, ' +
+        'stored word sum 0 — valid',
+    );
+    /* and none of the cipher clauses, for any slot on this camera */
+    expect(log).not.toContain('acceptance FAILS');
+    expect(log).not.toContain('footer BAD');
+    expect(log).not.toContain('NOT bootable');
+    expect(log).not.toContain('unknown key');
+  }, 60_000);
+
   it('stages the plain image verbatim — no cipher, no footer, no keys', async () => {
     const state = await read2014(camera2014());
     const image = plainImage2014();

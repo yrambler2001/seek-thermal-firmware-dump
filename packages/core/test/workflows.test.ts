@@ -5,6 +5,7 @@ import { SeekError } from '../src/errors.js';
 import { collectingReporter, silentReporter, type Artifact, type Reporter } from '../src/events.js';
 import { cryptBytes } from '../src/crypto/cipher.js';
 import { keyFilenameSuffix, stateFromKey } from '../src/crypto/keys.js';
+import type { LogEvent, RunEvent } from '../src/events.js';
 import {
   assertBankPayload,
   setAcceptSum,
@@ -15,6 +16,7 @@ import {
   FOOTER_SIZE,
   FOOTER_TAG,
   HEADER_OFFSET,
+  HEADER_SIZE,
   IMAGE_MAGIC,
   TRY_KEYS_MAX_LEN,
   parseImageHeader,
@@ -43,7 +45,11 @@ import {
 import { detectProfile } from '../src/profiles/registry.js';
 import type { FirmwareProfile, SlotKey } from '../src/profiles/types.js';
 import { decryptDump, detectProfileForDump, evidenceFromDump } from '../src/workflows/decrypt.js';
-import { readDeviceInfo } from '../src/workflows/device-info.js';
+import {
+  blankSlotCapture,
+  readDeviceInfo,
+  staleDescriptorCapture,
+} from '../src/workflows/device-info.js';
 import { runDump } from '../src/workflows/dump.js';
 import { prepareImage, writeFirmware } from '../src/workflows/flash.js';
 import { runSweep } from '../src/workflows/sweep.js';
@@ -1128,6 +1134,149 @@ describe('readDeviceInfo', () => {
     expect(modernCamera.arms.at(-1)).toBe(0);
     expect(modern.flashBlockedBy.join('\n')).not.toContain('upgrade-target selector');
   }, 60_000);
+
+  /* ---- the spent-reader signatures (the 2026-10-02 incident) ---------- */
+
+  /** The run's log lines, joined — for asserting what the read said. */
+  function logsOf(reporter: { readonly events: readonly RunEvent[] }): string {
+    return reporter.events
+      .filter((e): e is LogEvent => e.type === 'log')
+      .map((e) => e.message)
+      .join('\n');
+  }
+
+  /**
+   * A flash whose bank-A window serves what the incident's spent reader
+   * served: the PREVIOUS arm's head — 0x14000000's vector table (word 0 an
+   * SRAM address, word 1 a reset into the bootloader block) — followed by a
+   * header-shaped tail that would have fed family scoring had it been parsed.
+   */
+  function flashWithStaleBankA(): Uint8Array {
+    const flash = new Uint8Array(FLASH_SIZE).fill(0xff);
+    const dv = viewOf(flash);
+    dv.setUint32(0x50000, 0x10018000, true);
+    dv.setUint32(0x50004, 0x14000301, true);
+    dv.setUint32(0x50000 + HEADER_OFFSET, IMAGE_MAGIC, true);
+    dv.setUint32(0x50000 + HEADER_OFFSET + 4, 0x4000, true);
+    return flash;
+  }
+
+  /**
+   * A healthy stored-plain bank image: sane vector table (words 7..10 and 13
+   * zero, so the GF(2) solve reads zeros), header at 0x200, and the adjust
+   * word at 0x238 balancing the stored word sum to the bootloader's 0 — the
+   * 2014 chain's acceptance, and checksum 0 in the analysis.
+   */
+  function healthyBankImage(): Uint8Array {
+    const image = new Uint8Array(0x4000);
+    const dv = viewOf(image);
+    dv.setUint32(0, 0x10008000, true);
+    dv.setUint32(4, 0x14070201, true); /* reset into its own bank */
+    dv.setUint32(HEADER_OFFSET, IMAGE_MAGIC, true);
+    dv.setUint32(HEADER_OFFSET + 4, 0x4000, true);
+    dv.setUint32(HEADER_OFFSET + 12, 0x00000301, true); /* 1.3.0.0 */
+    let sum = 0;
+    for (let i = 0; i < image.length; i += 4) sum = (sum + dv.getUint32(i, true)) >>> 0;
+    dv.setUint32(0x238, (0 - sum) >>> 0, true);
+    return image;
+  }
+
+  it('scores nothing from a slot whose window served a spent reader’s bytes', async () => {
+    /* The GF(2) solve is total: wrong bytes decrypt to anything, and on the
+     * incident a checksum solved out of a spent reader's bytes scored the
+     * camera `compact-2016` (0.9, "a slot decrypts to the 0x00000000
+     * acceptance sum"). The stale descriptor's signature is caught before the
+     * header parse, so the capture never reaches the cipher analysis. */
+    const camera = legacyBuildCamera('1.3.0.0', flashWithStaleBankA());
+    const reporter = collectingReporter();
+    const state = await readDeviceInfo(await contextFor(legacyAuth, camera, reporter), {
+      chunk: 4096,
+    });
+
+    const bankA = state.byKey.get('a');
+    expect(bankA?.present).toBe(false);
+    expect(bankA?.unread).toBe(true);
+    expect(bankA?.reason ?? '').toContain('stale reader');
+    expect(bankA?.reason ?? '').toContain('power-cycle');
+
+    /* every window the plan reached served blank or stale bytes, so the whole
+     * read is diagnosed as a spent reader, once, with the remedy */
+    expect(logsOf(reporter)).toContain(
+      "the camera's slots could not be read — the window reader may be spent for this " +
+        'boot; power-cycle the camera and retry',
+    );
+    for (const slot of state.slots) {
+      expect(slot.unread, slot.name).toBe(true);
+    }
+    for (const slot of state.slots) {
+      expect(slot.reason ?? '', slot.name).toContain('power-cycle');
+    }
+
+    /* and no family scored anything off those captures */
+    expect(state.evidence.observedAcceptanceSums ?? []).toEqual([]);
+    expect(JSON.stringify(state.detection)).not.toContain('decrypts to the');
+    expect(state.canFlash).toBe(false);
+    expect(state.flashBlockedBy.join(' ')).toContain('could not be read');
+  }, 60_000);
+
+  it('keeps scoring the slot that did read, beside a spent one', async () => {
+    /* A blank capture beside a read one is an erased bank — the truth about
+     * that bank, not a spent reader — so it keeps its own reading, the stale
+     * bank is refused on its own signature, and the sums come only from the
+     * capture that actually read. */
+    const flash = flashWithStaleBankA();
+    flash.set(healthyBankImage(), 0x70000); /* the recovery bank reads fine */
+    const camera = legacyBuildCamera('1.3.0.0', flash);
+    const reporter = collectingReporter();
+    const state = await readDeviceInfo(await contextFor(legacyAuth, camera, reporter), {
+      chunk: 4096,
+    });
+
+    const bankA = state.byKey.get('a');
+    expect(bankA?.present).toBe(false);
+    expect(bankA?.unread).toBe(true);
+    expect(bankA?.reason ?? '').toContain('stale reader');
+
+    /* the erased bank keeps today's classification: a clean read that holds
+     * no image, NOT an unread slot */
+    const bankB = state.byKey.get('b');
+    expect(bankB?.present).toBe(false);
+    expect(bankB?.unread).toBe(false);
+    expect(bankB?.reason ?? '').toBe('no image header (magic 0xFFFFFFFF)');
+
+    /* the readable bank scored, and it is the ONLY sum — the stale capture's
+     * header-shaped tail contributed nothing */
+    expect(state.evidence.observedAcceptanceSums ?? []).toEqual([0]);
+    /* no whole-read spent verdict: a bank did read */
+    expect(logsOf(reporter)).not.toContain("the camera's slots could not be read");
+  }, 60_000);
+
+  it('tells a blank capture from a stale descriptor, word by word', () => {
+    const blank = new Uint8Array(HEADER_OFFSET + HEADER_SIZE).fill(0xff);
+    expect(blankSlotCapture(blank)).toBe(true);
+    expect(blankSlotCapture(new Uint8Array(HEADER_OFFSET + HEADER_SIZE))).toBe(false);
+
+    /* a real bank's vector: word 0 an SRAM stack pointer, reset into its OWN
+     * bank — the SRAM word alone must never read as the stale descriptor */
+    const bank = new Uint8Array(8);
+    const bankDv = viewOf(bank);
+    bankDv.setUint32(0, 0x10018000, true);
+    bankDv.setUint32(4, 0x14050201, true);
+    expect(blankSlotCapture(bank)).toBe(false);
+    expect(staleDescriptorCapture(bank)).toBeNull();
+
+    /* the measured signature: the bootloader block's vector served where a
+     * bank's content should be */
+    const stale = new Uint8Array(8);
+    const staleDv = viewOf(stale);
+    staleDv.setUint32(0, 0x10018000, true);
+    staleDv.setUint32(4, 0x14000301, true);
+    const reason = staleDescriptorCapture(stale);
+    expect(reason ?? '').toContain('0x10018000');
+    expect(reason ?? '').toContain('0x14000301');
+    expect(reason ?? '').toContain('0x14000000');
+    expect(reason ?? '').toContain('power-cycle');
+  });
 });
 
 describe('writeFirmware', () => {
