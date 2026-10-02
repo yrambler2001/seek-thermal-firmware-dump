@@ -40,7 +40,12 @@
  * sites, its staged form, its acceptance rule, its commit route and its
  * measured drain capability. `buildV1Patch` dispatches over the table; the
  * four-site 2014 table keeps its exact gates (and its pinned refusal order
- * for a foreign image).
+ * for a foreign image). The 0.x line (FW-V1 doc 36: the eight 2014 Compact
+ * builds 0.7.0.7..0.10.0.0 the widening chain reached) joins as eight
+ * plaintext-family profiles of its own — the same widen tail as the 1.3.0.0
+ * generation, a per-layout-group reader trio, and a per-build header version
+ * word, because within a layout group the sibling builds are byte-identical
+ * apart from their version identity.
  *
  * NEVER SHIP A HAND-ASSEMBLED PATCH: every site carries its `before` bytes and
  * the builder refuses to run if the factory plaintext does not match them, at
@@ -52,6 +57,7 @@
 
 import { bytesToHex, findAll, hexToBytes, hexUp, viewOf } from '../bytes.js';
 import { SeekError } from '../errors.js';
+import { parseImageHeader } from '../image/header.js';
 
 /** The R16 xorshift128 generator, seeded [k1,k2,k3,k0], no whitening — the
  *  2016-donor at-rest form (`forge_v1_patch.py keystream`). Only needed where
@@ -208,6 +214,34 @@ export interface DrainCapability {
   readonly losslessReadUnit: number;
   /** The reach the widened window is proven byte-exact to, when it is bounded. */
   readonly maxPerArmReach?: number;
+  /**
+   * The widened mode-2 window serves the part from a ROTATED base on this
+   * build: 0.7.0.7's mode-2 row shares mode 0's body — the boot-config walk
+   * that arms the A/B slot the active-slot word does NOT name (the upgrade
+   * target; measured slot B `0x14060000` with the donor's blank record, doc 36
+   * secs. 36.4.2 and 36.10.3) — so a whole-part drain serves part[base:] and
+   * then wraps through the NOR's own alias decode. The drain step computes the
+   * base from the slot detection and UNROTATES before the delivered dump is
+   * post-processed; the raw artifact is kept in part layout order so the
+   * post-write == post-commit invariant holds on every build.
+   */
+  readonly rotation?: {
+    readonly walk: 'upgrade-target';
+    /** The base measured on the doc's donor: slot B with the blank record. */
+    readonly measuredBase: number;
+  };
+  /**
+   * Offsets that MUST be among the committed patch's sites before a mode-2
+   * arm is safe: these builds' factory mode-2 row is the INDIRECT pair (`ldr
+   * r3,=0x14000000; ldr r3,[r3,#0]`) — it arms the word stored AT 0x14000000
+   * (the bootloader vector's initial SP), and an armed read walks off SRAM and
+   * faults the guest (measured on 0.8.0.0: 32 KiB served, then
+   * UC_ERR_READ_UNMAPPED; doc 36.3.1). The patch turns the dereference into a
+   * nop, and the drain gate refuses a run whose recorded patch summary lacks
+   * that site — the nop is applied to the image BEFORE any mode-2 arm is ever
+   * sent, which is the patch step's ordering.
+   */
+  readonly modeTwoHazardSites?: readonly number[];
   readonly note: string;
 }
 
@@ -493,6 +527,301 @@ function requireKeys(pair: LocatedKeys | null): LocatedKeys {
   return pair;
 }
 
+/* ---- the 0.x line (the 2014 Compact builds the widening reached) -------------
+ *
+ * FW-V1 doc 36 derived and emulator-proved the widening chain down the 2014
+ * Compact line: stage 1 (0.8.0.0, 0.9.0.2, 0.9.0.6, 0.9.0.7, 0.9.1.0,
+ * 0.10.0.0) and stage 2 (0.7.0.7, 0.7.0.8). Every build of the line is the
+ * plaintext chain — word sum 0, banks stored as-is, no key material anywhere —
+ * so the family is `v1-2014` for all of them: the identity solve owns their
+ * captures, the staged form is the conjugated capture, and the restore puts
+ * the capture back verbatim. What the line ADDS is three things the 1.x table
+ * never needed: a wire-88 reader (0.7.x), a rotated mode-2 window (0.7.0.7),
+ * and a mode-2 row that is a crash hazard until the patch lands (0.8.0.0,
+ * 0.7.0.8).
+ *
+ * THE SITES, AND WHY THEY LOCATE THE WAY THEY DO. Every build carries the
+ * same widen tail as the 1.3.0.0 generation — `str r3,[r4,#20]; mov.w
+ * r3,#0x10000; str r3,[r4,#8]; str r3,[r4,#16]` — EXACTLY ONCE per image
+ * (byte-verified across the whole corpus line), and the reader trio sits at a
+ * fixed offset FROM it, per layout group. The three 2-byte trio encodings are
+ * not unique in an image, so a trio site is located as "the widen tail's
+ * offset plus this build's measured delta", and every site is then gated on
+ * its `before` bytes — a foreign image refuses at the gate, never patches
+ * blind. The builds within a layout group differ by NOTHING structural (0.9.0.7
+ * and 1.0.0.0 are byte-identical apart from their version identity: 18 bytes
+ * of header word, version strings and build timestamps), so the last gate —
+ * and the only one that can tell siblings apart — is the header's own version
+ * word at 0x20c. That is still an image property, not a wire report, and it
+ * never travels alone: every structural gate runs first.
+ */
+
+/** `ldr r3,[pc,#0xbc]; ldr r3,[r3,#0]` — the INDIRECT mode-2 body of
+ *  0.8.0.0 and 0.7.0.8: the case loads the ADDRESS 0x14000000 from its pool
+ *  and then dereferences it, arming the word stored there (the bootloader
+ *  vector's initial SP — not a flash window, and a crash under an armed
+ *  read). Occurs exactly once in each of the two builds, and in NO build
+ *  whose mode 2 is direct. */
+const NEEDLE_MODE2_INDIRECT = '2f4b1b68';
+
+/** The reader trio's halfword encodings, and their 32-bit replacements. */
+const TRIO_BEFORE: readonly (readonly number[])[] = [
+  [0xa9, 0x89],
+  [0xa2, 0x89],
+  [0xa3, 0x81],
+];
+const TRIO_AFTER: readonly (readonly number[])[] = [
+  [0xe9, 0x68],
+  [0xe2, 0x68],
+  [0xe3, 0x60],
+];
+
+/** Trio offsets FROM the widen site, per layout group (measured, doc 36.3.2
+ *  and 36.5). Groups A and B differ by 16 bytes of code between the reader
+ *  and the Begin tail; 0.7.0.7's own layout is the one its unaligned widen
+ *  sits in. */
+const TRIO_LAYOUT_A = [
+  -0x198, -0x14c, -0x144,
+] as const; /* 0.9.0.2/0.9.0.6/0.9.0.7/0.9.1.0/0.10.0.0 */
+const TRIO_LAYOUT_B = [-0x1a8, -0x15c, -0x154] as const; /* 0.8.0.0 / 0.7.0.8 */
+const TRIO_LAYOUT_C = [-0x1a2, -0x156, -0x14e] as const; /* 0.7.0.7 */
+
+/** The header version words of the CLOSED 1.x builds (little-endian, as
+ *  stored: bytes 01 03 00 00 -> 0x00000301 -> "1.3.0.0") — what keeps
+ *  `V1_2014_PROFILE` and the 0.9.0.7 profile (byte-identical siblings:
+ *  same length, same sites, same before bytes) from both matching. */
+const V1_2014_VERSION_WORDS: readonly number[] = [0x00000001, 0x00000201, 0x00000301];
+
+/** The image's own header version word at 0x20c (`image_header_t.version`),
+ *  or null when the image is too small to carry one. */
+function headerVersionOf(plain: Uint8Array): number | null {
+  if (plain.length < 0x210) return null;
+  return viewOf(plain).getUint32(0x20c, true);
+}
+
+/** The widen site for a 0.x build: the unique tail's mov.w, at tail + 2. */
+function widen0xSite(plain: Uint8Array): PatchSite {
+  const at = oneIn(
+    plain,
+    NEEDLE_WIDEN_2016,
+    'widen tail (str [r4,#20]; mov.w r3,#0x10000; str [r4,#8]; str [r4,#16])',
+  );
+  return {
+    offset: at + 2,
+    before: [0x4f, 0xf4, 0x80, 0x33],
+    after: [0x4f, 0xf4, 0x80, 0x03],
+    what:
+      'widen: mov.w r3,#0x10000 -> #0x400000 — one constant feeds the d4 AND dc ' +
+      'window-length stores, the reader window becomes [0x14000000, 0x14400000)',
+  };
+}
+
+/** The reader trio at its widen-relative offsets, before-byte gated. */
+function trio0xSites(widenAt: number, layout: readonly number[]): PatchSite[] {
+  const what = [
+    'ldrh r1,[r5,#12] -> ldr r1,[r5,#12]: the reader loads its d8 cursor as a HALFWORD, so reads wrap every 64 KiB',
+    'ldrh r2,[r4,#12] -> ldr r2,[r4,#12]: the cursor RE-load for the update step — still 16-bit, it truncated d8 at EVERY read',
+    'strh r3,[r4,#12] -> str r3,[r4,#12]: the matching halfword STORE of the advanced cursor',
+  ];
+  return layout.map((delta, i) => {
+    const before = TRIO_BEFORE[i] ?? [];
+    const after = TRIO_AFTER[i] ?? [];
+    return {
+      offset: widenAt + delta,
+      before,
+      after,
+      what: `${what[i] ?? ''} (LDR/STR imm T1, imm5=3, located widen${delta < 0 ? ' -' : ' +'} 0x${Math.abs(
+        delta,
+      ).toString(16)})`,
+    };
+  });
+}
+
+/** The mode-2 indirect->direct nop, at its unique shape. */
+function mode2DerefSite(plain: Uint8Array): PatchSite {
+  const at = oneIn(
+    plain,
+    NEEDLE_MODE2_INDIRECT,
+    'indirect mode-2 body (ldr r3,=0x14000000; ldr r3,[r3,#0])',
+  );
+  return {
+    offset: at + 2,
+    before: [0x1b, 0x68],
+    after: [0x00, 0xbf],
+    what:
+      'mode-2 indirection: ldr r3,[r3,#0] -> nop — the factory case arms *(0x14000000) (the ' +
+      'bootloader vector SP, not a flash window; an armed read walks off SRAM and faults the ' +
+      'guest) and the nop leaves r3 = 0x14000000, arming the bootloader block directly',
+  };
+}
+
+interface ZeroXSpec {
+  readonly buildId: string;
+  readonly label: string;
+  /** The header version word at 0x20c — the ONLY gate that can tell the
+   *  byte-identical siblings of one layout group apart. */
+  readonly versionWord: number;
+  readonly layout: readonly number[];
+  /** The indirect mode-2 body, and the nop that makes it safe. */
+  readonly extra: boolean;
+  readonly capability: DrainCapability;
+}
+
+function zeroXProfile(spec: ZeroXSpec): BuildPatchProfile {
+  const detect = (plain: Uint8Array): boolean => {
+    if (headerVersionOf(plain) !== spec.versionWord) return false;
+    if (occurrences(plain, NEEDLE_WIDEN_2016).length !== 1) return false;
+    if (occurrences(plain, NEEDLE_MODE2_INDIRECT).length !== (spec.extra ? 1 : 0)) return false;
+    const widenAt = (occurrences(plain, NEEDLE_WIDEN_2016)[0] ?? 0) + 2;
+    return spec.layout.every((delta, i) => {
+      const before = TRIO_BEFORE[i] ?? [];
+      return before.every((b, j) => (plain[widenAt + delta + j] ?? -1) === b);
+    });
+  };
+  return {
+    buildId: spec.buildId,
+    family: 'v1-2014',
+    label: spec.label,
+    detect,
+    locate: (plain) => {
+      const widen = widen0xSite(plain);
+      const sites = [widen, ...trio0xSites(widen.offset, spec.layout)];
+      return spec.extra ? [...sites, mode2DerefSite(plain)] : sites;
+    },
+    keysOf: () => null,
+    stagedForm: 'plain',
+    restoreForm: 'capture-verbatim',
+    acceptanceSum: 0,
+    route: 'active-bank',
+    routeNote: null,
+    capability: spec.capability,
+  };
+}
+
+/* ---- the 0.x capability lines, as measured (doc 36.4) ---------------------- */
+
+const ZERO_X_PROVEN =
+  'EMULATOR-PROVEN ONLY: this line was derived and measured on the emulator against the ' +
+  'plaintext 1.3.0.0 donor (doc 36.3.3); no native flash dump of any of these builds exists, ' +
+  'so the first hardware run is the first silicon evidence.';
+
+const PLAIN_0X_CAPABILITY = (drainSha: string): DrainCapability => ({
+  wholePart: true,
+  losslessReadUnit: 64,
+  note:
+    'one widened-window arm drains the whole 4 MiB part (doc 36.4: full in-place — commit 0x0, ' +
+    `exactly the 10 patch bytes vs as-booted, 0-diff restore, factory reader back); ` +
+    `in-place drain sha256 ${drainSha}…; the stock cap is exactly 65,536 B per arm; byte-exact ` +
+    `at the 64-byte ask. ${ZERO_X_PROVEN}`,
+});
+
+/* ---- the 0.x profiles themselves ------------------------------------------- */
+
+/** The eight 2014 Compact builds doc 36 reached, in wire order. */
+const ZERO_X_PROFILES: readonly BuildPatchProfile[] = [
+  zeroXProfile({
+    buildId: 'compact-0.7.0.7',
+    label: 'Compact 0.7.0.7',
+    versionWord: 0x07000700,
+    layout: TRIO_LAYOUT_C,
+    extra: false,
+    capability: {
+      wholePart: true,
+      losslessReadUnit: 64,
+      rotation: { walk: 'upgrade-target', measuredBase: 0x14060000 },
+      note:
+        'the reader answers on WIRE 88, not 79 (0x4F stalls; doc 36.5.0), and the widened ' +
+        'mode-2 window serves the part ROTATED: mode 2 shares mode 0’s boot-config walk ' +
+        'and arms the A/B slot the active-slot word does not name (slot B 0x14060000 on the ' +
+        'donor’s blank record) — the drain unrotates before delivery. Full in-place ' +
+        'proven including the boot-back (ip1–ip4 green, doc 36.4.2: in-place drain sha ' +
+        '5e1b5db4… at the rotated offsets, restore 0-diff, factory window exact on the ' +
+        `rotated compare). 9 bytes move (word 142 = 0x00009240). ${ZERO_X_PROVEN}`,
+    },
+  }),
+  zeroXProfile({
+    buildId: 'compact-0.7.0.8',
+    label: 'Compact 0.7.0.8',
+    versionWord: 0x08000700,
+    layout: TRIO_LAYOUT_B,
+    extra: true,
+    capability: {
+      wholePart: true,
+      losslessReadUnit: 64,
+      modeTwoHazardSites: [0x3bac],
+      note:
+        'the reader answers on WIRE 88, not 79 (0x4F stalls; doc 36.5.0); the factory mode 2 ' +
+        'is the INDIRECT pair — it arms *(0x14000000) and serves 0 B (measured) — so the nop ' +
+        'site is part of the patch and MUST be committed before any mode-2 arm (12 bytes ' +
+        'move). Full in-place through ip3 (doc 36.4.2: in-place drain sha 18649ea1…, ' +
+        'exactly the 12 patch bytes, restore 0-diff); the ip4 boot-back stage is OPEN — it ' +
+        'died on transport timeouts, not on the patch (doc 36.10 item 5) — everything it ' +
+        'would check is proven on the siblings. ' +
+        ZERO_X_PROVEN,
+    },
+  }),
+  zeroXProfile({
+    buildId: 'compact-0.8.0.0',
+    label: 'Compact 0.8.0.0',
+    versionWord: 0x00000800,
+    layout: TRIO_LAYOUT_B,
+    extra: true,
+    capability: {
+      wholePart: true,
+      losslessReadUnit: 64,
+      modeTwoHazardSites: [0x3ce4],
+      note:
+        'the factory mode 2 is the INDIRECT pair: it arms *(0x14000000) — the bootloader ' +
+        'vector’s initial SP — and an armed read served 32 KiB of SRAM and then faulted ' +
+        'the guest (measured, doc 36.3.1): the nop site is part of the patch and MUST be ' +
+        'committed before any mode-2 arm (12 bytes move). Full in-place through ip3 (doc ' +
+        '36.4.2: in-place drain sha c82556c1…, exactly the 12 patch bytes, restore 0-diff); ' +
+        'the ip4 boot-back stage is OPEN on transport timeouts (doc 36.10 item 5) — ' +
+        `everything it would check is proven on the siblings. ${ZERO_X_PROVEN}`,
+    },
+  }),
+  zeroXProfile({
+    buildId: 'compact-0.9.0.2',
+    label: 'Compact 0.9.0.2',
+    versionWord: 0x02000900,
+    layout: TRIO_LAYOUT_A,
+    extra: false,
+    capability: PLAIN_0X_CAPABILITY('3bd923c2e65a467b'),
+  }),
+  zeroXProfile({
+    buildId: 'compact-0.9.0.6',
+    label: 'Compact 0.9.0.6',
+    versionWord: 0x06000900,
+    layout: TRIO_LAYOUT_A,
+    extra: false,
+    capability: PLAIN_0X_CAPABILITY('d34497c0c45afd20'),
+  }),
+  zeroXProfile({
+    buildId: 'compact-0.9.0.7',
+    label: 'Compact 0.9.0.7',
+    versionWord: 0x07000900,
+    layout: TRIO_LAYOUT_A,
+    extra: false,
+    capability: PLAIN_0X_CAPABILITY('ad37c52f633caec9'),
+  }),
+  zeroXProfile({
+    buildId: 'compact-0.9.1.0',
+    label: 'Compact 0.9.1.0',
+    versionWord: 0x00010900,
+    layout: TRIO_LAYOUT_A,
+    extra: false,
+    capability: PLAIN_0X_CAPABILITY('0630ac9ee9f9eb1c'),
+  }),
+  zeroXProfile({
+    buildId: 'compact-0.10.0.0',
+    label: 'Compact 0.10.0.0',
+    versionWord: 0x00000a00,
+    layout: TRIO_LAYOUT_A,
+    extra: false,
+    capability: PLAIN_0X_CAPABILITY('62618426fe08ebcb'),
+  }),
+];
+
 /* ---- the profiles ----------------------------------------------------------- */
 
 /**
@@ -561,12 +890,18 @@ function detect2016Shapes(plain: Uint8Array): boolean {
 }
 
 /** The four-site 2014 chain (1.0.0.0 / 1.2.0.0 / 1.3.0.0): widen + the halfword
- *  reader trio at the doc-34 offsets, word-sum-0 acceptance, plaintext banks. */
+ *  reader trio at the doc-34 offsets, word-sum-0 acceptance, plaintext banks.
+ *  The detect carries the header's version word (the closed 1.x set) because
+ *  the 0.x line's 0.9.0.7 carries the SAME four sites at the SAME offsets with
+ *  the SAME before bytes — the two builds are byte-identical apart from their
+ *  version identity — and two matching profiles is a refusal, never a guess. */
 const V1_2014_PROFILE: BuildPatchProfile = {
   buildId: 'v1-2014',
   family: 'v1-2014',
   label: 'v1 2014 chain',
-  detect: (plain) => V1_2014_PATCH_SITES.every((site) => matchesAt(plain, site)),
+  detect: (plain) =>
+    V1_2014_VERSION_WORDS.includes(headerVersionOf(plain) ?? -1) &&
+    V1_2014_PATCH_SITES.every((site) => matchesAt(plain, site)),
   locate: (plain) =>
     V1_2014_PATCH_SITES.map((site) => {
       if (!matchesAt(plain, site)) {
@@ -743,6 +1078,7 @@ export const BUILD_PATCH_PROFILES: readonly BuildPatchProfile[] = [
   CP_1030_PROFILE,
   COMPACT_1308_FF_PROFILE,
   COMPACT_1308_8HZ_PROFILE,
+  ...ZERO_X_PROFILES,
   V1_2014_PROFILE,
 ];
 
@@ -787,12 +1123,43 @@ export interface V1Patch {
 
 const NO_MATCH_GUIDANCE =
   'No build in the preservation table matches this image (looked for the 2014 widen + ' +
-  'reader trio, the 1.3.0.8 widen, the 1.3.0.8-FF guard and key blocks, and the 2016 ' +
-  'guard + widen + key blocks — or the image is already patched). If this is a ' +
-  '2018-or-later build (Compact/Compact PRO 4.x, Compact XR, Nano 200/300, Mosaic), no ' +
-  'widening patch is needed: the modern stock plan already reads 63 of the 64 flash ' +
-  'windows (the whole flash except 0x14060000, which no selector can arm) — use the ' +
-  'standard dump workflow (`seek-fw dump`, or the Dump view) instead.';
+  'reader trio, the 0.x line’s widen tail + trio layouts, the 1.3.0.8 widen, the ' +
+  '1.3.0.8-FF guard and key blocks, and the 2016 guard + widen + key blocks — or the ' +
+  'image is already patched). If this is a 2018-or-later build (Compact/Compact PRO 4.x, ' +
+  'Compact XR, Nano 200/300, Mosaic), no widening patch is needed: the modern stock plan ' +
+  'already reads 63 of the 64 flash windows (the whole flash except 0x14060000, which no ' +
+  'selector can arm) — use the standard dump workflow (`seek-fw dump`, or the Dump view) ' +
+  'instead.';
+
+/**
+ * The measured refusal for the generation the widening route explicitly does
+ * NOT reach: the 2014 Compact builds OLDER than 0.7.0.7 (0.3.0.1, 0.5.0.2,
+ * 0.5.1.0, 0.5.1.3, 0.6.0.4). FW-V1 doc 36 sec. 36.7 investigated that
+ * generation and STOPPED: the upgrade machinery exists (0.3.0.1 even has a
+ * byte-exact reconstruction target) but the route does not port, for three
+ * measured reasons, each fatal on its own. Returns the refusal text, or null
+ * when `version` is not one of those builds.
+ */
+export function preWideningRefusal(version: string | null): string | null {
+  const match = /^\s*0\.(\d+)\./.exec(version ?? '');
+  const minor = match === null ? Number.NaN : Number.parseInt(match[1] ?? '', 10);
+  if (Number.isNaN(minor) || minor >= 7) return null;
+  return (
+    `firmware ${version ?? '(unreadable)'} predates the widening route, and the run refuses ` +
+    'rather than write over a slot it cannot serve. The generation was investigated and ' +
+    'STOPPED (FW-V1 doc 36, sec. 36.7): every BeginFirmwareUpgrade arm shape — modes 0/2/7, ' +
+    'plain 2-byte and token 18-byte — refuses with status 0x400000, a code outside even the ' +
+    'reconstruction’s own status taxonomy (measured on the 0.3.0.1 chimera); its mode-2 ' +
+    'row is not the 0x14000000-named window the widened drain reads through; and its window ' +
+    'constant is not the patchable two-store immediate (0.3.0.1 pools FLASH_BLOCK_BYTES as ' +
+    '-O0 constants, and the two 4ff48033 immediates the 0.5.x/0.6.0.4 images do carry belong ' +
+    'to settings-op stagers, not the upgrade path). There is no standard dump path on this ' +
+    'generation either — it has no read handler a dump can use (before 0.7.0.7 the reader ' +
+    'row does not exist at all). The widening campaign records this generation as its ' +
+    'boundary; reaching it would need the pre-0.7 dispatcher’s argument convention, the ' +
+    'real mode table, and the window-constant encoding derived first.'
+  );
+}
 
 /**
  * Build the widening patch for whatever build the plaintext turns out to be.
@@ -825,8 +1192,13 @@ export function buildV1Patch(plain: Uint8Array): V1Patch {
   const matched = matches.at(0);
   if (matched !== undefined) return buildWithProfile(plain, matched);
 
-  /* No table entry matched. Reproduce the 2014 chain's own refusals first —
-   * they are the pinned, measured messages — then widen the message with the
+  /* No table entry matched. The generation the route explicitly does not
+   * reach gets its doc-cited refusal first, then the 2014 chain's own pinned
+   * messages, then the guidance. */
+  const tooOld = preWideningRefusal(parseImageHeader(plain)?.versionStr ?? null);
+  if (tooOld !== null) throw new SeekError('pipeline/refused', tooOld);
+
+  /* The 2014 chain's own refusals — the pinned, measured messages — then the
    * guidance above. */
   const sum = wordSum(plain);
   if (sum !== 0) {

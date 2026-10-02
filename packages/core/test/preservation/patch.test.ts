@@ -117,8 +117,13 @@ function syntheticPlain(): Uint8Array {
   bytes[REBALANCE_WORD_OFFSET + 1] = 0;
   bytes[REBALANCE_WORD_OFFSET + 2] = 0;
   bytes[REBALANCE_WORD_OFFSET + 3] = 0;
-  /* Balance the word sum through a word far from every site. */
   const dv = new DataView(bytes.buffer);
+  /* The header's version word: the closed 1.x set, which the v1-2014 detect
+   * carries — 0.9.0.7 shares this build's four sites byte for byte, and the
+   * version word is the gate that keeps the table from matching both. */
+  dv.setUint32(0x200, 0xa1b2c3d4, true);
+  dv.setUint32(0x20c, 0x0000_0301, true); /* bytes 01 03 00 00 -> "1.3.0.0" */
+  /* Balance the word sum through a word far from every site. */
   const scratch = 0x3ff0;
   dv.setUint32(scratch, 0, true);
   const total = wordSum(bytes);

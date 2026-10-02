@@ -15,13 +15,14 @@
  * ==================================================================== */
 
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
 import { hexToBytes } from '../../src/bytes.js';
 import { SeekError } from '../../src/errors.js';
+import { legacyReaderOp } from '../../src/profiles/legacy-auth.js';
 import {
   BUILD_PATCH_PROFILES,
   buildV1Patch,
@@ -44,6 +45,7 @@ import {
 } from '../../src/preservation/patch.js';
 import { describeStepGate, type PreserveRunState } from '../../src/preservation/steps.js';
 import { emulatorDir } from '../emulator/harness.js';
+import facts from '../firmware/facts.json' with { type: 'json' };
 
 const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
 
@@ -776,5 +778,330 @@ describe('the build table — the five real builds, pinned to the RE records', (
     expect(
       eightHzProfile?.detect(readImage(CORPUS_IMAGES['compact-1.3.0.8-ff'] ?? null)) ?? false,
     ).toBe(false);
+  });
+});
+
+/* ==================================================================== *
+ * the 0.x line — the eight 2014 Compact builds doc 36 reached
+ * (corpus-gated; every number is the doc's own, byte-verified)
+ * ==================================================================== */
+
+const ZERO_X_DIR: Record<string, string> = {
+  'compact-0.7.0.7': '2014.09.04-14.15.36-0.7.0.7',
+  'compact-0.7.0.8': '2014.09.06-10.24.56-0.7.0.8',
+  'compact-0.8.0.0': '2014.09.17-09.17.37-0.8.0.0',
+  'compact-0.9.0.2': '2014.09.29-13.38.48-0.9.0.2',
+  'compact-0.9.0.6': '2014.10.03-15.32.39-0.9.0.6',
+  'compact-0.9.0.7': '2014.10.03-18.31.47-0.9.0.7',
+  'compact-0.9.1.0': '2014.10.02-13.48.57-0.9.1.0',
+  'compact-0.10.0.0': '2014.10.02-14.16.26-0.10.0.0',
+};
+
+const ZERO_X_IMAGES: Record<string, string | null> = Object.fromEntries(
+  Object.entries(ZERO_X_DIR).map(([id, dir]) => {
+    if (EMU === null) return [id, null];
+    const dirPath = path.join(EMU, 'data', 'corpus', 'compact', dir, 'no-serial');
+    if (!existsSync(dirPath)) return [id, null];
+    const bin = readdirSync(dirPath).find((f) => f.endsWith('.bin'));
+    return [id, bin === undefined ? null : path.join(dirPath, bin)];
+  }),
+);
+
+interface ZeroXPin {
+  /** The factory image sha, doc 36.1. */
+  readonly factorySha: string;
+  /** Site offsets: widen, trio, (extra). */
+  readonly sites: readonly number[];
+  /** Word 142 after the rebalance. */
+  readonly rebalance: number;
+  /** The enumerated diff set, factory -> patched. */
+  readonly diffs: readonly number[];
+  /** The staged (= patched plain) sha256, doc 36.3.2 / 36.5. */
+  readonly stagedSha: string;
+  readonly sum16: number;
+  readonly chunks: number;
+  readonly hazardSite?: number;
+  readonly rotates?: boolean;
+}
+
+const ZERO_X_PINS: Record<string, ZeroXPin> = {
+  'compact-0.7.0.7': {
+    factorySha: '60fdda7276573fc4994192e4c9d7f3c24f0131db4faab308bb6a5b99adfbad33',
+    sites: [0x3c86, 0x3ae4, 0x3b30, 0x3b38],
+    rebalance: 0x00009240,
+    diffs: [0x238, 0x239, 0x3ae4, 0x3ae5, 0x3b30, 0x3b31, 0x3b38, 0x3b39, 0x3c89],
+    stagedSha: '8b06ed2baff7c0c2a1881cf21a67ec80f5266bac36e146ec299b69687c90f0dc',
+    sum16: 0x1c76,
+    chunks: 752,
+    rotates: true,
+  },
+  'compact-0.7.0.8': {
+    factorySha: '6bac46abf3023d02cf0ba8a43bfbebdd7a85c77ffbedbab08d53e2f297a3e1ea',
+    sites: [0x3c2c, 0x3a84, 0x3ad0, 0x3ad8, 0x3bac],
+    rebalance: 0x30000b5b,
+    diffs: [
+      0x238, 0x239, 0x23b, 0x3a84, 0x3a85, 0x3ad0, 0x3ad1, 0x3ad8, 0x3ad9, 0x3bac, 0x3bad, 0x3c2f,
+    ],
+    stagedSha: 'a0c0b711306e2132eb66dd0b29496931b312e02eac7b051a52c5bb45d8c49146',
+    sum16: 0x825a,
+    chunks: 729,
+    hazardSite: 0x3bac,
+  },
+  'compact-0.8.0.0': {
+    factorySha: '9f5d9006f8bce9539e3f913ab5aad55e7ca6bc84e55839d1fe8d48c1c7463836',
+    sites: [0x3d64, 0x3bbc, 0x3c08, 0x3c10, 0x3ce4],
+    rebalance: 0x30000b5b,
+    diffs: [
+      0x238, 0x239, 0x23b, 0x3bbc, 0x3bbd, 0x3c08, 0x3c09, 0x3c10, 0x3c11, 0x3ce4, 0x3ce5, 0x3d67,
+    ],
+    stagedSha: '524974d12aab48dac931e8b296cfe62aca954b76e674037452b11884afa06c38',
+    sum16: 0x0407,
+    chunks: 738,
+    hazardSite: 0x3ce4,
+  },
+  'compact-0.9.0.2': {
+    factorySha: '3c597b72f5f4081d5f76e9348cc0d6a1d46a13453a2ca9c5005b117930df57d8',
+    sites: [0x3dcc, 0x3c34, 0x3c80, 0x3c88],
+    rebalance: 0x30006240,
+    diffs: [0x238, 0x239, 0x23b, 0x3c34, 0x3c35, 0x3c80, 0x3c81, 0x3c88, 0x3c89, 0x3dcf],
+    stagedSha: '9e901cf25330d771501d5a80308772370ac6f88be625f6f1cd8db2661fa46e6a',
+    sum16: 0x28f1,
+    chunks: 741,
+  },
+  'compact-0.9.0.6': {
+    factorySha: 'c07c3c3f913415bbfe3aed926a8fda94dd91ea2b8fbb023a02c1b958d26abdab',
+    sites: [0x3dcc, 0x3c34, 0x3c80, 0x3c88],
+    rebalance: 0x30006240,
+    diffs: [0x238, 0x239, 0x23b, 0x3c34, 0x3c35, 0x3c80, 0x3c81, 0x3c88, 0x3c89, 0x3dcf],
+    stagedSha: 'b6ff6a6cbe6dbbbd6e08c27660c22b25e6b5bb17a87e0cca89b5dfb057aa6e2d',
+    sum16: 0xf013,
+    chunks: 737,
+  },
+  'compact-0.9.0.7': {
+    factorySha: 'f3ecc810260a1ddf96e25bf9f9d0c405d8bce9975ef47497f6f2e7c4da020182',
+    sites: [0x3db4, 0x3c1c, 0x3c68, 0x3c70],
+    rebalance: 0x30006240,
+    diffs: [0x238, 0x239, 0x23b, 0x3c1c, 0x3c1d, 0x3c68, 0x3c69, 0x3c70, 0x3c71, 0x3db7],
+    stagedSha: '6d2804543fd686fe40aef5ea4e6a981bb169dadc81856ed5a1e01e84bc4e423f',
+    sum16: 0x26f2,
+    chunks: 740,
+  },
+  'compact-0.9.1.0': {
+    factorySha: 'f0ff04d53111b858c17affefd64dee2fa12d3320f14b6ca3260581f49917a62d',
+    sites: [0x3dcc, 0x3c34, 0x3c80, 0x3c88],
+    rebalance: 0x30006240,
+    diffs: [0x238, 0x239, 0x23b, 0x3c34, 0x3c35, 0x3c80, 0x3c81, 0x3c88, 0x3c89, 0x3dcf],
+    stagedSha: 'ba22185e189db14fbf1ec5f865a379753287f23c278998d2420241ccd772e077',
+    sum16: 0x28f1,
+    chunks: 741,
+  },
+  'compact-0.10.0.0': {
+    factorySha: '68b314052b80d40f0b28dd8c91f3530a9c1bdba5585f4f2c02b4fe98ba69d988',
+    sites: [0x3dcc, 0x3c34, 0x3c80, 0x3c88],
+    rebalance: 0x30006240,
+    diffs: [0x238, 0x239, 0x23b, 0x3c34, 0x3c35, 0x3c80, 0x3c81, 0x3c88, 0x3c89, 0x3dcf],
+    stagedSha: '7457fed1a243d583fdf30df69bdced1f22524ff9dfd4fada8c3a4d8a309d9eb4',
+    sum16: 0x29ef,
+    chunks: 741,
+  },
+};
+
+const ZERO_X_MISSING: readonly string[] = Object.entries(ZERO_X_IMAGES)
+  .filter(([, file]) => file === null)
+  .map(([id]) => id);
+
+/** One of the STOPPED pre-0.7 generation (doc 36.7), for the refusal test. */
+const PRE_0502_IMAGE: string | null = (() => {
+  if (EMU === null) return null;
+  const dir = path.join(
+    EMU,
+    'data',
+    'corpus',
+    'compact',
+    '2014.06.26-17.10.04-0.5.0.2',
+    'no-serial',
+  );
+  if (!existsSync(dir)) return null;
+  const bin = readdirSync(dir).find((f) => f.endsWith('.bin'));
+  return bin === undefined ? null : path.join(dir, bin);
+})();
+
+const zeroXImage = (id: string): Uint8Array => readImage(ZERO_X_IMAGES[id] ?? null);
+
+describe('the 0.x line — the eight builds doc 36 reached, pinned to the RE record', () => {
+  it.skipIf(ZERO_X_MISSING.length > 0)(
+    'every corpus image is present and sha-identical to its RE record',
+    () => {
+      expect(ZERO_X_MISSING).toEqual([]);
+      for (const [id, pin] of Object.entries(ZERO_X_PINS)) {
+        expect(sha256(zeroXImage(id)), id).toBe(pin.factorySha);
+      }
+    },
+  );
+
+  it.skipIf(ZERO_X_MISSING.length > 0)(
+    'each build detects as exactly its own profile — no sibling, no the 1.x table',
+    () => {
+      for (const [id] of Object.entries(ZERO_X_PINS)) {
+        const image = zeroXImage(id);
+        const matching = BUILD_PATCH_PROFILES.filter((profile) => profile.detect(image)).map(
+          (profile) => profile.buildId,
+        );
+        expect(matching, id).toEqual([id]);
+        const patch = buildV1Patch(image);
+        expect(patch.buildId).toBe(id);
+        expect(patch.family).toBe('v1-2014');
+        expect(patch.stagedForm).toBe('plain');
+        expect(patch.restoreForm).toBe('capture-verbatim');
+        expect(patch.route).toBe('active-bank');
+        expect(patch.keys).toBeNull();
+      }
+    },
+  );
+
+  for (const [id, pin] of Object.entries(ZERO_X_PINS)) {
+    it.skipIf(ZERO_X_IMAGES[id] === null)(
+      `${id}: sites at the doc offsets, word 142 := 0x${pin.rebalance.toString(16)}, ` +
+        `${String(pin.diffs.length)} bytes, staged sha ${pin.stagedSha.slice(0, 8)}…`,
+      () => {
+        const patch = buildV1Patch(zeroXImage(id));
+        expect(patch.sites.map((site) => site.offset)).toEqual([...pin.sites]);
+        expect(patch.rebalanceWord).toBe(pin.rebalance);
+        expect([...patch.diffOffsets]).toEqual([...pin.diffs]);
+        /* Staged == patched plain: the donor's banks are plaintext and the
+         * types-7/8/9 commit programs verbatim (doc 36.3.2). */
+        const staged = stagedFormOf(patch, patch.patched);
+        expect(staged).toBe(patch.patched);
+        expect(sum16(staged)).toBe(pin.sum16);
+        expect(Math.ceil(staged.length / 64)).toBe(pin.chunks);
+        expect(sha256(staged)).toBe(pin.stagedSha);
+        /* The capability line, as measured. */
+        expect(patch.capability.wholePart).toBe(true);
+        expect(patch.capability.losslessReadUnit).toBe(64);
+        if (pin.hazardSite !== undefined) {
+          expect(patch.capability.modeTwoHazardSites).toEqual([pin.hazardSite]);
+        } else {
+          expect(patch.capability.modeTwoHazardSites).toBeUndefined();
+        }
+        expect(patch.capability.rotation).toEqual(
+          pin.rotates === true ? { walk: 'upgrade-target', measuredBase: 0x14060000 } : undefined,
+        );
+      },
+    );
+  }
+
+  it.skipIf(ZERO_X_IMAGES['compact-0.9.0.2'] === null)(
+    'a flipped trio byte refuses with the before-byte gate, never patches blind',
+    () => {
+      const image = new Uint8Array(zeroXImage('compact-0.9.0.2'));
+      image[0x3c34] = (image[0x3c34] ?? 0) ^ 0xff;
+      /* Re-balance through a word far from every site, so ONLY the site gate
+       * can fire (the sum gate predates it). */
+      const dv = new DataView(image.buffer);
+      dv.setUint32(0x8000, 0, true);
+      dv.setUint32(0x8000, (0 - wordSum(image)) >>> 0, true);
+      expect(() => buildV1Patch(image)).toThrow(/are not the expected/);
+      /* The detect hook is itself the before-byte gate for the 0.x layouts:
+       * the corrupted trio byte stops the profile from matching at all, and
+       * the pinned fallback carries the refusal. */
+      const profile = BUILD_PATCH_PROFILES.find((p) => p.buildId === 'compact-0.9.0.2');
+      expect(profile?.detect(image) ?? true).toBe(false);
+    },
+  );
+
+  it.skipIf(ZERO_X_IMAGES['compact-0.9.0.7'] === null)(
+    '0.9.0.7 and 1.0.0.0 are byte-identical siblings apart from version identity — ' +
+      'and the table still refuses to guess',
+    () => {
+      /* The doc's fact, asserted on the vendored images: every differing byte
+       * between the two builds is version identity (header word, version
+       * strings, build timestamps). */
+      const p1000 = path.join(
+        EMU!,
+        'data',
+        'corpus',
+        'compact',
+        '2014.10.07-14.55.43-1.0.0.0',
+        'no-serial',
+      );
+      const bin = existsSync(p1000)
+        ? readdirSync(p1000).find((f) => f.endsWith('.bin'))
+        : undefined;
+      if (bin === undefined) return; /* corpus-gated */
+      const a = zeroXImage('compact-0.9.0.7');
+      const b = readImage(path.join(p1000, bin));
+      expect(a.length).toBe(b.length);
+      const diffs: number[] = [];
+      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) diffs.push(i);
+      expect(diffs.length).toBeGreaterThan(0);
+      for (const at of diffs) {
+        const inIdentity =
+          (at >= 0x208 && at < 0x210) /* the header's image-id/version words */ ||
+          (at >= 0xb250 && at < 0xb6e0); /* the version and timestamp strings */
+        expect(inIdentity, `byte ${at.toString(16)} differs`).toBe(true);
+      }
+      /* ...and the version word is what keeps the four-site 1.x table and the
+       * 0.9.0.7 profile from both matching. */
+      expect(buildV1Patch(a).buildId).toBe('compact-0.9.0.7');
+      expect(buildV1Patch(b).buildId).toBe('v1-2014');
+    },
+  );
+
+  it.skipIf(PRE_0502_IMAGE === null)(
+    'a pre-0.7 build (0.5.0.2) refuses with the doc-cited stage-3 verdict',
+    () => {
+      const pre = readImage(PRE_0502_IMAGE);
+      expect(() => buildV1Patch(pre)).toThrow(/predates the widening route/);
+      expect(() => buildV1Patch(pre)).toThrow(/0x400000/);
+      expect(() => buildV1Patch(pre)).toThrow(/sec\. 36\.7/);
+    },
+  );
+});
+
+/* ==================================================================== *
+ * the 0.7.x reader wire — the selection policy, and the facts behind it
+ * ==================================================================== */
+
+describe('the 0.7.x reader answers on wire 88, not 79', () => {
+  it('legacyReaderOp sends the 0.7.x builds to 0x58 and everything else to 0x4f', () => {
+    expect(legacyReaderOp('0.7.0.7')).toBe(0x58);
+    expect(legacyReaderOp('0.7.0.8')).toBe(0x58);
+    expect(legacyReaderOp('0.8.0.0')).toBe(0x4f);
+    expect(legacyReaderOp('0.9.0.2')).toBe(0x4f);
+    expect(legacyReaderOp('0.10.0.0')).toBe(0x4f);
+    expect(legacyReaderOp('1.3.0.0')).toBe(0x4f);
+    expect(legacyReaderOp('1.0.3.0')).toBe(0x4f);
+    expect(legacyReaderOp('4.18.2.0')).toBe(0x4f);
+    expect(legacyReaderOp(null)).toBe(0x4f);
+  });
+
+  it('the facts pin the 0.7.x read handler in wire 0x58’s getter column, shared with 0x4f’s setter', () => {
+    const images = facts.images as Record<
+      string,
+      {
+        version: string;
+        rpcHandlers: { name: string; getter: string | null; setter: string | null }[] | null;
+      }
+    >;
+    for (const [id, f] of Object.entries(images)) {
+      if (f.rpcHandlers === null) continue;
+      const row58 = f.rpcHandlers[0x58 - facts.wireIdBase];
+      const row4f = f.rpcHandlers[0x4f - facts.wireIdBase];
+      if (f.version.startsWith('0.7.')) {
+        /* The doc 36.5.0 shape: the SAME handler address, 0x58's getter and
+         * 0x4F's setter — wire 79 cannot serve a read on these builds. */
+        expect(row58?.name, id).toBe('GetFeaturedData');
+        expect(row58?.getter, id).not.toBeNull();
+        expect(row58?.setter, id).toBeNull();
+        expect(row4f?.name, id).toBe('GetFeaturedFirmwareData');
+        expect(row4f?.getter, id).toBeNull();
+        expect(row4f?.setter, id).toBe(row58?.getter);
+      } else if (Number(f.version[0]) >= 1 || f.version.startsWith('0.8.')) {
+        /* 0.8.0.0 and later: the reader is 0x4F's getter; 0x58 routes to it
+         * too, but 0x4F is what the toolkit speaks. */
+        expect(row4f?.getter, id).not.toBeNull();
+        expect(row4f?.name, id).toBe('GetFeaturedFirmwareData');
+      }
+    }
   });
 });
