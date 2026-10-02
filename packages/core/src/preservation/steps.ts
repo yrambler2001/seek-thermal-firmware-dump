@@ -63,11 +63,12 @@ import {
   makeOfflineDecryptReadme,
   manifestToJson,
 } from '../archive/index.js';
-import { bytesToHex, equalBytes, hexToBytes, isoStamp, sha256hex, utf8 } from '../bytes.js';
+import { bytesToHex, equalBytes, hexToBytes, hexUp, isoStamp, sha256hex, utf8 } from '../bytes.js';
 import { CancelledError, SeekError } from '../errors.js';
 import type { Artifact, Reporter } from '../events.js';
 import { parseImageHeader } from '../image/header.js';
 import { FLASH_BASE, FLASH_SIZE } from '../profiles/modern-4x.js';
+import { legacyReaderOp } from '../profiles/legacy-auth.js';
 import { getProfile } from '../profiles/registry.js';
 import type { SeekDevice } from '../protocol/client.js';
 import { decryptDump } from '../workflows/decrypt.js';
@@ -87,6 +88,8 @@ import {
   probeWidenedWindow,
   readVersion,
   resetDevice,
+  rotatedDrainBase,
+  unrotateDump,
   verifyAgainstBackup,
   type BackupResult,
   type SessionOpener,
@@ -95,6 +98,7 @@ import {
 import {
   buildV1Patch,
   conjugateCapture,
+  preWideningRefusal,
   stagedAcceptanceSum,
   stagedFormOf,
   type CommitRouteId,
@@ -541,6 +545,30 @@ export async function describeStepGate(
           state.capability.note
         );
       }
+      /* THE MODE-2 HAZARD ORDERING: on the builds whose factory mode-2 row
+       * arms *(0x14000000), the nop that makes the arm safe is part of the
+       * patch — the drain arms mode 2 only after the reset into the PATCHED
+       * image, and this gate holds the run state to that order: the recorded
+       * patch summary must carry the hazard site, or the arm is refused
+       * before it can fault the camera. */
+      const hazardSites = state.capability?.modeTwoHazardSites;
+      if (hazardSites !== undefined && hazardSites.length > 0) {
+        const recorded = new Set((state.patch?.sites ?? []).map((site) => site.offset));
+        const missing = hazardSites.filter((offset) => !recorded.has(offset));
+        if (missing.length > 0) {
+          return (
+            `the drain step refuses on ${state.buildId ?? state.buildFamily ?? 'the detected build'}: ` +
+            'arming mode 2 on this build’s UNPATCHED image faults the camera — the factory ' +
+            'mode-2 row loads the word stored AT 0x14000000 (the bootloader vector’s initial ' +
+            'SP, not a flash window) and an armed read walks off SRAM (measured on the ' +
+            'emulator: 32 KiB served, then the guest faulted; FW-V1 doc 36.3.1). The nop that ' +
+            'makes the arm safe is patch site ' +
+            missing.map((offset) => hexUp(offset)).join(', ') +
+            ', and it is NOT among the patch sites this run recorded — run the patch step (and ' +
+            'land the commit) before any mode-2 arm.'
+          );
+        }
+      }
       const route = routeRefusal(state);
       if (route !== null) return route;
       if ((await loadArtifact(PRESERVE_BANK_CAPTURE_FILE)) === null) {
@@ -716,7 +744,22 @@ async function gateVersion(device: SeekDevice, state: PreserveRunState): Promise
         "derived from one build's bytes and must not be sent to another",
     );
   }
+  applyReaderOp(device, version);
   return version;
+}
+
+/**
+ * Point the session's window reads at the build's reader wire. The version
+ * read itself (0x4E) is version-agnostic and always runs first; everything
+ * that reads a WINDOW on this generation reads through `device.windowReadOp`,
+ * and the 0.7.x builds answer on wire 88, not 79 (their method table puts the
+ * read handler in 0x4F's setter column and 0x4F stalls for every request
+ * length — measured, FW-V1 doc 36 sec. 36.5.0). Applied at EVERY session
+ * open, before the first window read: the backup step from the version it
+ * just read, every later step from the version the state pins.
+ */
+function applyReaderOp(device: SeekDevice, version: string | null | undefined): void {
+  device.windowReadOp = legacyReaderOp(version ?? null);
 }
 
 function expectedPrefixOf(state: PreserveRunState): Uint8Array | undefined {
@@ -959,6 +1002,12 @@ async function runBackupStep(
     /* No gate yet — the camera's own report is the version the run expects
      * from here on. The derived image's header must agree with it (below). */
     const version = await readVersion(device);
+    /* THE GENERATION GATE, before a single window read: the 2014 builds older
+     * than 0.7.0.7 are outside the widening route (doc 36.7, measured) and
+     * this run refuses with that evidence instead of reading anything. */
+    const tooOld = preWideningRefusal(version);
+    if (tooOld !== null) fail(tooOld);
+    applyReaderOp(device, version);
     reporter.log(`camera reports firmware ${version}`, 'detail');
 
     const backup = await backupWindows(device, reporter, READ_CHUNK, signal);
@@ -1300,6 +1349,24 @@ async function runDrainStep(
   const detection = state.detection;
   if (detection === undefined) fail('the run state carries no slot detection');
 
+  /* THE ROTATION, resolved BEFORE anything touches the camera: on the 0.7.0.7
+   * the widened mode-2 window serves the part from the A/B slot the
+   * active-slot word does NOT name (measured slot B 0x14060000 on the donor's
+   * blank record; doc 36.10 item 3), so the served bytes fold back through the
+   * NOR's own alias decode. The window's probe expectation and the delivered
+   * dump both read at layout addresses, so the base is resolved here — and a
+   * detection whose base this walk cannot name (recovery) refuses before the
+   * reset, not after it. */
+  let rotationBase: number | null = null;
+  if (state.capability?.rotation !== undefined) {
+    rotationBase = rotatedDrainBase(detection);
+    reporter.log(
+      `the widened window serves the part rotated from ${hexUp(rotationBase, 8)} — ` +
+        'the drain will unrotate before delivery',
+      'detail',
+    );
+  }
+
   /* The reset, ONCE, on its own first session: after it the camera boots the
    * patched image, and the session that sent it holds the reset's own
    * orphaned URB. Nothing else reads before the drain — the reader's per-arm
@@ -1319,6 +1386,9 @@ async function runDrainStep(
   let lastError = 'not attempted';
   for (let n = 1; n <= attempts && rawDump === null; n++) {
     const device = await opener.open();
+    /* No version read happens on an attempt session (the reset session gates
+     * it); the reader op comes from the state's pinned version. */
+    applyReaderOp(device, state.expectedVersion);
     try {
       rawDump = await drainWholePart(device, reporter, {
         chunk: state.drainChunk ?? READ_CHUNK,
@@ -1330,9 +1400,14 @@ async function runDrainStep(
       try {
         const backupImage = await loadArtifact(PRESERVE_BACKUP_FILE);
         if (backupImage !== null) {
+          /* The window offset PROBE_OFFSET reads LAYOUT address
+           * (rotationBase ?? FLASH_BASE) + PROBE_OFFSET, so the expectation
+           * is cut there — the rotated build compares against the rotated
+           * address's true bytes, exactly as the ip4 rotated compare did. */
+          const probeFlash = (rotationBase ?? FLASH_BASE) + PROBE_OFFSET - READ_CHUNK - FLASH_BASE;
           const probeBytes = backupSlice(
             backupResultFromImage(backupImage),
-            PROBE_OFFSET - READ_CHUNK,
+            probeFlash,
             READ_CHUNK,
           );
           const probe = await probeWidenedWindow(device, probeBytes);
@@ -1358,14 +1433,24 @@ async function runDrainStep(
     );
   }
 
-  const delivered = postProcessDump(rawDump, detection.bankAddress, capture);
+  /* The served bytes become the part in LAYOUT order here: the post-write
+   * artifact is the state the commits produced (the same invariant every
+   * build's run carries), and the delivered dump swaps the active bank back
+   * from the backup on top of it. */
+  const layout = rotationBase === null ? rawDump : unrotateDump(rawDump, rotationBase);
+  const delivered = postProcessDump(layout, detection.bankAddress, capture);
   const artifacts: Artifact[] = [
-    named(PRESERVE_DUMP_POSTWRITE_FILE, rawDump),
+    named(PRESERVE_DUMP_POSTWRITE_FILE, layout),
     named(PRESERVE_DUMP_ORIGINAL_FILE, delivered),
   ];
   const shas = await shasOf(artifacts);
   const rawSha = shas.get(PRESERVE_DUMP_POSTWRITE_FILE) ?? '';
   const deliveredSha = shas.get(PRESERVE_DUMP_ORIGINAL_FILE) ?? '';
+  const servedNote =
+    rotationBase === null
+      ? `raw dump ${String(rawDump.length)} B (sha256 ${rawSha})`
+      : `served dump ${String(rawDump.length)} B rotated from ${hexUp(rotationBase, 8)} ` +
+        `(sha256 ${await sha256hex(rawDump)}), unrotated to layout order (sha256 ${rawSha})`;
   const nextState: PreserveRunState = {
     ...state,
     rawDumpSha256: rawSha,
@@ -1375,8 +1460,8 @@ async function runDrainStep(
       ...state.steps,
       drain: stepRecord(
         startedAt,
-        `raw dump ${String(rawDump.length)} B (sha256 ${rawSha}); delivered dump (the active ` +
-          `bank swapped back from the backup) sha256 ${deliveredSha}`,
+        `${servedNote}; delivered dump (the active bank swapped back from the backup) ` +
+          `sha256 ${deliveredSha}`,
         shas,
       ),
     },
@@ -1521,6 +1606,10 @@ async function runVerifyStep(
   for (let n = 1; n <= attempts; n++) {
     const read = await withSession(opener, (device) => {
       assertLive(signal);
+      /* The windows re-read through the build's own reader wire (wire 88 on
+       * the 0.7.x builds) — the op comes from the state's pinned version, as
+       * in every step after the backup. */
+      applyReaderOp(device, state.expectedVersion);
       return verifyAgainstBackup(device, backup, reporter, READ_CHUNK, signal);
     });
     last = read;

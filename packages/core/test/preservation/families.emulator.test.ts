@@ -98,6 +98,25 @@ const PLAIN_8HZ = corpusFile(
   'no-serial',
   '32k_43x0_1.3.0.8_compact-insecure-8hz_public_-_compact_jan_6_2017_11-16-17_99.28_gabiz_ro_firmware.bin',
 );
+/** The 0.x plaintexts (doc 36.1's corpus paths), by build. */
+const PLAIN_0907 = corpusFile(
+  'compact',
+  '2014.10.03-18.31.47-0.9.0.7',
+  'no-serial',
+  'subi_lpc43xx_lpcopen_0.9.0.7_compact_oct_3_2014_18-31-47_99.28_yrambler2001_firmware.bin',
+);
+const PLAIN_0800 = corpusFile(
+  'compact',
+  '2014.09.17-09.17.37-0.8.0.0',
+  'no-serial',
+  'subi_lpc43xx_lpcopen_0.8.0.0_compact_sep_17_2014_09-17-37_99.28_yrambler2001_firmware.bin',
+);
+const PLAIN_0707 = corpusFile(
+  'compact',
+  '2014.09.04-14.15.36-0.7.0.7',
+  'no-serial',
+  'subi_lpc43xx_lpcopen_0.7.0.7_compact_sep_4_2014_14-15-36_99.28_yrambler2001_firmware.bin',
+);
 const PLAIN_FF = corpusFile(
   'compact',
   '2017.01.06-11.17.29-1.3.0.8-FF',
@@ -847,6 +866,108 @@ describe.skipIf(missingPlain('1.3.0.8-FF', PLAIN_FF) !== null)(
           boot: { entry: '11.17.29', donor: DONOR_2014 },
           restore: false,
           expectDetectionBank: 'r',
+        });
+        expect(liveEmulatorCount()).toBe(0);
+      },
+    );
+  },
+);
+
+/* ==================================================================== *
+ * 4..6 — the 0.x line (doc 36): the 2014 Compact builds the widening
+ * chain reached, each on the SAME plaintext donor chimera. Every row is
+ * self-sourced like the 1.3.0.8 rows; the per-build shape comes from the
+ * run state the backup derives. Three rows, one per NEW mechanism:
+ *   4. Compact 0.9.0.7  — the plain 0.8+ shape (wire 79, direct mode 2),
+ *      carrying the 1.3.0.0 generation's exact site offsets.
+ *   5. Compact 0.8.0.0  — the INDIRECT mode-2 crash hazard: the patch's
+ *      nop site is what makes the drain's mode-2 arm safe (12-byte diff).
+ *   6. Compact 0.7.0.7  — the WIRE-88 reader and the ROTATED drain: every
+ *      window read goes out on 0x58, the widened window serves the part
+ *      from slot B (0x14060000), and the delivered dump is unrotated.
+ * ==================================================================== */
+
+describe.skipIf(missingPlain('0.9.0.7', PLAIN_0907) !== null)(
+  'family compact-0.9.0.7 — full in-place on the 2014 donor (emulator)',
+  () => {
+    it(
+      'self-sourced: backup derives the image, then patch (four sites), commit, whole-part drain, restore, verify; delivered == as-booted',
+      { timeout: 5_400_000 },
+      async () => {
+        const plain = new Uint8Array(readFileSync(PLAIN_0907!));
+        await runFullInPlace({
+          label: '0907',
+          expectedSlotPrefix: plain,
+          expectedDiffOffsets: [
+            0x238, 0x239, 0x23b, 0x3c1c, 0x3c1d, 0x3c68, 0x3c69, 0x3c70, 0x3c71, 0x3db7,
+          ] /* the rebalance word + the widen byte + both bytes of each trio site (doc 36.4.2) */,
+          bankFlashOffset: 0x50000 /* bank A: the donor's blank cfg boots A */,
+          boot: { entry: '18.31.47', donor: DONOR_2014 },
+          restore: true,
+          expectDetectionBank: 'a',
+        });
+        expect(liveEmulatorCount()).toBe(0);
+      },
+    );
+  },
+);
+
+describe.skipIf(missingPlain('0.8.0.0', PLAIN_0800) !== null)(
+  'family compact-0.8.0.0 — the indirect mode-2 hazard, full in-place on the 2014 donor (emulator)',
+  () => {
+    it(
+      'self-sourced: the patch carries the mode-2 nop site (12 bytes), commit, whole-part drain, restore, verify; delivered == as-booted',
+      { timeout: 5_400_000 },
+      async () => {
+        const plain = new Uint8Array(readFileSync(PLAIN_0800!));
+        const patch = buildV1Patch(plain);
+        /* THE HAZARD, as the table records it: the factory mode 2 arms
+         * *(0x14000000) and an armed read faults the guest (doc 36.3.1) —
+         * the nop is a first-class gated site, and the drain gate refuses a
+         * run whose patch lacks it. */
+        expect(patch.capability.modeTwoHazardSites).toEqual([0x3ce4]);
+        expect(patch.sites.map((s) => s.offset)).toContain(0x3ce4);
+        await runFullInPlace({
+          label: '0800',
+          expectedSlotPrefix: plain,
+          expectedDiffOffsets: [
+            0x238, 0x239, 0x23b, 0x3bbc, 0x3bbd, 0x3c08, 0x3c09, 0x3c10, 0x3c11, 0x3ce4, 0x3ce5,
+            0x3d67,
+          ] /* the rebalance word + widen + trio + the mode-2 nop (doc 36.4.2) */,
+          bankFlashOffset: 0x50000,
+          boot: { entry: '09.17.37', donor: DONOR_2014 },
+          restore: true,
+          expectDetectionBank: 'a',
+        });
+        expect(liveEmulatorCount()).toBe(0);
+      },
+    );
+  },
+);
+
+describe.skipIf(missingPlain('0.7.0.7', PLAIN_0707) !== null)(
+  'family compact-0.7.0.7 — wire 88 and the rotated drain, full in-place on the 2014 donor (emulator)',
+  () => {
+    it(
+      'self-sourced: every window read rides wire 88, the widened window serves the part rotated from slot B, and the delivered dump is the unrotated part',
+      { timeout: 5_400_000 },
+      async () => {
+        const plain = new Uint8Array(readFileSync(PLAIN_0707!));
+        const patch = buildV1Patch(plain);
+        expect(patch.capability.rotation).toEqual({
+          walk: 'upgrade-target',
+          measuredBase: 0x14060000,
+        });
+        await runFullInPlace({
+          label: '0707',
+          expectedSlotPrefix: plain,
+          expectedDiffOffsets: [
+            0x238, 0x239, 0x3ae4, 0x3ae5, 0x3b30, 0x3b31, 0x3b38, 0x3b39, 0x3c89,
+          ] /* the rebalance word (0x00009240 — two bytes) + widen + trio (doc 36.5) */,
+          bankFlashOffset: 0x50000,
+          boot: { entry: '14.15.36', donor: DONOR_2014 },
+          restore: true,
+          expectDetectionBank: 'a',
         });
         expect(liveEmulatorCount()).toBe(0);
       },

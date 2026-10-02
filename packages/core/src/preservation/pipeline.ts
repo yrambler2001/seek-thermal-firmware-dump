@@ -62,12 +62,12 @@
  */
 
 import { hexUp, isoStamp, sha256hex } from '../bytes.js';
-import { CancelledError, errorMessage } from '../errors.js';
+import { CancelledError, errorMessage, SeekError } from '../errors.js';
 import type { Reporter } from '../events.js';
 import type { SeekDevice } from '../protocol/client.js';
 import { u16Payload } from '../protocol/client.js';
 import { OP, EP0_BUF, USB_COMMIT_TIMEOUT_MS } from '../protocol/ops.js';
-import { FLASH_SIZE } from '../profiles/modern-4x.js';
+import { FLASH_BASE, FLASH_SIZE } from '../profiles/modern-4x.js';
 import {
   PRESERVE_BACKUP_FILE,
   PRESERVE_BANK_CAPTURE_FILE,
@@ -337,7 +337,7 @@ export async function drainExact(
     let blk: Uint8Array | null = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        blk = await device.rpcIn(OP.GET_FEATURED_FIRMWARE_DATA, want, timeoutMs);
+        blk = await device.rpcIn(device.windowReadOp, want, timeoutMs);
         break;
       } catch (error) {
         blk = null;
@@ -419,7 +419,7 @@ export async function probeWidenedWindow(
     retries: 2,
     timeoutMs: 10000,
   });
-  const blk = await device.rpcIn(OP.GET_FEATURED_FIRMWARE_DATA, READ_CHUNK, 10000);
+  const blk = await device.rpcIn(device.windowReadOp, READ_CHUNK, 10000);
   if (blk.length !== READ_CHUNK) {
     return {
       live: false,
@@ -484,6 +484,58 @@ export function postProcessDump(
   }
   const out = new Uint8Array(dump);
   out.set(originalBank, bankAddress - 0x14000000);
+  return out;
+}
+
+/* ---- the 0.7.0.7 rotation ---------------------------------------------------
+ *
+ * On 0.7.0.7 the widened mode-2 row shares mode 0's body — the boot-config
+ * walk that arms the A/B slot the ACTIVE-slot word does not name (the upgrade
+ * target; FW-V1 doc 36 secs. 36.4.2 and 36.10.3) — so a whole-part drain
+ * serves part[base:] and then wraps through the NOR's own alias decode
+ * (machine.py `_alias_flash` on the emulator). Measured on the donor: slot B
+ * 0x14060000 with the blank record. A whole-part in-order drain would need a
+ * mode-2 body rewrite (a third patch shape) and was not pursued; the drain
+ * instead UNROTATES what the window served.
+ */
+
+/** The flash address the 0.7.0.7 widened window's offset 0 serves, from the
+ *  slot detection: the A/B bank the detection does NOT name — bank A (or a
+ *  blank record, which names A) serves from slot B, bank B from slot A. The
+ *  measured donor case is the blank record serving from 0x14060000. A record
+ *  naming RECOVERY was never measured on this walk and refuses rather than
+ *  guess the base. */
+export function rotatedDrainBase(detection: SlotDetection): number {
+  if (detection.bank === 'a') return 0x14060000;
+  if (detection.bank === 'b') return 0x14050000;
+  throw new SeekError(
+    'pipeline/refused',
+    `the active slot is recovery (${hexUp(detection.bankAddress, 8)}) and the 0.7.0.7 mode-2 ` +
+      'walk was never measured against a recovery-named record — the rotation base of the ' +
+      'widened window is unknown, so the drain refuses rather than deliver a wrongly-folded ' +
+      'part (doc 36.10 item 3)',
+  );
+}
+
+/**
+ * Undo the 0.7.0.7 rotation: window offset i served flash
+ * `(base - 0x14000000 + i) mod 4 MiB`, so layout byte j is the served byte
+ * `(j + SIZE - at) mod SIZE`. The result is the part in layout order — the
+ * state the commits produced — which is what every downstream consumer
+ * (the delivered-dump swap-back, the == post-commit proofs) expects.
+ */
+export function unrotateDump(dump: Uint8Array, base: number): Uint8Array {
+  if (dump.length !== FLASH_SIZE) {
+    throw new Error(`unrotate: the dump is ${String(dump.length)} B, want ${String(FLASH_SIZE)}`);
+  }
+  const at = base - FLASH_BASE;
+  if (!Number.isInteger(at) || at < 0 || at >= FLASH_SIZE || at % WINDOW_BYTES !== 0) {
+    throw new Error(`unrotate: ${hexUp(base, 8)} is not a slot-aligned flash base`);
+  }
+  const out = new Uint8Array(dump.length);
+  for (let j = 0; j < dump.length; j++) {
+    out[j] = dump[(j + dump.length - at) % dump.length] ?? 0;
+  }
   return out;
 }
 

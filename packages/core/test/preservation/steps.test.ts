@@ -56,7 +56,9 @@ import {
   createPreserveRun,
   describeStepGate,
   recordStepFailure,
+  rotatedDrainBase,
   runPreserveStep,
+  unrotateDump,
   type PreserveArtifactLoader,
   type PreserveRunState,
   type PreserveStepId,
@@ -485,6 +487,109 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
       expect(state.slotReadShas?.[0]).toBe(await sha256hex(window));
       expect(state.slotReadShas?.[1]).toBe(state.slotReadShas?.[0]);
       expect(state.steps.backup?.notes).toMatch(/re-pointed at the recovery bank/);
+    },
+  );
+
+  /* ---- the 0.x line: the wire-88 reader and the generation gate ------------ */
+
+  /** A synthetic 0.x factory plaintext: the widen tail (unique), the reader
+   *  trio at ONE build's widen-relative layout, no indirect mode-2 body, the
+   *  build's header version word, and a balance. The recipe the real images
+   *  follow (doc 36.3.2), at synthetic offsets. */
+  function zeroXPlain(versionWord: number, layout: readonly number[]): Uint8Array {
+    const bytes = new Uint8Array(IMAGE_LENGTH);
+    let state = 0x12345678;
+    for (let i = 0; i < bytes.length; i++) {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      bytes[i] = state & 0xff;
+    }
+    const put = (at: number, hex: string): void => {
+      bytes.set(hexToBytes(hex), at);
+    };
+    const WIDEN_AT = 0x3d00; /* the mov.w inside the tail */
+    put(WIDEN_AT - 2, '63614ff48033a3602361');
+    const trioBefore = ['a989', 'a289', 'a381'];
+    layout.forEach((delta, i) => {
+      put(WIDEN_AT + delta, trioBefore[i] ?? '');
+    });
+    const dv = new DataView(bytes.buffer);
+    dv.setUint32(0x200, 0xa1b2c3d4, true);
+    dv.setUint32(0x204, IMAGE_LENGTH, true);
+    dv.setUint32(0x20c, versionWord, true);
+    dv.setUint32(REBALANCE_WORD_OFFSET, 0, true);
+    const scratch = 0x3ff0;
+    dv.setUint32(scratch, 0, true);
+    dv.setUint32(scratch, (0 - wordSum(bytes)) >>> 0, true);
+    return bytes;
+  }
+
+  it(
+    'a 0.7.0.7 camera reads its windows through wire 88, and the run names the 0.7 build',
+    { timeout: 120_000 },
+    async () => {
+      /* 0.7.0.7: layout C. The camera reports 0.7.0.7; every window read of
+       * the backup goes out on 0x58 (GetFeaturedData — the build's reader
+       * row), and NO read on 0x4f, which would stall on this generation. */
+      const plain = zeroXPlain(0x0700_0700, [-0x1a2, -0x156, -0x14e]);
+      const camera = v1Camera(plain, { version: [0, 7, 0, 7, 0, 0, 0, 0] });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'wire88' });
+      const state = await step('backup', camera, created.state, store);
+
+      expect(state.buildId).toBe('compact-0.7.0.7');
+      expect(state.buildFamily).toBe('v1-2014');
+      expect(state.expectedVersion).toBe('0.7.0.7');
+      const ins = camera.calls.filter((c) => c.direction === 'in');
+      expect(ins.some((c) => c.op === OP.GET_FEATURED_DATA)).toBe(true);
+      expect(
+        ins.some((c) => c.op === OP.GET_FEATURED_FIRMWARE_DATA),
+        'no window read may go out on wire 79 against a 0.7.x build',
+      ).toBe(false);
+      /* The reads served: the derived plaintext is the synthetic image. */
+      expect(await store.load(PRESERVE_PLAIN_NAME)).not.toBeNull();
+      expect(state.imageSha256).toBe(await sha256hex(plain));
+    },
+  );
+
+  it(
+    'a 0.9.x camera keeps the wire-79 reader and names its own build',
+    { timeout: 120_000 },
+    async () => {
+      const plain = zeroXPlain(0x0200_0900, [-0x198, -0x14c, -0x144]);
+      const camera = v1Camera(plain, { version: [0, 9, 0, 2, 0, 0, 0, 0] });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'wire79' });
+      const state = await step('backup', camera, created.state, store);
+
+      expect(state.buildId).toBe('compact-0.9.0.2');
+      const ins = camera.calls.filter((c) => c.direction === 'in');
+      expect(ins.some((c) => c.op === OP.GET_FEATURED_FIRMWARE_DATA)).toBe(true);
+      expect(ins.some((c) => c.op === OP.GET_FEATURED_DATA)).toBe(false);
+    },
+  );
+
+  it(
+    'a pre-0.7 camera refuses at the version read, before any window is armed',
+    { timeout: 120_000 },
+    async () => {
+      /* 0.5.0.2 is the STOPPED generation (doc 36.7): the refusal is the
+       * doc-cited verdict, and the wire ledger shows the version read and
+       * NOTHING else — no Begin, no arm, no read of any window. */
+      const camera = v1Camera(syntheticPlain(), { version: [0, 5, 0, 2, 0, 0, 0, 0] });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'pre07' });
+      const error: unknown = await step('backup', camera, created.state, store).catch(
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(SeekError);
+      expect((error as Error).message).toMatch(/predates the widening route/);
+      expect((error as Error).message).toMatch(/0x400000/);
+      expect((error as Error).message).toMatch(/sec\. 36\.7/);
+      expect(
+        camera.calls.some((c) => c.op === OP.BEGIN_FIRMWARE_UPGRADE),
+        'no window arm may be sent against the stopped generation',
+      ).toBe(false);
+      expect(camera.calls.filter((c) => c.direction === 'out').length).toBe(0);
     },
   );
 });
@@ -1052,4 +1157,135 @@ describe('runPreserveStep — the recovery behaviours', () => {
       );
     },
   );
+});
+
+/* ==================================================================== *
+ * the 0.x line's drain plumbing: the mode-2 hazard ordering, the 0.7.0.7
+ * rotation base, and the unrotation algebra
+ * ==================================================================== */
+
+describe('the mode-2 hazard ordering, in the drain gate', () => {
+  /** A state advanced to the post-commit shape the drain gate reads, with a
+   *  recorded patch summary that carries or lacks the hazard site. */
+  const hazardState = (sites: readonly number[]): PreserveRunState => {
+    const base: PreserveRunState = {
+      version: 2,
+      imageSource: 'device',
+      slotReadShas: ['aa', 'aa'],
+      runId: 'hazard',
+      imageSha256: 'ab',
+      expectedVersion: '0.8.0.0',
+      createdAt: '2026-10-02T00:00:00Z',
+      nextStep: 'drain',
+      buildFamily: 'v1-2014',
+      buildId: 'compact-0.8.0.0',
+      capability: {
+        wholePart: true,
+        losslessReadUnit: 64,
+        modeTwoHazardSites: [0x3ce4],
+        note: 'the factory mode 2 arms *(0x14000000) — the nop site must be committed first',
+      },
+      detection: {
+        cfgHex: '00000000',
+        cfg0: 0,
+        blank: true,
+        bank: 'a',
+        bankAddress: 0x14050000,
+        bankMode: 7,
+        verdict: 'blank -> bank A',
+      },
+      patch: {
+        sites: sites.map((offset) => ({
+          name: 'site',
+          offset,
+          before: [0x1b, 0x68],
+          after: [0x00, 0xbf],
+        })),
+        rebalanceWord: 0x30000b5b,
+        stagedLength: 0x4000,
+        chunkCount: 256,
+        patchedSha256: 'ab',
+        diffCount: 12,
+      },
+      steps: {
+        backup: { status: 'done', notes: 'backup done' },
+        patch: { status: 'done', notes: 'patch done' },
+        commit: { status: 'done', notes: 'commit done' },
+      },
+    };
+    return base;
+  };
+
+  it('refuses a run whose recorded patch lacks the nop site, before any mode-2 arm', async () => {
+    const refusal = await describeStepGate('drain', hazardState([0x3d64]), never);
+    expect(refusal).toMatch(/the drain step refuses on compact-0\.8\.0\.0/);
+    expect(refusal).toMatch(/faults the camera/);
+    expect(refusal).toMatch(/0x00003CE4/);
+    expect(refusal).toMatch(/run the patch step/);
+    /* The other write steps are not mode-2 arms; they keep their ordinary
+     * refusals, not this one. */
+    for (const step of ['commit', 'restore'] as const) {
+      const other = await describeStepGate(step, hazardState([0x3d64]), never);
+      expect(other ?? '').not.toMatch(/faults the camera/);
+    }
+  });
+
+  it('lets the drain through once the patch summary carries the nop site', async () => {
+    const refusal = await describeStepGate('drain', hazardState([0x3d64, 0x3ce4]), never);
+    expect(refusal ?? '').not.toMatch(/faults the camera/);
+  });
+});
+
+describe('the 0.7.0.7 rotation — the base from the detection, and the algebra', () => {
+  const detection = (bank: 'a' | 'b' | 'r'): NonNullable<PreserveRunState['detection']> => ({
+    cfgHex: '00000000',
+    cfg0: 0,
+    blank: bank === 'a',
+    bank,
+    bankAddress: bank === 'a' ? 0x14050000 : bank === 'b' ? 0x14060000 : 0x14070000,
+    bankMode: bank === 'a' ? 7 : bank === 'b' ? 8 : 9,
+    verdict: 'test',
+  });
+
+  it('the walk serves the A/B slot the detection does not name; recovery refuses', () => {
+    expect(rotatedDrainBase(detection('a'))).toBe(0x14060000);
+    expect(rotatedDrainBase(detection('b'))).toBe(0x14050000);
+    expect(() => rotatedDrainBase(detection('r'))).toThrow(/recovery-named record/);
+    expect(() => rotatedDrainBase(detection('r'))).toThrow(/doc 36\.10/);
+  });
+
+  it('unrotateDump folds the served bytes back to part layout order', { timeout: 120_000 }, () => {
+    /* A deterministic 4 MiB part, served from base 0x14060000: served[i] ==
+     * part[(0x60000 + i) % SIZE] — the NOR alias decode the doc measured.
+     * The whole-part compares run as loops: 4M-element spreads are heavy
+     * enough to starve under the full suite's parallel load. */
+    const part = new Uint8Array(FLASH_SIZE);
+    let s = 0x2b3c4d5e;
+    for (let i = 0; i < part.length; i++) {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      part[i] = s & 0xff;
+    }
+    const base = 0x14060000;
+    const served = new Uint8Array(FLASH_SIZE);
+    for (let i = 0; i < served.length; i++) {
+      served[i] = part[(i + (base - FLASH_BASE)) % FLASH_SIZE] ?? 0;
+    }
+    const sameBytes = (a: Uint8Array, b: Uint8Array): boolean => {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+      }
+      return true;
+    };
+    const layout = unrotateDump(served, base);
+    expect(sameBytes(layout, part), 'unrotated == the part in layout order').toBe(true);
+    /* The measured donor case, at the seam: layout byte 0 is served byte
+     * 0x60000, and the wrap hands the part's head back at the end. */
+    expect(layout[0]).toBe(served[0x60000]);
+    expect(layout[FLASH_SIZE - 1]).toBe(served[0x5ffff]);
+    /* Identity when the base is the part base. */
+    expect(sameBytes(unrotateDump(part, FLASH_BASE), part)).toBe(true);
+    /* A non-slot-aligned base refuses. */
+    expect(() => unrotateDump(served, FLASH_BASE + 0x123)).toThrow(/slot-aligned/);
+  });
 });

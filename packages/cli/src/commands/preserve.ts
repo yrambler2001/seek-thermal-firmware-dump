@@ -101,17 +101,27 @@ function describeRestoreForm(form: 'capture-verbatim' | 'factory-staged' | 'none
   }
 }
 
-/** The drain line of the plan print: what this build's drain may promise. */
+/** The drain line of the plan print: what this build's drain may promise.
+ *  On a build whose capability carries per-build facts (the 0.x line's wire-88
+ *  reader, the 0.7.0.7 rotation, the mode-2 hazard ordering) the note rides
+ *  along — those lines are the honest capability statement, and the plan print
+ *  is where an operator reads it before confirming the run. */
 function describeCapability(capability: {
   wholePart: boolean;
   losslessReadUnit: number;
   maxPerArmReach?: number;
+  rotation?: { readonly walk: string; readonly measuredBase: number };
+  modeTwoHazardSites?: readonly number[];
   note: string;
 }): string {
   if (capability.wholePart) {
+    const perBuild =
+      capability.rotation !== undefined || capability.modeTwoHazardSites !== undefined
+        ? ` — ${capability.note}`
+        : '';
     return (
       `whole part: yes — one widened-window arm; lossless read unit ` +
-      `${String(capability.losslessReadUnit)} B`
+      `${String(capability.losslessReadUnit)} B${perBuild}`
     );
   }
   return `REFUSED on this build — ${capability.note}`;
