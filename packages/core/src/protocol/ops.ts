@@ -15,6 +15,24 @@ export const OP = {
   SET_OPERATION_MODE: 0x3c,
   GET_OPERATION_MODE: 0x3d,
   GET_FEATURED_FIRMWARE_DATA: 0x4f,
+  /**
+   * GetFeaturedData — the WINDOW READER of the 0.7.x builds (Compact 0.7.0.7
+   * and 0.7.0.8). Their method table carries `GetFeaturedFirmwareData` at 0x4F
+   * with the handler in the SETTER column only, and the SAME handler in the
+   * GETTER column of this row (`{kind, 'GetFeaturedData', reader, 0}` — both
+   * columns of every corpus image, `test/firmware/facts.json`), and on the wire
+   * that is what happens: after arming a window, 0x4F stalls for every request
+   * length while 0x58 serves it (measured on a 0.7.0.8 chimera, FW-V1 doc 36
+   * sec. 36.5.0: the 28-byte boot-config record came back through 0x58 while
+   * every 0x4F read stalled at status 0). On 0.8.0.0 and later the reader is
+   * 0x4F and this row routes to it too — both rows carry the handler — so the
+   * toolkit keeps 0x4F everywhere except the 0.7.x builds, whose selection is
+   * `legacyReaderOp` in `profiles/legacy-auth.ts`. NOT in `READ_ONLY_OPS`: the
+   * dump path never sends it (a dump refuses 0.7.x at the profile gate), so
+   * adding it there would only widen the surface the firmware-facts tests
+   * have to hold.
+   */
+  GET_FEATURED_DATA: 0x58,
   BEGIN_FIRMWARE_UPGRADE: 0x52,
   /**
    * The one command every corpus build answers the same way, which is what
@@ -50,6 +68,7 @@ export const OP_DIRECTION: Readonly<Record<Opcode, 'in' | 'out'>> = {
   [OP.SET_OPERATION_MODE]: 'out',
   [OP.GET_OPERATION_MODE]: 'in',
   [OP.GET_FEATURED_FIRMWARE_DATA]: 'in',
+  [OP.GET_FEATURED_DATA]: 'in',
   [OP.BEGIN_FIRMWARE_UPGRADE]: 'out',
   [OP.GET_FIRMWARE_INFO]: 'in',
   [OP.SET_FEATURED_FIRMWARE_DATA]: 'out',

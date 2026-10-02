@@ -76,6 +76,7 @@
  */
 import { hexUp, viewOf } from '../bytes.js';
 import { SeekError } from '../errors.js';
+import { OP } from '../protocol/ops.js';
 import type {
   BootPolicy,
   BootPrediction,
@@ -365,6 +366,23 @@ export function legacyUpgradeTargetBuild(version: string | null): string | null 
 function predatesReadHandler(version: string): boolean {
   const [major, minor] = version.split('.').map((n) => Number.parseInt(n, 10));
   return major === 0 && (minor ?? 0) < 8;
+}
+
+/**
+ * The wire id the WINDOW READER answers on for one build of this line, as the
+ * build's own method table registers it: 0x4F (`GetFeaturedFirmwareData`)
+ * everywhere except the 0.7.x builds, whose table puts the handler in the
+ * SETTER column of 0x4F and the SAME handler in the GETTER column of the
+ * 0x58 row (`GetFeaturedData`) — and on the wire 0x4F stalls for every
+ * request length while 0x58 serves the window (measured on a 0.7.0.8 chimera,
+ * FW-V1 doc 36 sec. 36.5.0). On 0.8.0.0 and later both rows carry the handler
+ * and the reader is 0x4F, so 0x4F stays the answer there; the preservation
+ * pipeline applies this once per session, right after the version read, by
+ * way of the device's `windowReadOp`.
+ */
+export function legacyReaderOp(version: string | null): number {
+  const v = normalisedVersion(version);
+  return v?.startsWith('0.7.') === true ? 0x58 : OP.GET_FEATURED_FIRMWARE_DATA;
 }
 
 const plainOrAuth = {

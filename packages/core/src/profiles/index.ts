@@ -60,6 +60,7 @@ export {
   authPayload,
   buildLegacyWindowMap,
   legacyAuth,
+  legacyReaderOp,
   legacySelectorRows,
   legacyWindowPlan,
 } from './legacy-auth.js';

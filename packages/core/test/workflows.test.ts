@@ -417,7 +417,7 @@ describe('runDump', () => {
     expect(record.shortfallFilled?.length).toBe(WINDOW_SIZE - stallOffset);
     expect(record.shortfallFilled?.fill).toBe(hex(0xff, 2));
     expect(record.shortfallFilled?.reason).toMatch(
-      /GetFeaturedFirmwareData|no more data|short chunk/,
+      /window read \(op 0x4f\)|GetFeaturedFirmwareData|no more data|short chunk/,
     );
 
     /* the bytes that DID arrive are kept, and exactly the rest is filled */

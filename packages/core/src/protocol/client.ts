@@ -73,6 +73,20 @@ export class SeekDevice {
    * emulated camera's time under the emulator suites (TESTING.md sec.19, 20).
    */
   readonly clock: DeadlineClock;
+  /**
+   * The wire id the WINDOW READER answers on for the connected build — the
+   * opcode `readArmed` (and the preservation pipeline's drain, which rides the
+   * same primitive) sends its data-stage asks to. The default is 0x4F
+   * (`GetFeaturedFirmwareData`), right for every build from 0.8.0.0 on; the
+   * 0.7.x builds serve the window through 0x58 instead (their table puts the
+   * handler in 0x4F's setter column, and 0x4F stalls for every request length
+   * — FW-V1 doc 36 sec. 36.5.0), so a caller that knows the version sets this
+   * to `legacyReaderOp(version)` once per session, right after the version
+   * read. Until it is set, a session simply speaks the 0.8+ shape — which is
+   * why the steps that talk to a 0.7.x camera apply it BEFORE the first
+   * window read, never after.
+   */
+  windowReadOp: number = OP.GET_FEATURED_FIRMWARE_DATA;
 
   constructor(transport: UsbTransport, options: SeekDeviceOptions = {}) {
     this.transport = transport;
@@ -253,7 +267,7 @@ export class SeekDevice {
       for (let attempt = 0; ; attempt++) {
         try {
           blk = await this.rpcIn(
-            OP.GET_FEATURED_FIRMWARE_DATA,
+            this.windowReadOp,
             Math.min(size, remaining),
             attempt === 0 ? USB_TIMEOUT_MS : USB_PROBE_TIMEOUT_MS,
           );
@@ -274,7 +288,7 @@ export class SeekDevice {
 
       if (blk === null) {
         stopReason =
-          `GetFeaturedFirmwareData stopped at offset ${hex(got, 4)} even at ` +
+          `window read (op ${hex(this.windowReadOp)}) stopped at offset ${hex(got, 4)} even at ` +
           `${String(size)}-byte requests: ${errorMessage(lastError)}`;
         break;
       }

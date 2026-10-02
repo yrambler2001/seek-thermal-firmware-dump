@@ -265,6 +265,10 @@ export class FakeCamera implements UsbTransport {
         return out.subarray(0, Math.min(length, 2));
       }
       case OP.GET_FEATURED_FIRMWARE_DATA:
+      case OP.GET_FEATURED_DATA:
+        /* Both reader rows answer the same window: the 0.7.x builds register
+         * the read handler in 0x58's getter (and 0x4F's setter), and a device
+         * pointed at them by `legacyReaderOp` asks 0x58 (doc 36.5.0). */
         return this.readArmedWindow(length);
       case OP.GET_FIRMWARE_INFO: {
         /* SELECTOR 0 IS THE DEFAULT, not "no selector". This used to stall an

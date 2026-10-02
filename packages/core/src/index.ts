@@ -219,6 +219,7 @@ export {
   getProfile,
   hasCapability,
   legacyAuth,
+  legacyReaderOp,
   legacySelectorRows,
   legacyWindowPlan,
   listProfiles,

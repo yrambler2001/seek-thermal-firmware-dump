@@ -103,7 +103,7 @@ describe('readWindow', () => {
 
     expect(got.data.length).toBe(0x8000);
     expect(got.stoppedAt).toBe(0x8000);
-    expect(got.stopReason).toMatch(/GetFeaturedFirmwareData stopped at offset 0x8000/);
+    expect(got.stopReason).toMatch(/window read \(op 0x4f\) stopped at offset 0x8000/);
     expect(got.stopReason).toMatch(new RegExp(`even at ${String(MIN_READ_CHUNK)}-byte requests`));
     expect(got.chunkUsed).toBe(MIN_READ_CHUNK);
     expect(got.shrank).toBe(true);
