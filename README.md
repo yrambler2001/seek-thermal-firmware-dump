@@ -214,7 +214,8 @@ command set. Nothing in the dump view reaches it.
 pipeline for the v1 "locked line" cameras. These are the builds whose write path the profiles
 refuse, and that refusal is still right for the general `flash` command; this pipeline is a
 separate, explicit, operator-invoked route that exists because in-place preservation cannot be
-done read-only. It started with Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0 (FW-V1 docs 33 sec. 11.7 and 34) and now covers eight builds across three cipher/acceptance families. The command takes NO
+done read-only. It started with Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0 (FW-V1 docs 33 sec. 11.7 and 34) and now covers sixteen builds across three cipher/acceptance families — the eight 2014
+Compact 0.x builds (0.7.0.7 .. 0.10.0.0) joined in the doc-36 campaign. The command takes NO
 image argument: the backup step reads the active slot's image TWICE (two independent captures
 that must agree byte for byte — a disagreement refuses the run), derives the factory plaintext
 from that capture (identity on the 2014 plain chain, the build family's keystream solver on a
@@ -223,13 +224,39 @@ runs.
 
 ### The supported builds
 
-| Build                                   | Family       | Patch                                                              | Staged form                        | Restore                 | Drain (whole part)                                                                                                                   |
-| --------------------------------------- | ------------ | ------------------------------------------------------------------ | ---------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0     | v1-2014      | widen + the 3-halfword reader trio, word 142 rebalanced            | plain (the capture, conjugated)    | capture verbatim        | yes — one widened-window arm; byte-exact at the 64-byte ask                                                                          |
-| Compact 1.3.0.8 (8 Hz "insecure")       | v1-2014      | widen only (the 2017 reader is already 32-bit; no guard), `0x3000` | plain                              | capture verbatim        | yes — proven in-place on the 2014 donor                                                                                              |
-| Compact 1.3.0.8 FF (16 Hz)              | v1-2014-ff   | guard + widen, word 142 := `0x485523E8` (the accept solve)         | plain ⊕ ks0 ⊕ ksD (two keystreams) | **refused** (see below) | commit + drain proven **through the recovery slot only**; the in-place variant is derived, not run                                   |
-| Compact Pro 1.0.3.0 (9 Hz)              | compact-2016 | guard + widen (by shape), `0xF1003000`                             | plain ⊕ ks(block 0)                | factory image, staged   | yes — the doc-33 chain                                                                                                               |
-| Compact Pro 1.0.3.2 (9 Hz and 18 Hz FF) | compact-2016 | guard + widen + the arm-tail hook nop, `0x29FD6B0F`                | plain ⊕ ks(block 0)                | factory image, staged   | **refused** — 128 B is the lossless read unit and the EP0 sessions die at ~64–81 KB; backup → patch → commit → restore → verify only |
+| Build                                                    | Family       | Patch                                                              | Staged form                        | Restore                 | Drain (whole part)                                                                                                                                                                                                              |
+| -------------------------------------------------------- | ------------ | ------------------------------------------------------------------ | ---------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0                      | v1-2014      | widen + the 3-halfword reader trio, word 142 rebalanced            | plain (the capture, conjugated)    | capture verbatim        | yes — one widened-window arm; byte-exact at the 64-byte ask                                                                                                                                                                     |
+| Compact 0.9.0.2 / 0.9.0.6 / 0.9.0.7 / 0.9.1.0 / 0.10.0.0 | v1-2014      | widen + the reader trio (per-layout offsets), word 142 rebalanced  | plain                              | capture verbatim        | yes — 10 bytes move; full in-place proven on the emulator (doc 36.4); stock cap 65,536 B/arm                                                                                                                                    |
+| Compact 0.8.0.0 / 0.7.0.8                                | v1-2014      | widen + trio + the mode-2 indirection nop (12 bytes)               | plain                              | capture verbatim        | yes — the nop site MUST be committed before any mode-2 arm (the factory mode 2 arms `*(0x14000000)` and faults under an armed read); full in-place through ip3; the ip4 boot-back stage is open (transport timeouts, doc 36.10) |
+| Compact 0.7.0.7                                          | v1-2014      | widen + trio (9 bytes, word 142 := `0x00009240`)                   | plain                              | capture verbatim        | yes — reads on **wire 88**, and the widened window serves the part ROTATED from the slot the cfg does not name (slot B on the donor); the drain unrotates; full in-place incl. the boot-back (doc 36.4.2)                       |
+| Compact 1.3.0.8 (8 Hz "insecure")                        | v1-2014      | widen only (the 2017 reader is already 32-bit; no guard), `0x3000` | plain                              | capture verbatim        | yes — proven in-place on the 2014 donor                                                                                                                                                                                         |
+| Compact 1.3.0.8 FF (16 Hz)                               | v1-2014-ff   | guard + widen, word 142 := `0x485523E8` (the accept solve)         | plain ⊕ ks0 ⊕ ksD (two keystreams) | **refused** (see below) | commit + drain proven **through the recovery slot only**; the in-place variant is derived, not run                                                                                                                              |
+| Compact Pro 1.0.3.0 (9 Hz)                               | compact-2016 | guard + widen (by shape), `0xF1003000`                             | plain ⊕ ks(block 0)                | factory image, staged   | yes — the doc-33 chain                                                                                                                                                                                                          |
+| Compact Pro 1.0.3.2 (9 Hz and 18 Hz FF)                  | compact-2016 | guard + widen + the arm-tail hook nop, `0x29FD6B0F`                | plain ⊕ ks(block 0)                | factory image, staged   | **refused** — 128 B is the lossless read unit and the EP0 sessions die at ~64–81 KB; backup → patch → commit → restore → verify only                                                                                            |
+
+Three 0.x-specific facts the plan print states and the gates enforce:
+
+- **The 0.x line is emulator-proven, not hardware-proven.** Every 0.x patch was derived from the
+  images' bytes and measured end-to-end on the emulator against the plaintext 1.3.0.0 donor
+  (FW-V1 doc 36.4); no native flash dump of any of these builds exists, so a hardware run is
+  the first silicon evidence for each. The capability line each run prints says so.
+- **The 0.7.x builds serve their reader on wire 88 (`GetFeaturedData`), not 79.** Their method
+  table puts the read handler in 0x4F's setter column, and 0x4F stalls for every request length.
+  The pipeline selects the reader wire from the version (0.4F everywhere else); on 0.7.0.7 the
+  widened mode-2 window serves the part from the A/B slot the boot config does NOT name (measured
+  slot B `0x14060000` on the donor's blank record), so the drain unrotates the served bytes
+  before the delivered dump is built.
+- **On 0.8.0.0 and 0.7.0.8 the factory mode-2 row is a crash hazard**: it loads the word stored
+  AT `0x14000000` (the bootloader vector's initial SP) and an armed read walks off SRAM —
+  measured on 0.8.0.0 (32 KiB served, then the guest faulted). The patch turns that dereference
+  into a nop, and the drain gate refuses a run whose recorded patch lacks the site: the nop is
+  applied BEFORE any mode-2 arm is ever sent.
+
+The builds OLDER than 0.7.0.7 (0.3.0.1, 0.5.x, 0.6.0.4) are refused with the doc-cited verdict:
+the route does not port to that generation (every arm shape answers `0x400000`, the mode-2 row
+is not a `0x14000000`-named window, and the widen constant is not the patchable two-store
+immediate — FW-V1 doc 36.7), and no standard dump path exists on it either.
 
 Two build-specific facts the plan print states and the gates enforce:
 

@@ -4773,3 +4773,170 @@ Nothing. The seam signature, the result shape and the run-state schema are uncha
 only new user-visible fact is the backup log/detail line, which now names the solve method
 (`r16-state-from-crib+keyblock-verify (…)` on a cipher family, `identity — …` on the plain
 chain) — the wizard's plan-from-state screen already prints whatever the step recorded.
+
+## 32. The 0.x line joins the preservation pipeline: eight 2014 builds, the wire-88 reader, the rotated drain, and the honest boundaries (2026-10-02)
+
+FW-V1 doc 36 derived and emulator-proved the widening chain down the 2014 Compact line — stage 1
+(0.8.0.0, 0.9.0.2, 0.9.0.6, 0.9.0.7, 0.9.1.0, 0.10.0.0) and stage 2 (0.7.0.7, 0.7.0.8). This
+workstream ports those eight builds into the preservation pipeline of `refactor/all-firmware-profiles`:
+the patch table, the reader wire, the drain geometry, the refusals, the tests, and the docs. The
+doc is the authority for every number; each one is re-derived here from the vendored corpus
+images and pinned by test, so a doc fact and a code fact cannot drift.
+
+### 32.1 The build table, as landed
+
+All eight are the PLAINTEXT chain — word sum 0, banks stored as-is, no key material — so each is
+family `v1-2014`: the identity solve owns their captures, the staged form is the conjugated
+capture, and the restore stages the capture verbatim. Detection is per build: the unique widen
+tail (`63614ff48033a3602361` — the 1.3.0.0 generation's tail, exactly one per image), the reader
+trio at the build's layout deltas FROM it (three layout groups: A `−0x198/−0x14c/−0x144` for the
+0.9.x/0.10 builds, B `−0x1a8/−0x15c/−0x154` for 0.8.0.0/0.7.0.8, C `−0x1a2/−0x156/−0x14e` for
+0.7.0.7), the indirect mode-2 body present iff the build carries the extra site, and finally the
+header's own version word at 0x20c — because within a layout group the sibling builds are
+BYTE-IDENTICAL apart from version identity (0.9.0.7 vs 1.0.0.0: 18 differing bytes, all of them
+header word 0x208, the version strings and the build timestamps; pinned in
+`families.test.ts`). The 1.x table (`v1-2014`) now carries the 1.x version-word set for the same
+reason: two matching profiles is a refusal, never a guess.
+
+| build    | sites (raw)                                                   | word 142     | bytes | staged (== patched) sha256 / sum16 / chunks |
+| -------- | ------------------------------------------------------------- | ------------ | ----- | ------------------------------------------- |
+| 0.7.0.7  | widen 0x3C86, trio 0x3AE4/0x3B30/0x3B38                       | `0x00009240` | 9     | `8b06ed2b…` / `0x1C76` / 752                |
+| 0.7.0.8  | widen 0x3C2C, trio 0x3A84/0x3AD0/0x3AD8, nop 0x3BAC           | `0x30000B5B` | 12    | `a0c0b711…` / `0x825A` / 729                |
+| 0.8.0.0  | widen 0x3D64, trio 0x3BBC/0x3C08/0x3C10, nop 0x3CE4           | `0x30000B5B` | 12    | `524974d1…` / `0x0407` / 738                |
+| 0.9.0.2  | widen 0x3DCC, trio 0x3C34/0x3C80/0x3C88                       | `0x30006240` | 10    | `9e901cf2…` / `0x28F1` / 741                |
+| 0.9.0.6  | as 0.9.0.2                                                    | `0x30006240` | 10    | `b6ff6a6c…` / `0xF013` / 737                |
+| 0.9.0.7  | widen 0x3DB4, trio 0x3C1C/0x3C68/0x3C70 (the 1.3.0.0 offsets) | `0x30006240` | 10    | `6d280454…` / `0x26F2` / 740                |
+| 0.9.1.0  | as 0.9.0.2                                                    | `0x30006240` | 10    | `ba22185e…` / `0x28F1` / 741                |
+| 0.10.0.0 | as 0.9.0.2                                                    | `0x30006240` | 10    | `7457fed1…` / `0x29EF` / 741                |
+
+Every site is before-byte gated; the trio needles are not unique in an image, so each trio site
+is located as the widen tail's offset plus its measured delta and then gated. The two nop sites
+(the mode-2 indirection `2f4b1b68` → `00bf`) are first-class gated sites and occur exactly once
+in their builds and in NO direct-mode-2 build.
+
+### 32.2 Wire 88: the reader id, and the plumbing
+
+The 0.7.x builds put their read handler in the SETTER column of 0x4F and the SAME handler in the
+GETTER column of the 0x58 row (`GetFeaturedData`; both columns of every corpus image,
+`firmware/facts.json` — pinned by test now), and on the wire 0x4F stalls for every request
+length while 0x58 serves the window (doc 36.5.0). The change surface:
+
+- `protocol/ops.ts` — `OP.GET_FEATURED_DATA = 0x58` (control IN; NOT in `READ_ONLY_OPS`: the
+  dump path never sends it, and adding it there would widen the surface the facts tests hold
+  without a user).
+- `protocol/client.ts` — `SeekDevice.windowReadOp` (default 0x4F), used by `readArmed`.
+- `profiles/legacy-auth.ts` — `legacyReaderOp(version)`: 0x58 for the 0.7.x builds, 0x4F for
+  everything else (0.8.0.0+ carry the handler on BOTH rows; the toolkit keeps 0x4F there).
+- `preservation/pipeline.ts` — `drainExact` and the patch probe read through
+  `device.windowReadOp`.
+- `preservation/steps.ts` — every session applies the op right after the version fact is known:
+  the backup step from the version it just read, commit/drain/restore through `gateVersion`,
+  the drain's attempt sessions and verify from the state's pinned version. A 0.7.x session never
+  sends a window read to 0x4F (asserted on the fake camera's ledger in `steps.test.ts`).
+
+The emulator pin files (`expectations.rpc.json` / `expectations.roundtrip.json`) needed NO
+regeneration: the tier-1/tier-2 suites measure the DUMP surface, and the dump path refuses the
+0.7.x builds exactly as before (`compact-2014`'s no-read-handler gate) — the wire-88 selection
+lives in the preservation pipeline, which the pins do not drive. A dump-path reader for 0.7.x
+would be its own campaign (their tables decode, but the plan/gap machinery is written for the
+0.4F reader).
+
+### 32.3 The 0.7.0.7 rotation
+
+0.7.0.7's mode-2 row shares mode 0's body — the boot-config walk that arms the A/B slot the
+active-slot word does NOT name (measured slot B `0x14060000` on the donor's blank record; doc
+36.4.2 and 36.10.3) — so a whole-part drain serves part[base:] and wraps through the NOR's own
+alias decode. `rotatedDrainBase(detection)` resolves the base (A or blank → B, B → A; a
+recovery-named record was never measured and REFUSES), `unrotateDump(dump, base)` folds the
+served bytes back to layout order, and the drain step does three things with it: the probe's
+expectation is cut at the ROTATED address's true bytes, the post-write artifact is the
+UNROTATED part (so raw == post-commit holds on every build, and the served bytes' own sha rides
+in the step notes), and the delivered dump is post-processed from the unrotated part as usual.
+A whole-part in-order drain would need a mode-2 body rewrite (a third patch shape) and was not
+pursued — the unrotation is the doc's own comparison, made before delivery instead of after.
+
+### 32.4 The mode-2 hazard, and its ordering
+
+On 0.8.0.0 and 0.7.0.8 the factory mode-2 row is the INDIRECT pair — it arms `*(0x14000000)`
+(the bootloader vector's initial SP), and an armed read served 32 KiB of SRAM and then faulted
+the guest (measured, doc 36.3.1). The nop that makes the arm safe is part of the patch, and the
+ORDER is enforced: `DrainCapability.modeTwoHazardSites` names the offsets that MUST be among the
+run's recorded patch sites, and the drain gate refuses before any mode-2 arm if one is missing
+(`steps.test.ts` pins both the refusal and the pass). The commit step never arms mode 2; the
+drain arms it only after the reset into the patched image.
+
+### 32.5 The refusals
+
+- Pre-0.7 (0.3.0.1, 0.5.0.2, 0.5.1.0, 0.5.1.3, 0.6.0.4): refused at the backup step's version
+  read — BEFORE any window is armed — and again in `buildV1Patch`'s fallback, with the doc 36.7
+  evidence cited (every arm shape answers `0x400000`, a code outside even the reconstruction's
+  own status taxonomy; the mode-2 row is not a `0x14000000`-named window; the widen constant is
+  not the patchable two-store immediate) and the note that no standard dump path exists on the
+  generation either. The wire ledger of the refusal is asserted: the version read and NOTHING
+  else (`steps.test.ts`).
+- 2018+ (modern/nano): the existing refusal is unchanged (the standard dump workflow pointer).
+- An already-patched 0.x bank still refuses at the derivation (the widen tail needle carries the
+  pre-patch byte, so a patched image matches no profile and the fallback fires).
+
+### 32.6 The emulator proofs (this tree, this workstream)
+
+All three rows on the doc's donor chimera (`compact/2014.10.21-14.58.29-1.3.0.0/101310HSNEA2/dump`,
+`--jedec 010215`), self-sourced exactly like the §31 rows: the run is created empty, the backup
+double-reads the active slot, the identity solve derives the image, the build table names the
+build, and the six steps run on the §24 choreography (commit server → drain ladder → restore →
+verify). The commit's diff vs as-booted is EXACTLY the build's enumerated patch bytes (asserted
+against the emulator's own `.final`), raw == post-commit, delivered == as-booted, restored
+`.final` == as-booted, verify 0 diffs / 31 windows.
+
+- **Compact 0.7.0.7 — the wire-88 + rotation row.** The whole backup (31 windows), the boot-config
+  reads, the bank heads, the 4 MiB drain and the 31-window verify ALL rode wire 88. The drain
+  took 153.3 s on the one arm; the unrotated raw sha256 is `8f7f7aaaf5ce51c5…` (== the post-commit
+  state, 0 diffs), and the delivered dump sha256 `4a7088301ab7779365…` == the as-booted part
+  byte for byte — the rotation came back out of the delivered image, and the restore's `.final`
+  proved == as-booted offline. The 9 patch bytes land at the ROTATED offsets exactly as the
+  doc's ip2 measured. (The doc's own 0707 shas are taken on the ROTATED served stream — the
+  pre-unrotation bytes this pipeline now folds back before delivery.)
+- **Compact 0.9.0.7 — the plain 0.8+ shape, and THE DOC REPRODUCED.** Commit phase 76.2 s;
+  drain 165.5 s on the one arm; **raw sha256 `ad37c52f633caec914eb69ddd4c1d57dfde32b02e477f8…`
+  — the doc 36.4.2 ip2 drain sha, byte for byte** — and the delivered dump == the as-booted
+  part == the restore re-drain sha `42f87074acfe66d4f4d5b26ffde89571de4e385…`, the doc's ip3
+  number, also byte for byte. A different code tree, five months after the doc's campaign,
+  reproduces the measured part exactly.
+- **Compact 0.8.0.0 — the hazard row, and THE DOC REPRODUCED AGAIN.** The patch carries the
+  mode-2 nop (12 bytes); commit phase 78.7 s; drain 163.6 s on the one arm — **raw sha256
+  `c82556c179bbea185b1a5a0cfec19bcaa46495f6d6e6232393d4d174b464b8a5`, the doc 36.4.2 ip2 sha
+  byte for byte** — and delivered == as-booted == restored `.final`
+  `b3d69955f73500db31c1d88be56699081d9cf6774b21e4d66f5…`, the doc's ip3 sha, byte for byte.
+  The arming of mode 2 happened only after the nop was committed, which is the ordering §32.4
+  pins.
+
+(The per-row sha256 lines are printed by the suite on stderr at `GREEN`.)
+
+### 32.7 What the tests pin
+
+`families.test.ts` — the eight corpus images sha-identical to doc 36.1; each build detects as
+exactly its own profile (and never as a sibling or the 1.x table); per build: site offsets, the
+rebalance word, the enumerated diff set, staged == patched, sum16, chunk count, staged sha256,
+capability fields (rotation / hazard sites); the flipped-trio-byte refusal; the 0.9.0.7 vs
+1.0.0.0 sibling fact; the 0.5.0.2 doc-cited refusal; `legacyReaderOp`'s table; and the
+facts-pinned 0x58 getter shape on every corpus image.
+`steps.test.ts` — a 0.7.0.7 camera reads its windows on wire 88 and none on 79 (fake-camera
+ledger), a 0.9.x camera keeps 79 and names its build, the pre-0.7 camera refuses before any
+window arm, the hazard ordering in the drain gate (refusal + pass), `rotatedDrainBase`'s
+detection table (recovery refuses), and the unrotation algebra on a deterministic 4 MiB part.
+`patch.test.ts` — the synthetic v1-2014 image now carries the 1.3.0.0 version word (the detect
+gate).
+`protocol.test.ts` / `workflows.test.ts` — the stop-reason text now names the op it read on.
+
+### 32.8 The honest limits, stated where an operator reads them
+
+- **Emulator-proven only.** No native flash dump of any of the eight builds exists; every proof
+  is the emulator against the plaintext 1.3.0.0 donor. The capability line each run prints says
+  so, and the first hardware run is the first silicon evidence for the build it runs on.
+- **The ip4 boot-back gaps on 0.8.0.0 and 0.7.0.8** are the doc's own (transport timeouts, not
+  the patch; doc 36.10 item 5) and the capability lines carry them; 0.7.0.7's ip4 is GREEN on
+  the rotated compare, and the 0.9.x/0.10 ip4s are green.
+- **The stock cap** is exactly 65,536 B per arm on 0.9.x/0.10 (measured twice, byte-counted to
+  exhaustion; the refusal is a STALL with wire 53 = `0x30200`); 0.7.x's unpatched mode-2 serves
+  the slot window (0.7.0.7) or 0 B (0.7.0.8); 0.8.0.0's faults the guest. The 64-B single-token
+  ask is the drain shape everywhere (READ_CHUNK default), one drain per server.
