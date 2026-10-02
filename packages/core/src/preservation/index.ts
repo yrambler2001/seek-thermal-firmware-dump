@@ -57,8 +57,11 @@ export {
   WINDOW_BYTES,
   bankWindow,
   cfgWindow,
+  doubleReadWindows,
   parseBootConfig,
+  planWindowAt,
   preservationWindows,
+  spentReaderRefusal,
   widenedWindow,
 } from './windows.js';
 export type { BankKey, SlotDetection } from './windows.js';
@@ -114,6 +117,7 @@ export {
   nextStepAfter,
   recordStepFailure,
   runPreserveStep,
+  spentReaderSignature,
 } from './steps.js';
 export type {
   CreatePreserveRunOptions,

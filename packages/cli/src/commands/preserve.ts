@@ -131,6 +131,60 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** The failure shapes that mean the camera's window reader is spent for this
+ *  boot (TESTING.md secs. 23.3, 28.4 and the 2026-10-02 incident): a read
+ *  that stalls — at offset 0 most of all — or a capture that comes back
+ *  blank or as stale descriptor bytes. The core refusals for those shapes
+ *  carry these words; a raw wire stall carries "stall"/"did not answer". */
+const SPENT_READER_FAILURE =
+  /stall|did not answer|stopped at offset 0|spent reader|all-blank read|0xFF-fill|stale reader descriptor/i;
+
+/**
+ * The power-cycle acknowledgement a failed backup must pass before it re-runs
+ * (core's retry gate): the instruction prints, and --yes or a fresh terminal
+ * confirmation must assert the camera actually was power-cycled — core cannot
+ * observe one, so the assertion is the front end's.
+ */
+async function requirePowerCycleAcknowledgement(
+  ctx: CommandContext,
+  runDir: string,
+): Promise<boolean> {
+  ctx.reporter.log(
+    'the previous backup attempt failed — power-cycle the camera first (unplug and replug ' +
+      'it, or use its power switch): a retry against the same boot can serve stale or blank ' +
+      'window bytes',
+    'warn',
+  );
+  if (ctx.options.yes) {
+    ctx.reporter.log('--yes given: asserting the camera was power-cycled', 'warn');
+    return true;
+  }
+  if (!ctx.io.stdinIsTty) {
+    throw new CliError(
+      'refusing to re-run the backup after a failure without the power-cycle confirmation: ' +
+        'stdin is not a terminal, so there is nobody to ask',
+      {
+        code: 'flash/refused',
+        hint:
+          'Power-cycle the camera (unplug and replug it, or use its power switch), then ' +
+          're-run with --yes to assert it was power-cycled.',
+      },
+    );
+  }
+  const confirmed = await ctx.io.confirm(
+    'Have you power-cycled the camera since that failed backup (unplug and replug it, or ' +
+      'use its power switch)? [y/N] ',
+  );
+  if (!confirmed) {
+    throw new CliError(
+      'aborted at the power-cycle prompt — nothing was re-read; power-cycle the camera and ' +
+        `re-run \`preserve --resume ${runDir}\``,
+      { code: 'flash/refused' },
+    );
+  }
+  return true;
+}
+
 /** A cancelled run is an interrupt (exit 130, previous checkpoint stands), not
  *  a failed step — both shapes the run can arrive in are recognised here. */
 function isCancellation(error: unknown): boolean {
@@ -484,23 +538,41 @@ async function runSteps(
   while (state.nextStep !== 'done') {
     const step: PreserveStepId = state.nextStep;
     ctx.reporter.log(`— ${step} —`, 'info');
+    /* THE RETRY GATE: a failed backup re-runs only past the power-cycle
+     * acknowledgement — core refuses it otherwise (describeStepGate), and the
+     * flag passed here is this front end's assertion, asked for on a terminal
+     * or carried by --yes. */
+    const powerCycled =
+      step === 'backup' && state.steps.backup?.status === 'failed'
+        ? await requirePowerCycleAcknowledgement(ctx, runDir)
+        : false;
     let outcome;
     try {
-      outcome = await runPreserveStep(
-        step,
-        opener,
-        state,
-        loadArtifact,
-        ctx.reporter,
-        ctx.signal,
-        options.allowJump === true ? { allowJump: true } : {},
-      );
+      outcome = await runPreserveStep(step, opener, state, loadArtifact, ctx.reporter, ctx.signal, {
+        ...(options.allowJump === true ? { allowJump: true } : {}),
+        ...(powerCycled ? { powerCycled: true } : {}),
+      });
     } catch (error) {
       if (isCancellation(error)) throw error;
       /* The failure is checkpointed; --print-state reports it, and the step
        * can be re-run (a `failed` record never blocks). */
       state = recordStepFailure(state, step, error);
       await saveRunState(runDir, state);
+      /* THE FIRST-ATTEMPT REMEDY: a fresh run whose first backup stalls at
+       * its first bytes or comes back blank is almost always a spent reader —
+       * say the power cycle before any retry is even thinkable. */
+      if (
+        step === 'backup' &&
+        initialState.steps.backup === undefined &&
+        SPENT_READER_FAILURE.test(error instanceof Error ? error.message : String(error))
+      ) {
+        ctx.reporter.log(
+          'a backup that stalls at its first bytes or comes back blank usually means the ' +
+            "camera's window reader is spent for this boot — power-cycle the camera (unplug " +
+            'and replug it, or use its power switch) before any retry',
+          'warn',
+        );
+      }
       ctx.reporter.log(
         `${step} failed: ${error instanceof Error ? error.message : String(error)} — ` +
           `recorded in ${runDir}/${PRESERVE_RUN_STATE_FILE}; ` +

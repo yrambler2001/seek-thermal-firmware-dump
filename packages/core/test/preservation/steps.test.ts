@@ -45,6 +45,7 @@ import { FLASH_SIZE } from '../../src/profiles/modern-4x.js';
 import { SeekDevice } from '../../src/protocol/client.js';
 import { OP } from '../../src/protocol/ops.js';
 import {
+  BOOT_CONFIG_BYTES,
   PRESERVE_BANK_CAPTURE_FILE,
   PRESERVE_BACKUP_FILE,
   PRESERVE_DUMP_ORIGINAL_FILE,
@@ -55,9 +56,13 @@ import {
   backupResultFromImage,
   createPreserveRun,
   describeStepGate,
+  doubleReadWindows,
+  parseBootConfig,
+  planWindowAt,
   recordStepFailure,
   rotatedDrainBase,
   runPreserveStep,
+  spentReaderSignature,
   unrotateDump,
   type PreserveArtifactLoader,
   type PreserveRunState,
@@ -206,18 +211,23 @@ class StalledWire79Device extends SeekDevice {
 }
 
 /**
- * A device whose wire-79 reads go bad once a given window is RE-ARMED — the
- * read glitch the double read exists to catch: the backup's pass over the
- * bank's window comes through clean, and everything after the bank window is
- * armed a second time (the active slot's SECOND read) serves one flipped byte
- * per chunk. The two captures then disagree, and the step must refuse.
+ * A device whose wire-79 reads go bad once a given window is armed a THIRD
+ * time — the read glitch the double read exists to catch. The arms of the
+ * watched window come in a fixed order: the backup sweep's arm (clean), the
+ * double read's FIRST arm — the bank window (clean), and the double read's
+ * SECOND arm — the plan window, from which every serve carries one flipped
+ * byte per chunk. The two captures then disagree, and the step must refuse;
+ * a build that collapsed the double read onto one arm would serve both reads
+ * clean and this test would not refuse.
  */
 class GlitchySecondReadDevice extends SeekDevice {
   private readonly watchSubcmd: number;
+  private readonly glitchFromArm: number;
   private armed = 0;
-  constructor(camera: FakeCamera, watchSubcmd: number) {
+  constructor(camera: FakeCamera, watchSubcmd: number, glitchFromArm = 3) {
     super(camera, { reporter: silentReporter });
     this.watchSubcmd = watchSubcmd;
+    this.glitchFromArm = glitchFromArm;
   }
   override async armWindow(...args: Parameters<SeekDevice['armWindow']>): Promise<void> {
     if (args[0].subcmd === this.watchSubcmd) this.armed += 1;
@@ -225,7 +235,7 @@ class GlitchySecondReadDevice extends SeekDevice {
   }
   override async rpcIn(op: number, length: number, timeoutMs?: number): Promise<Uint8Array> {
     const data = await super.rpcIn(op, length, timeoutMs);
-    if (op === OP.GET_FEATURED_FIRMWARE_DATA && this.armed >= 2) {
+    if (op === OP.GET_FEATURED_FIRMWARE_DATA && this.armed >= this.glitchFromArm) {
       const out = new Uint8Array(data);
       out[0] = (out[0] ?? 0) ^ 0xff;
       return out;
@@ -315,9 +325,9 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
     const camera = v1Camera(plain);
     const store = memoryStore();
     const created = await createPreserveRun({ runId: 'double-read' });
-    /* Bank A's window is mode 7: the backup armed it once and read it
-     * clean; the second read re-arms it, and from that arm on every wire-79
-     * serve carries one flipped byte. */
+    /* Bank A's window is mode 7: the backup armed it once (clean), the double
+     * read's first arm — the bank window — reads clean, and from the second
+     * arm — the plan window — every wire-79 serve carries one flipped byte. */
     const corruptedOpener: SessionOpener = {
       open: async () => {
         await camera.open();
@@ -440,7 +450,15 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
       expect(await sha256hex(derived!)).toBe(state.imageSha256);
       expect([...derived!]).toEqual([...plain]);
       expect(state.steps.backup?.notes).toMatch(/both reads agree/);
+      expect(state.steps.backup?.notes).toMatch(
+        /two arms \(bank window mode 7, plan window mode 7\)/,
+      );
       expect(state.steps.backup?.notes).toMatch(/identity/);
+      /* THE TWO ARMS, on the wire: mode 7 went out THREE times — the sweep's
+       * arm, then the double read's bank-window arm and its plan-window arm,
+       * with the boot-config read (mode 3) between sweep and double read. */
+      expect(camera.arms.slice(-3)).toEqual([3, 7, 7]);
+      expect(camera.arms.filter((mode) => mode === 7)).toHaveLength(3);
       /* The capture, as before, is the bank verbatim. */
       const capture = await store.load(PRESERVE_BANK_CAPTURE_FILE);
       expect(capture?.length).toBe(0x10000);
@@ -595,8 +613,143 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
 });
 
 /* ==================================================================== *
- * the gates
+ * the spent-reader refusals and the two-arm double read — the 2026-10-02
+ * incident's fixes: the double read draws on two descriptor lifetimes, and a
+ * capture that came back from a spent reader names the power-cycle remedy
+ * before anything else
  * ==================================================================== */
+
+describe('the spent-reader refusals and the two-arm double read', () => {
+  const plain = syntheticPlain();
+
+  it('selects the mode pair per bank: the bank window and the matching plan window', () => {
+    /* The pair per bank — two arms covering the same 64 KiB block. The plan's
+     * row at a bank address IS the bank's row (modes 7/8/9 are both), so the
+     * two mode ids come out equal for every bank; what makes the reads
+     * independent is that each is its own arm, each with its own reader
+     * descriptor — the firmware re-stages the descriptor at every
+     * BeginFirmwareUpgrade. */
+    expect(doubleReadWindows('a').map((entry) => [entry.subcmd, entry.address])).toEqual([
+      [7, 0x14050000],
+      [7, 0x14050000],
+    ]);
+    expect(doubleReadWindows('b').map((entry) => [entry.subcmd, entry.address])).toEqual([
+      [8, 0x14060000],
+      [8, 0x14060000],
+    ]);
+    expect(doubleReadWindows('r').map((entry) => [entry.subcmd, entry.address])).toEqual([
+      [9, 0x14070000],
+      [9, 0x14070000],
+    ]);
+    /* Two distinct descriptors: the bank entry is the write-capable window,
+     * the plan entry is the sweep's own row. */
+    const [bankEntry, planEntry] = doubleReadWindows('a');
+    expect(bankEntry.note).toMatch(/write-capable/);
+    expect(planEntry.note).toMatch(/protected window/);
+    /* A block the plan does not cover refuses rather than guesses. */
+    expect(() => planWindowAt(0x14000000)).toThrow(/names no window at 0x14000000/);
+  });
+
+  it(
+    'an all-blank capture refuses with the power-cycle remedy first',
+    { timeout: 120_000 },
+    async () => {
+      /* The bank holds nothing but 0xFF: the sweep reads it fine, the two
+       * arms agree on an all-blank capture, and the derivation refuses with
+       * the spent-reader diagnosis — a reader state, not an image — before
+       * any cipher talk. */
+      const flash = new Uint8Array(FLASH_SIZE).fill(0xff);
+      new DataView(flash.buffer).setUint32(BOOT_CFG_OFFSET, 0xffffffff, true);
+      const camera = v1Camera(plain, { flash });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'blank' });
+      const error: unknown = await step('backup', camera, created.state, store).catch(
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(SeekError);
+      const message = (error as Error).message;
+      expect(message.startsWith('the camera’s window reader is budgeted per boot')).toBe(true);
+      expect(message).toMatch(
+        /power-cycle the camera \(unplug and replug it, or use its power switch\)/,
+      );
+      expect(message).toMatch(/preserve --resume/);
+      expect(message).toMatch(/every byte of the capture is 0xFF \(an all-blank read\)/);
+      /* The generic puzzle text stays out of this shape. */
+      expect(message).not.toMatch(/do not yield the factory plaintext/);
+    },
+  );
+
+  it(
+    'a stale-descriptor capture (the bootloader vector) refuses with the remedy, not a cipher puzzle',
+    { timeout: 120_000 },
+    async () => {
+      /* The 2026-10-02 incident's capture shape: a spent reader serves the
+       * BOOTLOADER block's first words into the bank read — initial SP
+       * 0x10018000, reset 0x14000269 — where a real bank image's own first
+       * word is a different SP (0x10008000 on the real 1.3.0.0). */
+      const flash = new Uint8Array(FLASH_SIZE).fill(0xff);
+      const dv = new DataView(flash.buffer);
+      dv.setUint32(BOOT_CFG_OFFSET, 0xffffffff, true);
+      dv.setUint32(BANK_A_OFFSET, 0x10018000, true);
+      dv.setUint32(BANK_A_OFFSET + 4, 0x14000269, true);
+      const camera = v1Camera(plain, { flash });
+      const store = memoryStore();
+      const created = await createPreserveRun({ runId: 'stale' });
+      const error: unknown = await step('backup', camera, created.state, store).catch(
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(SeekError);
+      const message = (error as Error).message;
+      expect(message.startsWith('the camera’s window reader is budgeted per boot')).toBe(true);
+      expect(message).toMatch(/preserve --resume/);
+      expect(message).toMatch(/0x10018000/);
+      expect(message).toMatch(/stale reader descriptor/);
+      expect(message).toMatch(/initial SP/);
+      expect(message).not.toMatch(/do not yield the factory plaintext/);
+    },
+  );
+
+  it('a boot-config read served as the bootloader’s SP refuses with the remedy, not the slot table', () => {
+    /* parseBootConfig on the incident's stale bytes: cfg[0]=0x10018000. The
+     * refusal leads with the remedy and never presents the word as a
+     * boot-config puzzle. */
+    const block = new Uint8Array(BOOT_CONFIG_BYTES).fill(0xff);
+    new DataView(block.buffer).setUint32(0, 0x10018000, true);
+    const error: unknown = (() => {
+      try {
+        parseBootConfig(block);
+        return null;
+      } catch (e: unknown) {
+        return e;
+      }
+    })();
+    expect(error).toBeInstanceOf(SeekError);
+    expect(
+      (error as Error).message.startsWith('the camera’s window reader is budgeted per boot'),
+    ).toBe(true);
+    expect((error as Error).message).toMatch(/initial SP/);
+    expect((error as Error).message).toMatch(/preserve --resume/);
+    expect((error as Error).message).not.toMatch(/names no slot/);
+    /* A genuinely unknown selector word keeps the slot-table refusal. */
+    const other = new Uint8Array(BOOT_CONFIG_BYTES).fill(0xff);
+    new DataView(other.buffer).setUint32(0, 5, true);
+    expect(() => parseBootConfig(other)).toThrow(/names no slot/);
+  });
+
+  it('a real bank capture is not mistaken for a stale descriptor: the app image’s own SP word differs', () => {
+    /* The guard against false refusals: a real 1.3.0.0 bank capture starts
+     * with the app's own vector (SP 0x10008000, handlers in SRAM) — the
+     * same SRAM-shaped neighbourhood as the bootloader's 0x10018000, and it
+     * must NOT carry the spent-reader signature. The real words come off
+     * the donor J-Link dump (bank A at 0x14050000). */
+    const capture = new Uint8Array(0x10000).fill(0xff);
+    const dv = new DataView(capture.buffer);
+    dv.setUint32(0, 0x10008000, true);
+    dv.setUint32(4, 0x1008066d, true);
+    dv.setUint32(0x200, 0xa1b2c3d4, true);
+    expect(spentReaderSignature(capture)).toBeNull();
+  });
+});
 
 describe('describeStepGate — every prerequisite refusal', () => {
   const plain = syntheticPlain();
@@ -788,13 +941,52 @@ describe('describeStepGate — every prerequisite refusal', () => {
     },
   );
 
-  it('a failed step does not block its own re-run', { timeout: 120_000 }, async () => {
-    const { state } = await createPreserveRun({ runId: 'gates' });
-    const failed = recordStepFailure(state, 'backup', new Error('the camera came unplugged'));
-    expect(failed.steps.backup?.status).toBe('failed');
-    expect(failed.steps.backup?.error).toBe('the camera came unplugged');
-    expect(await describeStepGate('backup', failed, never)).toBeNull();
-  });
+  it(
+    'a failed step does not block its own re-run — past the power-cycle ack for backup',
+    { timeout: 120_000 },
+    async () => {
+      const { state } = await createPreserveRun({ runId: 'gates' });
+      const failed = recordStepFailure(state, 'backup', new Error('the camera came unplugged'));
+      expect(failed.steps.backup?.status).toBe('failed');
+      expect(failed.steps.backup?.error).toBe('the camera came unplugged');
+      /* The retry gate: a failed backup names the power cycle and the honest
+       * limit of the acknowledgement — core cannot observe one. */
+      const refusal = await describeStepGate('backup', failed, never);
+      expect(refusal).toMatch(/must be POWER-CYCLED/);
+      expect(refusal).toMatch(
+        /Power-cycle the camera \(unplug and replug it, or use its power switch\)/,
+      );
+      expect(refusal).toMatch(/Core cannot observe the power cycle/);
+      expect(refusal).toMatch(/preserve --resume/);
+      expect(refusal).toMatch(/the camera came unplugged/);
+      /* The acknowledgement opens it. */
+      expect(await describeStepGate('backup', failed, never, { powerCycled: true })).toBeNull();
+    },
+  );
+
+  it(
+    'the power-cycle gate applies only to a failed backup — never to a fresh run or another step',
+    { timeout: 120_000 },
+    async () => {
+      const { state } = await createPreserveRun({ runId: 'gates' });
+      /* A fresh run: no backup record, no gate. */
+      expect(await describeStepGate('backup', state, never)).toBeNull();
+      /* A failure of another step carries no power-cycle record and does not
+       * gate the backup shape. */
+      const failedPatch = recordStepFailure(state, 'patch', new Error('no plaintext'));
+      expect(failedPatch.steps.patch?.powerCycleRequired).toBeUndefined();
+      const failedRestore = recordStepFailure(state, 'restore', new Error('stalled'));
+      expect(failedRestore.steps.restore?.powerCycleRequired).toBeUndefined();
+      /* A failed backup whose record predates the field (an old run directory)
+       * does not gate either — the gate reads the recorded field, not the
+       * status alone. */
+      const legacy: PreserveRunState = {
+        ...state,
+        steps: { ...state.steps, backup: { status: 'failed', error: 'old failure' } },
+      };
+      expect(await describeStepGate('backup', legacy, never)).toBeNull();
+    },
+  );
 });
 
 /* ==================================================================== *

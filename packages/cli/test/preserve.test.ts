@@ -37,6 +37,7 @@ import {
   type UsbBackend,
 } from '@seek-fw/core';
 import { FakeCamera, type FakeWindowSpec } from '../../core/test/fake-transport.js';
+import type { StallPoint } from '../../core/test/fake-transport.js';
 import { run } from '../src/cli.js';
 import { EXIT_CANCELLED, EXIT_FAILED, EXIT_OK, EXIT_USAGE } from '../src/errors.js';
 import { fixedBackend, tempDir, testIo } from './helpers.js';
@@ -103,7 +104,11 @@ function v1WindowMap(): FakeWindowSpec[] {
 
 function v1Camera(
   plain: Uint8Array,
-  options: { readonly flash?: Uint8Array; readonly stallDrain?: boolean } = {},
+  options: {
+    readonly flash?: Uint8Array;
+    readonly stallDrain?: boolean;
+    readonly stallAt?: readonly StallPoint[];
+  } = {},
 ): FakeCamera {
   const flash =
     options.flash ??
@@ -113,14 +118,15 @@ function v1Camera(
       bytes.set(plain, BANK_A_OFFSET);
       return bytes;
     })();
+  const stallAt: readonly StallPoint[] | undefined =
+    /* the widened window never answers, for the stallDrain shape */
+    options.stallAt ?? (options.stallDrain === true ? [{ subcmd: 2, offset: 0 }] : undefined);
   return new FakeCamera({
     flash,
     windows: v1WindowMap(),
     authBanks: [3, 4, 5, 6, 7, 8, 9],
     fwInfo: new Map([[0, Uint8Array.from([1, 3, 0, 0, 0, 0, 0, 0])]]),
-    ...(options.stallDrain === true
-      ? { stallAt: [{ subcmd: 2, offset: 0 }] } /* the widened window never answers */
-      : {}),
+    ...(stallAt === undefined ? {} : { stallAt }),
   });
 }
 
@@ -362,6 +368,101 @@ describe('preserve — a fresh run, checkpointed after every step', () => {
     expect(code).toBe(EXIT_USAGE);
     expect(refused.stderr.text).toMatch(/unexpected argument/);
   });
+});
+
+/* ==================================================================== *
+ * the spent-reader retry gate: a failed backup re-runs only past the
+ * power-cycle acknowledgement (the 2026-10-02 incident: a backup attempt +
+ * retry back-to-back with no reset served stale and blank descriptor bytes)
+ * ==================================================================== */
+
+describe('preserve — the power-cycle retry gate on a failed backup', () => {
+  it(
+    'the fresh run suggests the power cycle on a stall; the retry asks, and --yes asserts',
+    { timeout: 180_000 },
+    async () => {
+      const plain = syntheticPlain();
+      /* The second sweep window never answers — the stall-at-offset-0 shape
+       * of the incident (the fake's stand-in for a spent reader). */
+      const wedged = v1Camera(plain, { stallAt: [{ subcmd: 4, offset: 0 }] });
+
+      /* THE FIRST ATTEMPT of the fresh run: the failure line is preceded by
+       * the one-line remedy — say the power cycle before any retry. (Under a
+       * plain run the reporter's lines are on stdout; stderr carries the
+       * top-level error line.) */
+      const first = testIo({ backend: backendOf(wedged) });
+      expect(await run(['preserve', '--out', runDir(), '--yes'], first.io, signal())).toBe(
+        EXIT_FAILED,
+      );
+      expect(first.stdout.text).toMatch(
+        /window reader is spent for this boot — power-cycle the camera .* before any retry/,
+      );
+      expect(first.stderr.text).toMatch(/error: P1: backup window 0x14020000 .* did not answer/);
+      expect(first.stdout.text).toMatch(/backup failed: .*0x14020000/);
+      const torn = await loadState();
+      expect(torn.nextStep).toBe('backup');
+      expect(torn.steps.backup?.status).toBe('failed');
+
+      /* THE RETRY on a terminal: the instruction prints, the prompt gates,
+       * and a decline re-reads nothing. */
+      const declined = testIo({ backend: backendOf(wedged), stdinIsTty: true, answers: [false] });
+      expect(await run(['preserve', '--resume', runDir()], declined.io, signal())).toBe(
+        EXIT_FAILED,
+      );
+      expect(declined.stdout.text).toMatch(
+        /power-cycle the camera first \(unplug and replug it, or use its power switch\)/,
+      );
+      expect(declined.questions).toHaveLength(1);
+      expect(declined.questions[0]).toMatch(/power-cycled the camera since that failed backup/);
+      expect(declined.stderr.text).toMatch(/aborted at the power-cycle prompt/);
+
+      /* Accepting the prompt asserts the power cycle into core: the gate
+       * opens, the camera is still wedged, and the backup fails again — the
+       * failure is recorded and the gate stands for the next attempt. */
+      const retry = testIo({ backend: backendOf(wedged), stdinIsTty: true, answers: [true] });
+      expect(await run(['preserve', '--resume', runDir()], retry.io, signal())).toBe(EXIT_FAILED);
+      expect(retry.questions).toHaveLength(1);
+      expect(retry.stdout.text).toMatch(/backup failed:/);
+      expect((await loadState()).steps.backup?.status).toBe('failed');
+
+      /* --yes asserts the power cycle without a prompt. */
+      const asserted = testIo({ backend: backendOf(wedged) });
+      expect(await run(['preserve', '--resume', runDir(), '--yes'], asserted.io, signal())).toBe(
+        EXIT_FAILED,
+      );
+      expect(asserted.stdout.text).toMatch(/--yes given: asserting the camera was power-cycled/);
+      expect(asserted.questions).toHaveLength(0);
+    },
+  );
+
+  it(
+    'recovers end to end once the camera answers again: no prompt on a clean camera, prompt still asked for the failed record',
+    { timeout: 180_000 },
+    async () => {
+      const plain = syntheticPlain();
+      const asBooted = new Uint8Array(v1Camera(plain).flash);
+      const wedged = v1Camera(plain, { stallAt: [{ subcmd: 4, offset: 0 }] });
+      expect(
+        await run(
+          ['preserve', '--out', runDir(), '--yes'],
+          testIo({ backend: backendOf(wedged) }).io,
+          signal(),
+        ),
+      ).toBe(EXIT_FAILED);
+
+      /* The power cycle that revives the camera — the same part, reading now.
+       * The retry (tty) is asked once, answers yes, and the whole run lands:
+       * the gate exists to make the operator say the camera was cycled, not
+       * to keep a healthy run from finishing. */
+      const revived = v1Camera(plain, { flash: wedged.flash });
+      const recovered = testIo({ backend: backendOf(revived), stdinIsTty: true, answers: [true] });
+      expect(await run(['preserve', '--resume', runDir()], recovered.io, signal())).toBe(EXIT_OK);
+      expect(recovered.questions).toHaveLength(1);
+      expect((await loadState()).nextStep).toBe('done');
+      const delivered = await readFile(join(runDir(), PRESERVE_DUMP_ORIGINAL_FILE));
+      expect(await sha256hex(new Uint8Array(delivered))).toBe(await sha256hex(asBooted));
+    },
+  );
 });
 
 /* ==================================================================== *

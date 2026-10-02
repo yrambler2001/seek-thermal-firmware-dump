@@ -9,15 +9,19 @@
  * everything it produced in the caller's hands:
  *
  *   backup  — the 31 stock windows, the active-bank capture read TWICE (two
- *             independent captures that must agree byte for byte — a read
- *             glitch becomes a refusal, never a write), the factory plaintext
- *             DERIVED from that capture (`solve.ts`: identity on the plain
- *             chain, the family's keystream solver on a cipher family), the
- *             whole gate set run on the derived image, and the standard dump
- *             archive (decrypted slots, reports, manifest) built offline from
- *             the assembled backup. Read-only. THIS is the user's pre-flash
- *             dump of every region the stock plan can read, and it is handed
- *             over before anything write-shaped can possibly run.
+ *             independent captures through TWO ARMS — the bank window and the
+ *             matching plan window, two descriptor lifetimes — that must agree
+ *             byte for byte; a read glitch becomes a refusal, never a write),
+ *             the factory plaintext DERIVED from that capture (`solve.ts`:
+ *             identity on the plain chain, the family's keystream solver on a
+ *             cipher family), the whole gate set run on the derived image, and
+ *             the standard dump archive (decrypted slots, reports, manifest)
+ *             built offline from the assembled backup. Read-only. THIS is the
+ *             user's pre-flash dump of every region the stock plan can read,
+ *             and it is handed over before anything write-shaped can possibly
+ *             run. A failed backup re-runs only past a power-cycle
+ *             acknowledgement (`powerCycled`), because a retry against the
+ *             same boot reads a spent reader.
  *   patch   — offline, no device: buildV1Patch from the factory plaintext,
  *             refusing on every before-byte gate, and the patched image.
  *   commit  — the conjugated in-place patch into the active bank, staged
@@ -66,10 +70,11 @@ import {
 import { bytesToHex, equalBytes, hexToBytes, hexUp, isoStamp, sha256hex, utf8 } from '../bytes.js';
 import { CancelledError, SeekError } from '../errors.js';
 import type { Artifact, Reporter } from '../events.js';
-import { parseImageHeader } from '../image/header.js';
+import { HEADER_OFFSET, HEADER_SIZE, parseImageHeader } from '../image/header.js';
 import { FLASH_BASE, FLASH_SIZE } from '../profiles/modern-4x.js';
 import { legacyReaderOp } from '../profiles/legacy-auth.js';
 import { getProfile } from '../profiles/registry.js';
+import type { WindowEntry } from '../profiles/types.js';
 import type { SeekDevice } from '../protocol/client.js';
 import { decryptDump } from '../workflows/decrypt.js';
 import { profileInfoOf } from '../workflows/types.js';
@@ -114,7 +119,9 @@ import {
   BANKS,
   WINDOW_BYTES,
   bankWindow,
+  doubleReadWindows,
   preservationWindows,
+  spentReaderRefusal,
   type BankKey,
   type SlotDetection,
 } from './windows.js';
@@ -156,6 +163,12 @@ export interface PreserveStepRecord {
   /** sha256 of every artifact the step emitted, by artifact name — what a
    *  later step (and `--print-state`) checks the run directory against. */
   readonly artifactShas?: Record<string, string>;
+  /** Set on a FAILED backup record: the camera must be power-cycled before
+   *  this step re-runs (a retry against the same boot can serve stale or
+   *  blank window bytes — the 2026-10-02 incident). `describeStepGate`
+   *  refuses a backup re-run until the caller asserts the power cycle
+   *  (`powerCycled`), which core itself cannot observe. */
+  readonly powerCycleRequired?: boolean;
 }
 
 /** The patch summary, as the run state carries it after the patch step. */
@@ -462,12 +475,18 @@ function routeRefusal(state: PreserveRunState): string | null {
  * already-original detection, verify's 0-diff proof). Both front ends gate
  * the override behind their loudest interaction — the CLI's `--from-step`
  * with its WARNING line, the web's danger dialog.
+ *
+ * `options.powerCycled` is the same shape of honesty on the backup's retry:
+ * a FAILED backup record re-runs only past an explicit assertion that the
+ * camera was power-cycled since the failure. Core cannot observe a power
+ * cycle — the flag is an assertion by the front end (the CLI asks on a
+ * terminal, or `--yes` asserts it), and the gate's text says so.
  */
 export async function describeStepGate(
   step: PreserveStepId,
   state: PreserveRunState,
   loadArtifact: PreserveArtifactLoader,
-  options: { readonly allowJump?: boolean } = {},
+  options: { readonly allowJump?: boolean; readonly powerCycled?: boolean } = {},
 ): Promise<string | null> {
   if (state.nextStep === 'done') {
     return `this run is done — every step completed (run ${state.runId})`;
@@ -488,6 +507,27 @@ export async function describeStepGate(
         return (
           'the backup cannot re-run: this run has already completed ' +
           `${doneSteps.join(', ')} and its next step is ${state.nextStep} — use --resume`
+        );
+      }
+      /* THE RETRY GATE: a failed backup re-runs only past the power-cycle
+       * acknowledgement. The camera's window reader is budgeted per boot, and
+       * the incident this gate exists for is a backup attempt + retry
+       * back-to-back with no reset — the second pass served stale and blank
+       * descriptor bytes. */
+      if (
+        state.steps.backup?.status === 'failed' &&
+        state.steps.backup.powerCycleRequired === true &&
+        options.powerCycled !== true
+      ) {
+        return (
+          'the previous backup attempt failed, and the camera must be POWER-CYCLED before ' +
+          'this step re-runs — a retry against the same boot can serve stale or blank window ' +
+          'bytes (measured: a retried backup served the bootloader vector’s initial-SP word ' +
+          'into the boot-config read). Power-cycle the camera (unplug and replug it, or use ' +
+          'its power switch), then re-run `preserve --resume <run-directory>`. Core cannot ' +
+          'observe the power cycle — the acknowledgement is an assertion by the front end ' +
+          '(the CLI asks on a terminal; --yes asserts it). The recorded failure: ' +
+          (state.steps.backup.error ?? '(no error text)')
         );
       }
       return null;
@@ -678,7 +718,7 @@ export async function runPreserveStep(
   loadArtifact: PreserveArtifactLoader,
   reporter: Reporter,
   signal?: AbortSignal,
-  options: { readonly allowJump?: boolean } = {},
+  options: { readonly allowJump?: boolean; readonly powerCycled?: boolean } = {},
 ): Promise<PreserveStepOutcome> {
   const refusal = await describeStepGate(step, state, loadArtifact, options);
   if (refusal !== null) throw new SeekError('pipeline/refused', refusal);
@@ -704,7 +744,10 @@ export async function runPreserveStep(
 /**
  * The failed-step record a checkpointing caller persists when a step threw.
  * (A cancellation is NOT recorded — an interrupted run's previous checkpoint
- * stands.)
+ * stands.) A failed BACKUP record carries `powerCycleRequired`: the retry
+ * gate refuses its re-run until the front end asserts the camera was
+ * power-cycled, because a retry against the same boot is exactly how the
+ * 2026-10-02 incident turned a refused backup into a stale-byte second pass.
  */
 export function recordStepFailure(
   state: PreserveRunState,
@@ -721,6 +764,7 @@ export function recordStepFailure(
         status: 'failed',
         error: error instanceof Error ? error.message : String(error),
         finishedAt: new Date().toISOString(),
+        ...(step === 'backup' ? { powerCycleRequired: true } : {}),
       },
     },
   };
@@ -856,26 +900,118 @@ export function backupResultFromImage(image: Uint8Array): BackupResult {
  * backup — the 31 windows, the double-read capture, the derived image
  * ==================================================================== */
 
-/** The bank the backup just captured, read AGAIN as an independent capture:
- *  the bank window is re-armed and the whole 64 KiB served through the drain
- *  path — a different reader shape than the backup pass's `readArmed`, so the
- *  two captures share no ask sequence. THE RULE: the two reads must agree
- *  byte for byte. A read glitch must become a refusal, never a write — the
- *  capture is the restore source and the patch's derivation input, and a
- *  camera that cannot serve its own slot twice in a row is not a camera to
- *  write to. */
-async function readSlotAgain(
+/** One arm of the double read: arm `entry` and serve the whole 64 KiB through
+ *  the drain path. A stall here is the spent-reader signature — the reads
+ *  came back from a reader this boot already spent — so the error carries the
+ *  power-cycle remedy, not a bare wire failure. */
+async function armAndDrainSlot(
+  device: SeekDevice,
+  entry: WindowEntry,
+  label: string,
+  signal: AbortSignal | undefined,
+): Promise<Uint8Array> {
+  await device.armWindow(entry);
+  try {
+    return await drainExact(device, WINDOW_BYTES, label, {
+      chunk: READ_CHUNK,
+      retries: 3,
+      timeoutMs: 20000,
+      ...(signal === undefined ? {} : { signal }),
+    });
+  } catch (error) {
+    if (isWireStall(error)) {
+      throw new SeekError(
+        'pipeline/refused',
+        spentReaderRefusal(
+          `${label} stalled at ${error instanceof Error ? error.message : String(error)}`,
+        ),
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+/** The active slot's double read, as TWO INDEPENDENT ARMS covering the same
+ *  64 KiB block (`doubleReadWindows`: the bank window, mode 7/8/9 per
+ *  detection, and the plain plan window whose address equals the bank's). Two
+ *  arms = two BeginFirmwareUpgrade descriptors = two independent read
+ *  budgets; the reader of the real Compact is budgeted per boot, and one arm
+ *  asked twice for 64 KiB truncates mid-stream (TESTING.md secs. 23.3, 28.4).
+ *  THE RULE, unchanged: the two reads must agree byte for byte. A read glitch
+ *  must become a refusal, never a write — the capture is the restore source
+ *  and the patch's derivation input, and a camera that cannot serve its own
+ *  slot twice in a row is not a camera to write to. */
+async function readSlotTwice(
   device: SeekDevice,
   bank: BankKey,
   signal: AbortSignal | undefined,
-): Promise<Uint8Array> {
-  await device.armWindow(bankWindow(bank));
-  return drainExact(device, WINDOW_BYTES, 'the active slot’s second read', {
-    chunk: READ_CHUNK,
-    retries: 3,
-    timeoutMs: 20000,
-    ...(signal === undefined ? {} : { signal }),
-  });
+): Promise<{ reads: readonly [Uint8Array, Uint8Array]; modes: readonly [number, number] }> {
+  const [bankEntry, planEntry] = doubleReadWindows(bank);
+  const first = await armAndDrainSlot(
+    device,
+    bankEntry,
+    `the active slot’s first read (the bank window, mode ${String(bankEntry.subcmd)})`,
+    signal,
+  );
+  const second = await armAndDrainSlot(
+    device,
+    planEntry,
+    `the active slot’s second read (the plan window, mode ${String(planEntry.subcmd)})`,
+    signal,
+  );
+  return { reads: [first, second], modes: [bankEntry.subcmd, planEntry.subcmd] };
+}
+
+/**
+ * The spent-reader signatures a capture can carry, checked before any
+ * candidate is derived. On the real Compact the window reader is budgeted per
+ * boot (emulator: the cursor resets per re-arm — the gap that hid this), so a
+ * camera whose reads arrive after the budget is spent serves BLANK bytes or
+ * STALE DESCRIPTOR bytes, and no solver can read an image out of either. The
+ * shapes, from the 2026-10-02 incident: an all-0xFF capture; a header window
+ * that is 0xFF-fill so no magic can be read; and the bootloader vector's own
+ * first words (initial SP 0x10018000, reset address in the bootloader block
+ * 0x1400xxxx — the REAL bootloader block starts exactly so, and a real bank
+ * image never does: its SP word is its own, e.g. 0x10008000) served through a
+ * descriptor still pointing at the boot block. Returns the signature text, or
+ * null when the capture does not carry one of these shapes.
+ */
+export function spentReaderSignature(capture: Uint8Array): string | null {
+  let allBlank = true;
+  for (const byte of capture) {
+    if (byte !== 0xff) {
+      allBlank = false;
+      break;
+    }
+  }
+  if (allBlank) return 'every byte of the capture is 0xFF (an all-blank read)';
+  if (capture.length >= 8) {
+    const dv = new DataView(capture.buffer, capture.byteOffset, capture.byteLength);
+    const word0 = dv.getUint32(0, true);
+    const word1 = dv.getUint32(4, true);
+    if (word0 === 0x10018000 && word1 >>> 16 === 0x1400) {
+      return (
+        `the capture’s first words are ${hexUp(word0)} / ${hexUp(word1 & ~1)} — the ` +
+        'bootloader vector’s own initial SP and reset address served through a stale reader ' +
+        'descriptor, not the bank’s image'
+      );
+    }
+  }
+  let headerFill = true;
+  for (let i = HEADER_OFFSET; i < HEADER_OFFSET + HEADER_SIZE; i++) {
+    if (capture[i] !== 0xff) {
+      headerFill = false;
+      break;
+    }
+  }
+  if (headerFill) {
+    return (
+      'the capture’s header window (0x200..0x240) is 0xFF-fill — no image magic can be read ' +
+      'from it'
+    );
+  }
+  return null;
 }
 
 /**
@@ -897,6 +1033,10 @@ function deriveFactoryImage(
 ): { plain: Uint8Array; patch: V1Patch; method: string } {
   const attempts: { plain: Uint8Array; method: string }[] = [];
   const reasons: string[] = [];
+  /* The spent-reader check comes FIRST: a capture carrying one of those
+   * shapes is a reader state, not an image, and the refusal must say the one
+   * thing that un-blocks the camera before any cipher talk. */
+  const spent = spentReaderSignature(capture);
   for (const family of ['v1-2014', 'v1-2014-ff', 'compact-2016'] as const) {
     const solved = solvePlainFromCapture(family, capture);
     if (solved.ok) attempts.push({ plain: solved.plain, method: solved.method });
@@ -919,6 +1059,14 @@ function deriveFactoryImage(
       );
     }
   }
+  if (spent !== null) {
+    fail(
+      spentReaderRefusal(
+        `${spent} — no factory plaintext can be derived from these bytes. Every candidate was ` +
+          `tried:\n  - ${reasons.join('\n  - ')}`,
+      ),
+    );
+  }
   fail(
     'the two agreeing reads of the active slot do not yield the factory plaintext, and the ' +
       'run refuses rather than write over a slot it cannot read. Every candidate was tried:\n  - ' +
@@ -927,9 +1075,10 @@ function deriveFactoryImage(
 }
 
 /** One capture-and-derive pass, against the bank `detection` names: the
- *  double read, the expected-prefix gate (when the slot key is known), and
- *  the derivation with its gate set. The FF route's re-point runs this twice —
- *  the first pass names the build, the second captures the bank that runs. */
+ *  double read (two independent arms — see `readSlotTwice`), the
+ *  expected-prefix gate (when the slot key is known), and the derivation with
+ *  its gate set. The FF route's re-point runs this twice — the first pass
+ *  names the build, the second captures the bank that runs. */
 async function captureAndDerive(
   device: SeekDevice,
   byAddress: ReadonlyMap<number, Uint8Array>,
@@ -942,6 +1091,7 @@ async function captureAndDerive(
   detection: SlotDetection;
   capture: Uint8Array;
   slotReadShas: readonly [string, string];
+  readModes: readonly [number, number];
   derived: ReturnType<typeof deriveFactoryImage>;
 }> {
   const captured = byAddress.get(detection.bankAddress);
@@ -951,9 +1101,9 @@ async function captureAndDerive(
         `${detection.bankAddress.toString(16)} — the stock windows cannot serve it`,
     );
   }
-  const capture = new Uint8Array(captured);
+  const { reads, modes } = await readSlotTwice(device, detection.bank, signal);
+  const [capture, second] = reads;
   const sha1 = await sha256hex(capture);
-  const second = await readSlotAgain(device, detection.bank, signal);
   const sha2 = await sha256hex(second);
   if (!equalBytes(capture, second)) {
     fail(
@@ -962,7 +1112,12 @@ async function captureAndDerive(
         'capture is the restore source and the patch’s derivation input',
     );
   }
-  reporter.log(`the active slot read twice: both reads agree (sha256 ${sha1})`, 'detail');
+  reporter.log(
+    `the active slot read twice, through two arms (bank window mode ` +
+      `${String(modes[0])}, plan window mode ${String(modes[1])}): both reads agree ` +
+      `(sha256 ${sha1})`,
+    'detail',
+  );
 
   /* The strongest keyless gate that survives, when the slot key is known
    * (the emulator's donor): the capture must be the factory image as the
@@ -985,7 +1140,7 @@ async function captureAndDerive(
       `build ${derived.patch.buildId} (family ${derived.patch.family})`,
     'detail',
   );
-  return { detection, capture, slotReadShas: [sha1, sha2] as const, derived };
+  return { detection, capture, slotReadShas: [sha1, sha2] as const, readModes: modes, derived };
 }
 
 async function runBackupStep(
@@ -1052,6 +1207,7 @@ async function runBackupStep(
       detection: read2.detection,
       capture: read2.capture,
       slotReadShas: read2.slotReadShas,
+      readModes: read2.readModes,
       derived: read2.derived,
       repointed: didRepoint,
       assembled: assembleBackupImage(byAddress),
@@ -1121,8 +1277,10 @@ async function runBackupStep(
         startedAt,
         `${String(BACKUP_WINDOW_COUNT)} windows (${String(
           BACKUP_WINDOW_COUNT * WINDOW_BYTES,
-        )} B) backed up; ${read.detection.verdict}; the active slot read twice, both reads ` +
-          `agree (sha256 ${read.slotReadShas[0]}); the factory plaintext derived from the ` +
+        )} B) backed up; ${read.detection.verdict}; the active slot read twice through two ` +
+          `arms (bank window mode ${String(read.readModes[0])}, plan window mode ` +
+          `${String(read.readModes[1])}), both reads agree (sha256 ${read.slotReadShas[0]}); ` +
+          'the factory plaintext derived from the ' +
           `capture (${read.derived.method}, ${String(read.derived.plain.length)} B) and gated; ` +
           `build ${patch.buildId}` +
           (read.repointed

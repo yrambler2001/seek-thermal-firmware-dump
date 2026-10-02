@@ -99,6 +99,57 @@ export function bankWindow(key: BankKey): WindowEntry {
   };
 }
 
+/** The plan's own window for one 64 KiB block — the entry of
+ *  `preservationWindows()` whose address equals `address`. The plan covers
+ *  every block of 0x14010000..0x141FFFFF exactly once, so a bank address
+ *  always resolves; anything else refuses rather than guess. */
+export function planWindowAt(address: number): WindowEntry {
+  const entry = preservationWindows().find((w) => w.address === address);
+  if (entry === undefined) {
+    throw new SeekError(
+      'pipeline/refused',
+      `the stock window plan names no window at ${hexUp(address, 8)} — the plan covers ` +
+        '0x14010000..0x141FFFFF, one 64 KiB block per mode',
+    );
+  }
+  return entry;
+}
+
+/**
+ * The two independently-armed windows the backup's double read serves the
+ * active slot through: the bank's own window (mode 7/8/9 per `BANKS`) and the
+ * plain plan window whose address equals the bank's. Two arms = two separate
+ * BeginFirmwareUpgrade descriptors — the firmware's arm handler re-stages the
+ * reader descriptor at every arm (remaining, cursor, capacity, source) — so
+ * the two reads draw on two descriptor lifetimes rather than on one arm whose
+ * budget the first read already spent. Measured on the real Compact
+ * (TESTING.md secs. 23.3, 28.4 and the 2026-10-02 incident): a window re-read
+ * through a spent arm truncates mid-stream, so the double read may never ask
+ * one arm for the whole 64 KiB twice.
+ *
+ * For every bank the two entries carry the SAME mode id — the plan's row at a
+ * bank address IS the bank's row (modes 7/8/9 are both the bank windows and
+ * plan modes 3..9) — the pair is still two arms, each with its own descriptor.
+ */
+export function doubleReadWindows(bank: BankKey): readonly [WindowEntry, WindowEntry] {
+  const bankEntry = bankWindow(bank);
+  return [bankEntry, planWindowAt(bankEntry.address)];
+}
+
+/**
+ * The lead every spent-reader refusal carries, with the read's own signature
+ * after it. The wording is shared so every refusal that names the remedy names
+ * it the same way: the diagnosis and the power-cycle remedy FIRST (the one
+ * action that un-blocks a real camera), the technical detail after.
+ */
+export function spentReaderRefusal(signature: string): string {
+  return (
+    'the camera’s window reader is budgeted per boot and these reads came back from a spent ' +
+    'reader — power-cycle the camera (unplug and replug it, or use its power switch), then ' +
+    `re-run \`preserve --resume <run-directory>\`. Signature: ${signature}`
+  );
+}
+
 /** The widened mode-2 window entry (P3's drain). */
 export function widenedWindow(): WindowEntry {
   return {
@@ -173,6 +224,23 @@ export function parseBootConfig(block: Uint8Array): SlotDetection {
       bankMode: mode,
       verdict: `cfg[0]=${String(cfg0)} names bank ${key} (${hexUp(address)})`,
     };
+  }
+  /* A word shaped like the bootloader vector's own initial SP (an SRAM
+   * address, 0x10018000 measured on the real Compact) is the stale-descriptor
+   * signature: a spent reader serving the bootloader block's first bytes into
+   * the boot-config read. That is a reader state, not a boot-config puzzle —
+   * the refusal leads with the power-cycle remedy, never with the slot table.
+   */
+  if (cfg0 >= 0x10000000 && cfg0 < 0x20000000) {
+    throw new SeekError(
+      'pipeline/refused',
+      spentReaderRefusal(
+        `cfg[0]=${hexUp(cfg0)} is an SRAM-shaped word — the bootloader vector’s initial SP ` +
+          'served through a stale reader descriptor, not a record the bootloader wrote — and ' +
+          'no slot can be named from it; nothing is written',
+      ),
+      { detail: { cfg0: cfg0 >>> 0 } },
+    );
   }
   throw new SeekError(
     'pipeline/refused',
