@@ -4655,3 +4655,121 @@ miss; it is a labelled alert on the row, not a log line.
   the stuck jump; the wizard offers the past-commit jump the six-step version refused to
   offer (core's `allowJump` exists, and the task that rework answered asked for it wired
   to a dialog).
+
+## 31. The cipher families solve the slot: the keystream state from the crib, and the capture that closes (2026-10-02)
+
+§29.2 ended with both cipher families refusing at the seam. This workstream lands them:
+`solvePlainFromCapture('v1-2014-ff' | 'compact-2016')` now answers with the factory plaintext
+or a refusal, behind the UNCHANGED signature of commit 63bb4bd — nothing in `steps.ts`'s
+gate order moves, the web wizard needs nothing (its phase-① display reads the run state as
+before), and the CLI wording was already written for a solver that existed.
+
+### 31.1 The algebra, and why the state is FULLY DETERMINED from the capture
+
+xorshift128 is linear over GF(2): keystream word i is `A^i · s` for the fixed 128×128 step
+matrix A and the 128-bit seed s. An XOR of two generator streams is itself a generator
+stream — from the XOR of their seeds — so every at-rest form in the record is ONE equation
+family, `capture[i] = plain[i] ^ (A^i · s)` for image words, the header window 128..143
+verbatim. The plain image's Cortex-M vector table reserves words 7, 8, 9, 10 (and 13) as
+zero — byte-verified on every image in the record (1.0.3.0, 1.0.3.2 both variants,
+1.0.3.0-FF, 1.3.0.8-8Hz, 1.3.0.8-FF). Those four words are therefore 128 known KEYSTREAM
+bits: the capture's own crib, independent of any key material. The coefficient matrix of
+`A^(7..10) · s = crib` has FULL RANK 128 (asserted by construction in the synthetic
+round-trip: a random state's crib solves back to that exact state), so **the seed is the
+unique solution of a linear system — no search, no candidates, no per-key guessing**. The
+solve imports `recoverState` from `crypto/recover.ts` — the offline decrypt's own GF(2)
+machinery, the one implementation — and holds word 13 BACK from the solve as its
+self-check: a wrong crib or a wrong cipher model dies there, before anything is decrypted.
+
+Per family, the at-rest form the solver accepts (each then verified, not assumed):
+
+| family         | slot form (the record)                                                                                  | acceptance on the DECRYPTED image | key pair (by value)                                                                     |
+| -------------- | ------------------------------------------------------------------------------------------------------- | --------------------------------- | --------------------------------------------------------------------------------------- |
+| `compact-2016` | `plain ⊕ ks(key block 1)` (doc 33 sec. 11.2, donor-verified full length on both native cameras)         | word sum 0                        | cp103 (1.0.3.0, 1.0.3.2 9 Hz) or cp1032ff (1.0.3.2 18 Hz FF, and 1.0.3.0-FF — measured) |
+| `v1-2014-ff`   | `plain ⊕ ks(block 1)` (device), or `plain ⊕ ks(block 0) ⊕ ks(block 1)` (the two-stream store, doc 35.3) | the 0xFFFF sentinel               | ff1308                                                                                  |
+
+**The FF caveat, stated:** no native FF camera dump exists (the FF emulator proofs run on a
+PLAINTEXT donor, which the identity path solves), so the native at-rest form is only
+partially in the record. The solver answers for the two forms the record proves and refuses
+anything else — a slot holding a post-OTA STAGED form decrypts to a non-sentinel sum and is
+refused, because the factory plaintext is not recoverable from it by this family's rules.
+Refuse over guess.
+
+### 31.2 The layers, in order (refuse over guess, never a guess)
+
+1. the verbatim header parses: magic 0xA1B2C3D4, a word-multiple `length` that fits the
+   capture, under the bootloader's own 0x10000 bound, large enough for the segmented
+   container (≥ 0x2a0);
+2. the crib solve + word 13 == 0;
+3. the decrypted word sum == the family's acceptance (0 / 0xFFFF);
+4. structure on the decrypted image: reset vector (word 1) == the header's entry word at
+   0x210 with bit 0 set; the code-payload descriptor at 0x290 parses (flash LMA, payload
+   VMA, sane size); exactly ONE window-pool ladder; exactly one mode-2 guard and one
+   family widen tail in the Begin window (ladder − 0x800); the wire-82 token present;
+5. the family's key blocks by value, each half exactly once (two pairs matching refuses);
+6. THE CLOSING IDENTITY: `capture ⊕ plain`, off the header window, equals the at-rest
+   stream recomputed from the FOUND blocks — the keystream is accounted for to the last
+   word. A plain capture "solves" to the zero state, passes the sum, and dies HERE (the
+   identity family owns plain captures); a capture whose stream the image's own keys do not
+   explain dies here too. The `method` string names the form:
+   `r16-state-from-crib+keyblock-verify (the at-rest device stream, key block 1)` or
+   `(the two-stream store, key blocks 0+1)`.
+
+Unit-proven refusals (synthetic captures, `solve.test.ts`): one flipped capture byte →
+layer 3; a scrambled word 13 → layer 2; a scrambled crib word (8) → layer 2 (the wrong
+state cannot decrypt word 13 to zero); an unciphered image → layer 6; a keyless image →
+layer 5; a whole-window XOR-0x5A → layer 1; the families are mutually exclusive (an FF
+capture refuses the 2016 sum and vice versa); determinism is pinned (the same capture
+twice, the same result; the solve's own buffer, never a view).
+
+### 31.3 The fixtures, and their provenance
+
+- **The native 1.0.3.0 camera 0C21A1M5KP15** (SEEK_DUMPS, sha `db4efc84f5338815…`, the
+  doc 1032 donor table's own digest): bank A carved at 0x50000 solves to the camera's
+  decrypted twin, BYTE FOR BYTE — and the twin IS the corpus's plain 1.0.3.0 image (sha
+  `5e1f3f24c8bc1e85…`, the pin families.test.ts already carries). Method: the device
+  stream, key block 1.
+- **The native 1.0.3.0-FF camera 0B14A1JULD54** (emu corpus dump, sha `e6a3354f4719fe29…`):
+  solves through the cp1032ff pair to its plain image (sha `6f06b3334c0c7243…`). This build
+  is the cipher line's but is NOT in the patch table — the solver vouches for the
+  plaintext, the caller's build gates refuse the build; a run on that camera still writes
+  nothing.
+- **The corpus plaintexts, re-ciphered under their recorded block 1** and solved back:
+  1.0.3.0 and 1.0.3.2 9 Hz (cp103), 1.0.3.2 18 Hz FF (cp1032ff), 1.3.0.8-FF (ff1308, plus
+  the two-stream form). Each image's own sum is asserted first (0 / 0xFFFF) — the solve
+  pins the pair-per-build table AND the algebra on real image bytes.
+- **The 1.0.3.2 twin (1C0EZ0KTAMA5), a provenance note:** the decrypted twin exists, but
+  the 4 MiB dump in that folder is the camera's LATER 4.9.1.15 state — measured, no slot
+  of it decrypts to the 1.0.3.2 image (the active-firmware note in the folder's info.txt
+  says the same), so its capture is synthesized from the twin, not carved.
+- The two native dumps' shas are PINNED in solve.test.ts, as the corpus images already
+  were in families.test.ts.
+
+### 31.4 The emulator rows (families.emulator.test.ts)
+
+- **The 1.0.3.0 native row now runs the SIX STEPS, self-sourced through the solver**: the
+  run is created empty, the backup double-reads bank A, the crib solve derives the image,
+  the gates pass, the commit stages `patched ⊕ ks0`, the whole 4 MiB drains through the
+  widened window, the restore stages the factory image back through the same transform,
+  verify reads 0 diffs. **Delivered == the corpus dump's own sha `db4efc84f5338815…`,
+  byte for byte** (as-booted == the dump, restored .final == the dump, 0 diffs); raw
+  post-write drain sha `59e3f4469891b6be…`; the commit moved exactly the four patch bytes
+  (`0x50000+0x239`, `+0x23b`, `+0x352f`, `+0x3639` — doc 33 sec. 11.5's four). Commit
+  phase 54.1 s, drain 113.5 s at the 64-byte ask.
+- **The negative, kept and sharpened:** a copy of the same dump with ONE byte of the
+  bank-A image flipped (0x5C500, in the tables past the code payload; the part still
+  boots — from bank B, whose sum validates). The expected-prefix oracle is deliberately
+  absent so the SOLVER's own refusal fires: the identity candidate dies at the build gates
+  (the ciphered bytes are not balanced), both cipher families die at the sum rule, the run
+  refuses — and the wire ledger of the whole server shows no `0x50`, no `0x81`, no `0x59`.
+- The 8 Hz and FF rows are untouched by this workstream (their donors store plain, so
+  identity solves them) and stayed green: 8 Hz delivered == as-booted `afa9800f8969e46a…`
+  (doc 35.2.3's donor state), FF raw `28d50575dd30971a…` and delivered == as-booted
+  `dd935b331c214919…` — both the doc 35.3.3 shas, reproduced on this tree.
+
+### 31.5 What the web workstream must know
+
+Nothing. The seam signature, the result shape and the run-state schema are unchanged; the
+only new user-visible fact is the backup log/detail line, which now names the solve method
+(`r16-state-from-crib+keyblock-verify (…)` on a cipher family, `identity — …` on the plain
+chain) — the wizard's plan-from-state screen already prints whatever the step recorded.
