@@ -213,7 +213,14 @@ export interface TestIo {
   readonly questions: string[];
 }
 
-export function testIo(overrides: Partial<Io> & { readonly answer?: boolean } = {}): TestIo {
+export function testIo(
+  overrides: Partial<Io> & {
+    /** The answer for every `confirm` question. */
+    readonly answer?: boolean;
+    /** Per-question answers, in order; `answer` covers the rest. */
+    readonly answers?: readonly boolean[];
+  } = {},
+): TestIo {
   const stdout = new MemorySink(overrides.stdout instanceof MemorySink ? {} : {});
   const stderr = new MemorySink();
   const questions: string[] = [];
@@ -225,16 +232,19 @@ export function testIo(overrides: Partial<Io> & { readonly answer?: boolean } = 
     platform: 'linux',
     version: '2.0.0-test',
     confirm: (question: string): Promise<boolean> => {
+      const perQuestion = overrides.answers?.[questions.length];
       questions.push(question);
-      return Promise.resolve(overrides.answer === true);
+      return Promise.resolve((perQuestion ?? overrides.answer) === true);
     },
     ...stripTestOnly(overrides),
   };
   return { io, stdout, stderr, questions };
 }
 
-function stripTestOnly(overrides: Partial<Io> & { readonly answer?: boolean }): Partial<Io> {
-  const { answer: _answer, ...rest } = overrides;
+function stripTestOnly(
+  overrides: Partial<Io> & { readonly answer?: boolean; readonly answers?: readonly boolean[] },
+): Partial<Io> {
+  const { answer: _answer, answers: _answers, ...rest } = overrides;
   return rest;
 }
 

@@ -1,5 +1,5 @@
 /**
- * `seek-fw preserve <image>` — the full-flash preservation pipeline for the v1
+ * `seek-fw preserve` — the full-flash preservation pipeline for the v1
  * locked line (Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0), run as SIX RESUMABLE
  * STEPS with a checkpoint written after every one.
  *
@@ -15,11 +15,22 @@
  * every region the stock plan can read — is on disk BEFORE anything
  * write-shaped can possibly run, and every later step checkpoints behind it.
  *
+ * THE IMAGE IS THE CAMERA'S OWN. There is no image argument anywhere: the
+ * backup step reads the active slot's image TWICE, requires the two reads to
+ * agree byte for byte, derives the factory plaintext from that capture
+ * (identity on the 2014 plain chain; the build family's keystream solver on a
+ * cipher family), and gates the derived image before anything is trusted —
+ * the version cross-check against the camera's own report, the build table's
+ * detect hooks and before-bytes (an already-patched bank refuses here). The
+ * derived image is a run artifact, so `--resume` never needs any external
+ * file.
+ *
  * The commands:
  *
- *   seek-fw preserve <image> [--out dir]   a full run; checkpoint after every
+ *   seek-fw preserve [--out dir]           a full run; checkpoint after every
  *                                          step (preserve_run.json + files)
- *   seek-fw preserve --resume <dir> [image]  continue from state.nextStep
+ *   seek-fw preserve --resume <dir>        continue from state.nextStep —
+ *                                          no image, no other file
  *   seek-fw preserve --resume <dir> --from-step <id>  start at a chosen step
  *   seek-fw preserve --print-state <dir>   the run state, next step, and
  *                                          whether the checkpoint files
@@ -32,20 +43,17 @@
  */
 
 import { readFile, stat } from 'node:fs/promises';
-import { basename, resolve } from 'node:path';
+import { resolve } from 'node:path';
 
 import {
   CancelledError,
-  PRESERVE_PLAIN_NAME,
   PRESERVE_STEP_IDS,
   PRESERVE_RUN_STATE_FILE,
   createPreserveRun,
   hexUp,
   isPreserveStepId,
-  parseImageHeader,
   recordStepFailure,
   runPreserveStep,
-  sha256hex,
   type PreserveArtifactLoader,
   type PreserveRunState,
   type PreserveStepId,
@@ -86,7 +94,7 @@ function describeRestoreForm(form: 'capture-verbatim' | 'factory-staged' | 'none
     case 'none':
       return (
         'REFUSED on this build — no staged form of the factory image passes the running ' +
-        'app\u2019s own acceptance while transforming back to the original slot bytes ' +
+        'app’s own acceptance while transforming back to the original slot bytes ' +
         '(accept1 reads sum(P ^ ksD); the factory carries 0xB7AB9D17 there, not 0xFFFF). ' +
         'The run ends with the delivered dump in hand and the patch in place.'
       );
@@ -158,13 +166,6 @@ export async function preserveCommand(ctx: CommandContext): Promise<CommandResul
  * ==================================================================== */
 
 async function freshCommand(ctx: CommandContext, outDir: string): Promise<CommandResult> {
-  const imagePath = ctx.file;
-  if (imagePath === null) {
-    throw new CliError('preserve needs a decrypted firmware image argument', {
-      code: 'cli/usage',
-    });
-  }
-
   /* Nobody to ask: same rule as flash, checked before the camera opens. */
   if (!ctx.options.yes && !ctx.io.stdinIsTty) {
     throw new CliError(
@@ -179,51 +180,27 @@ async function freshCommand(ctx: CommandContext, outDir: string): Promise<Comman
     );
   }
 
-  const fileName = basename(imagePath);
-  const image = await readImageOrNull(imagePath);
-  if (image === null) {
-    throw new CliError(`could not read ${imagePath}`, { code: 'cli/no-input' });
-  }
-
-  /* The expected version comes FROM the image: the patch is derived from one
-   * build's bytes, and the camera must report that build before anything is
-   * sent. The builder also refuses an image that does not carry the 2014
-   * update machinery, so a wrong file fails here, on the desk. */
-  const header = parseImageHeader(image);
-  if (header === null) {
-    throw new CliError(
-      `${fileName} does not parse as a decrypted Seek firmware image (no header at 0x200)`,
-      { code: 'image/malformed' },
-    );
-  }
-  const created = await createPreserveRun(image, {
+  /* The run is created empty and self-sources: the backup step derives the
+   * image from the camera and records the build it finds. The detailed plan
+   * prints the moment it exists — after the patch step, before anything
+   * write-shaped runs — and an interactive run confirms again there. */
+  const created = await createPreserveRun({
     /* The global --chunk, where the drain step is given one; the default
      * (READ_CHUNK, 64) is the ask measured exact on silicon (TESTING.md
      * sec. 28.3). */
     ...(ctx.options.chunk === null ? {} : { drainChunk: ctx.options.chunk }),
   });
-  const patch = created.patch;
+
   const say = (text: string): void => {
     ctx.reporter.write(text);
   };
 
   say('');
-  say(`preserve plan — ${fileName}`);
-  say(`  build              ${patch.label} (${patch.buildId}, family ${patch.family})`);
-  say(`  image version      ${created.state.expectedVersion} (${String(image.length)} B)`);
-  say(`  patch sites        ${String(patch.sites.length)} instruction edit(s)`);
-  for (const site of patch.sites) {
-    say(`    ${hexUp(site.offset)}  ${site.what}`);
-  }
-  say(`  rebalance word     ${hexUp(patch.rebalanceWord)} at 0x00000238`);
-  say(
-    `  bytes that move    ${String(patch.diffOffsets.length)} on the part, all inside the ` +
-      (patch.route === 'recovery-only' ? 'recovery bank' : 'active bank'),
-  );
-  say(`  staged form        ${describeStagedForm(patch.stagedForm)}`);
-  if (patch.routeNote !== null) say(`  commit route       ${patch.routeNote}`);
-  say(`  restore            ${describeRestoreForm(patch.restoreForm)}`);
-  say(`  drain              ${describeCapability(patch.capability)}`);
+  say('preserve plan — self-sourced from the camera');
+  say('  image source       read from the camera’s active slot, two agreeing reads');
+  say('  build              detected from the derived image after the backup step; the');
+  say('                     full plan (patch sites, commit route, restore, drain) prints');
+  say('                     then, before anything write-shaped runs');
   say('  steps              backup -> patch -> commit -> drain -> restore -> verify');
   say('  run directory      each step checkpoints there; the backup (and the standard dump');
   say('                     archive built from it) is on disk BEFORE anything is written');
@@ -235,10 +212,9 @@ async function freshCommand(ctx: CommandContext, outDir: string): Promise<Comman
 
   if (!ctx.options.yes) {
     const confirmed = await ctx.io.confirm(
-      `Back this camera up, patch the ${patch.route === 'recovery-only' ? 'RECOVERY' : 'ACTIVE'} ` +
-        `slot in place, dump the whole part${
-          patch.capability.wholePart ? '' : ' (NOT on this build — the drain will refuse)'
-        }, and restore it (${created.state.expectedVersion})? [y/N] `,
+      'Back this camera up (read-only), derive the patch from its own flash, and show the ' +
+        'plan before anything is written? The commit afterwards WILL write the active boot ' +
+        'slot. [y/N] ',
     );
     if (!confirmed) {
       throw new CliError('aborted at the confirmation prompt — nothing was written', {
@@ -260,9 +236,79 @@ async function freshCommand(ctx: CommandContext, outDir: string): Promise<Comman
   /* The initial checkpoint lands BEFORE the first step: a crash during the
    * backup itself still leaves a resumable run. */
   await saveRunState(outDir, created.state);
-  const finalState = await runSteps(ctx, outDir, created.state, image);
+  const finalState = await runSteps(ctx, outDir, created.state, {
+    onPlanReady: (state) => confirmDerivedPlan(ctx, outDir, state),
+  });
 
-  return runResult(ctx, outDir, finalState, fileName);
+  return runResult(ctx, outDir, finalState);
+}
+
+/** The detailed plan, printed from the state the backup and patch steps
+ *  recorded — the first moment the build's facts exist. An interactive run
+ *  confirms here, at the last gate before the first write; --yes just prints. */
+async function confirmDerivedPlan(
+  ctx: CommandContext,
+  outDir: string,
+  state: PreserveRunState,
+): Promise<void> {
+  const patch = state.patch;
+  const say = (text: string): void => {
+    ctx.reporter.write(text);
+  };
+
+  say('');
+  say(`preserve plan — derived from the camera (run ${state.runId})`);
+  say('  image source       read from the camera’s active slot, two agreeing reads');
+  if (state.slotReadShas !== undefined)
+    say(`                     (sha256 ${state.slotReadShas[0]})`);
+  say(
+    `  build              ${state.buildLabel ?? state.buildId ?? state.buildFamily ?? '?'} ` +
+      `(${state.buildId ?? '?'}, family ${state.buildFamily ?? '?'})`,
+  );
+  say(
+    `  image version      ${state.expectedVersion ?? '?'} (${String(patch?.stagedLength ?? 0)} B)`,
+  );
+  say(`  patch sites        ${String(patch?.sites.length ?? 0)} instruction edit(s)`);
+  for (const site of patch?.sites ?? []) {
+    say(`    ${hexUp(site.offset)}  ${site.name}`);
+  }
+  if (patch !== undefined) {
+    say(`  rebalance word     ${hexUp(patch.rebalanceWord)} at 0x00000238`);
+    say(
+      `  bytes that move    ${String(patch.diffCount ?? 0)} on the part, all inside the ` +
+        (state.route === 'recovery-only' ? 'recovery bank' : 'active bank'),
+    );
+  }
+  if (state.stagedForm !== undefined)
+    say(`  staged form        ${describeStagedForm(state.stagedForm)}`);
+  if (state.routeNote !== null && state.routeNote !== undefined) {
+    say(`  commit route       ${state.routeNote}`);
+  }
+  if (state.restoreForm !== undefined)
+    say(`  restore            ${describeRestoreForm(state.restoreForm)}`);
+  if (state.capability !== undefined)
+    say(`  drain              ${describeCapability(state.capability)}`);
+  say(
+    `  next write         the commit step, into the ${
+      state.route === 'recovery-only' ? 'RECOVERY' : 'ACTIVE'
+    } bank`,
+  );
+  say(`  run directory      ${outDir}`);
+  say('');
+
+  if (ctx.options.yes) return;
+  const confirmed = await ctx.io.confirm(
+    `Proceed to the commit — the first write, into the ` +
+      `${state.route === 'recovery-only' ? 'RECOVERY' : 'ACTIVE'} boot bank of this camera ` +
+      `(${state.expectedVersion ?? '?'})? [y/N] `,
+  );
+  if (!confirmed) {
+    throw new CliError(
+      'aborted at the plan prompt — nothing was written; the backup and the derived plan are ' +
+        `checkpointed in ${outDir} (resume with --resume ${outDir}, or delete the directory)`,
+      { code: 'flash/refused' },
+    );
+  }
 }
 
 /* ==================================================================== *
@@ -297,28 +343,14 @@ async function resumeCommand(ctx: CommandContext, runDir: string): Promise<Comma
     fromStep = ctx.options.fromStep;
   }
 
+  /* No image is passed and none is needed: the run directory carries the
+   * derived factory plaintext (the backup step wrote it there), and the steps
+   * refuse with the remedy when a checkpoint file is missing. */
   const state = await loadRunState(runDir);
-
-  /* An image that was passed is checked BEFORE anything else about the run is
-   * interpreted: a wrong file is refused even on a run that is already done,
-   * because "nothing to resume" must never read as "this image is fine". */
-  let image: Uint8Array | null = null;
-  if (ctx.file !== null) {
-    image = await readImageOrNull(ctx.file);
-    if (image === null) throw new CliError(`could not read ${ctx.file}`, { code: 'cli/no-input' });
-    const sha = await sha256hex(image);
-    if (sha !== state.imageSha256) {
-      throw new CliError(
-        `${ctx.file} is not the image this run was created from (sha256 ${sha}, the run ` +
-          `records ${state.imageSha256}) — resume with the same file the run started with`,
-        { code: 'preserve/state' },
-      );
-    }
-  }
 
   if (state.nextStep === 'done') {
     ctx.reporter.log(`run ${state.runId} is already done — nothing to resume`, 'warn');
-    return runResult(ctx, runDir, state, ctx.file === null ? null : basename(ctx.file));
+    return runResult(ctx, runDir, state);
   }
   let start: PreserveStepId = state.nextStep;
   if (fromStep !== null) start = fromStep;
@@ -354,23 +386,8 @@ async function resumeCommand(ctx: CommandContext, runDir: string): Promise<Comma
     );
   }
 
-  /* The image (already sha-checked above) is needed only by the steps that
-   * rebuild the patch — and by the restore of a cipher-family run, whose
-   * staged-form restore payload is derived from the factory plaintext. */
-  const needsPlain =
-    start === 'patch' ||
-    start === 'commit' ||
-    (start === 'restore' && state.stagedForm !== undefined && state.stagedForm !== 'plain');
-  if (image === null && needsPlain) {
-    throw new CliError(
-      `resuming at ${start} needs the factory plaintext the patch derives from — pass the ` +
-        'image path: seek-fw preserve <image> --resume <dir>',
-      { code: 'cli/usage' },
-    );
-  }
-
   ctx.reporter.log(
-    `resuming run ${state.runId} (${state.expectedVersion}) at ${start}` +
+    `resuming run ${state.runId} (${state.expectedVersion ?? 'image not derived yet'}) at ${start}` +
       (ctx.options.fromStep === null ? '' : ' (--from-step)'),
     'detail',
   );
@@ -383,13 +400,12 @@ async function resumeCommand(ctx: CommandContext, runDir: string): Promise<Comma
       /* An explicit --chunk on a resume overrides the recorded drain ask size. */
       ...(ctx.options.chunk === null ? {} : { drainChunk: ctx.options.chunk }),
     },
-    image,
     /* An explicit --from-step is the one loud way a jump past an incomplete
      * write step is granted; core relaxes only the ordering gates, never the
      * file gates, and the wire-side pre-checks stay in the steps. */
-    fromStep !== null,
+    { allowJump: fromStep !== null },
   );
-  return runResult(ctx, runDir, finalState, ctx.file === null ? null : basename(ctx.file));
+  return runResult(ctx, runDir, finalState);
 }
 
 /* ==================================================================== *
@@ -409,8 +425,13 @@ async function runSteps(
   ctx: CommandContext,
   runDir: string,
   initialState: PreserveRunState,
-  image: Uint8Array | null,
-  allowJump = false,
+  options: {
+    readonly allowJump?: boolean;
+    /** Called once, after the step that first records the patch summary —
+     *  the first moment the derived plan exists (and still before anything
+     *  write-shaped runs). */
+    readonly onPlanReady?: (state: PreserveRunState) => Promise<void>;
+  } = {},
 ): Promise<PreserveRunState> {
   /* A fresh session per step boundary. After a wire-89 the camera
    * re-enumerates, so open() retries until the camera is back (or the run is
@@ -444,14 +465,12 @@ async function runSteps(
     },
   };
 
-  /* The factory plaintext arrives by this callback, never from the run
-   * directory; core checks its sha against the state on every load. */
-  const loadArtifact: PreserveArtifactLoader = async (name) => {
-    if (name === PRESERVE_PLAIN_NAME) return image;
-    return readImageOrNull(`${runDir}/${name}`);
-  };
+  /* Every checkpoint — the derived factory plaintext included — is a run
+   * directory file; core sha-checks each against the backup step's record. */
+  const loadArtifact: PreserveArtifactLoader = (name) => readImageOrNull(`${runDir}/${name}`);
 
   let state = initialState;
+  let planned = false;
   while (state.nextStep !== 'done') {
     const step: PreserveStepId = state.nextStep;
     ctx.reporter.log(`— ${step} —`, 'info');
@@ -464,7 +483,7 @@ async function runSteps(
         loadArtifact,
         ctx.reporter,
         ctx.signal,
-        allowJump ? { allowJump: true } : {},
+        options.allowJump === true ? { allowJump: true } : {},
       );
     } catch (error) {
       if (isCancellation(error)) throw error;
@@ -488,6 +507,10 @@ async function runSteps(
     }
     state = outcome.state;
     await saveRunState(runDir, state);
+    if (!planned && state.patch !== undefined) {
+      planned = true;
+      if (options.onPlanReady !== undefined) await options.onPlanReady(state);
+    }
   }
   return state;
 }
@@ -496,12 +519,7 @@ async function runSteps(
  * the results
  * ==================================================================== */
 
-function runResult(
-  ctx: CommandContext,
-  runDir: string,
-  state: PreserveRunState,
-  fileName: string | null,
-): CommandResult {
+function runResult(ctx: CommandContext, runDir: string, state: PreserveRunState): CommandResult {
   const stepIds = PRESERVE_STEP_IDS.filter((id) => state.steps[id] !== undefined);
   if (ctx.human) {
     for (const id of stepIds) {
@@ -513,10 +531,11 @@ function runResult(
     ctx.out(`run directory: ${runDir}`);
   }
   return {
-    image:
-      fileName === null
-        ? null
-        : { file: fileName, version: state.expectedVersion, sha256: state.imageSha256 },
+    image: {
+      source: state.imageSource ?? 'user-file',
+      version: state.expectedVersion ?? null,
+      sha256: state.imageSha256 ?? null,
+    },
     run: {
       id: state.runId,
       directory: runDir,
@@ -536,7 +555,8 @@ function runResult(
     steps: Object.fromEntries(stepIds.map((id) => [id, state.steps[id]])),
     verify: state.verify ?? null,
     sha256: {
-      image: state.imageSha256,
+      image: state.imageSha256 ?? null,
+      slotReads: state.slotReadShas === undefined ? null : [...state.slotReadShas],
       rawDump: state.rawDumpSha256 ?? null,
       deliveredDump: state.deliveredSha256 ?? null,
     },
@@ -559,11 +579,24 @@ async function printStateCommand(ctx: CommandContext, runDir: string): Promise<C
     say(`preserve run ${state.runId}`);
     say(`  directory          ${runDir}`);
     say(`  created            ${state.createdAt}`);
-    say(`  image sha256       ${state.imageSha256}`);
-    say(`  expected version   ${state.expectedVersion}`);
+    say(`  schema version     ${String(state.version)}`);
     say(
-      `  build              ${state.buildId ?? state.buildFamily} (family ` +
-        `${state.buildFamily}${state.stagedForm === undefined ? '' : `, staged ${state.stagedForm}`})`,
+      state.imageSource === 'device'
+        ? '  image source       the camera’s active slot (two agreeing reads)'
+        : '  image source       a file the run was started with (version-1 schema)',
+    );
+    if (state.imageSha256 !== undefined) say(`  image sha256       ${state.imageSha256}`);
+    if (state.slotReadShas !== undefined) {
+      say(`  slot reads         ${state.slotReadShas[0]}`);
+      say(`                     ${state.slotReadShas[1]}`);
+    }
+    say(`  expected version   ${state.expectedVersion ?? '(not derived yet)'}`);
+    say(
+      `  build              ${state.buildId ?? state.buildFamily ?? '(not derived yet)'}${
+        state.buildFamily === undefined ? '' : ` (family ${state.buildFamily}`
+      }${state.stagedForm === undefined ? '' : `, staged ${state.stagedForm}`}${
+        state.buildFamily === undefined ? '' : ')'
+      }`,
     );
     if (state.capability !== undefined) {
       say(`  drain              ${describeCapability(state.capability)}`);

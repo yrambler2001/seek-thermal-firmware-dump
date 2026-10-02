@@ -8,6 +8,13 @@
  * add is the run directory: a checkpoint after every step, a resume from a run
  * the drain killed, a `--from-step` that refuses on a torn directory, and a
  * `--print-state` that says which checkpoint files still match.
+ *
+ * THE RUN SELF-SOURCES: no test passes an image. The command takes no
+ * positional at all — the backup step derives the factory plaintext from the
+ * camera's active slot (two agreeing reads), writes it into the run directory
+ * as `preserve_image_plain.bin`, and every later step loads it from there.
+ * The migration shape a version-1 run directory left behind (its plaintext
+ * lived outside the directory) is tested too.
  */
 
 import { readdir, readFile, writeFile } from 'node:fs/promises';
@@ -20,6 +27,7 @@ import {
   PRESERVE_DUMP_ORIGINAL_FILE,
   PRESERVE_DUMP_POSTWRITE_FILE,
   PRESERVE_PATCHED_FILE,
+  PRESERVE_PLAIN_NAME,
   PRESERVE_RUN_STATE_FILE,
   REBALANCE_WORD_OFFSET,
   V1_2014_PATCH_SITES,
@@ -119,12 +127,6 @@ function v1Camera(
 const backendOf = (camera: FakeCamera): ((options: BackendOptions) => UsbBackend) =>
   fixedBackend([camera]);
 
-async function writePlainFile(name = 'plain-1.3.0.0.bin'): Promise<Uint8Array> {
-  const plain = syntheticPlain();
-  await writeFile(join(dir, name), plain);
-  return plain;
-}
-
 function runDir(name = 'run'): string {
   return join(dir, name);
 }
@@ -135,80 +137,128 @@ async function loadState(name = 'run'): Promise<PreserveRunState> {
   ) as PreserveRunState;
 }
 
+async function saveState(name: string, state: PreserveRunState): Promise<void> {
+  await writeFile(
+    join(runDir(name), PRESERVE_RUN_STATE_FILE),
+    `${JSON.stringify(state, null, 2)}\n`,
+  );
+}
+
+/** The version-1 shape of a state document: the older schema, whose plaintext
+ *  lived outside the run directory. */
+function asVersion1(state: PreserveRunState): PreserveRunState {
+  const v1: PreserveRunState & { imageSource?: unknown; slotReadShas?: unknown } = JSON.parse(
+    JSON.stringify(state),
+  );
+  v1.version = 1;
+  delete v1.imageSource;
+  delete v1.slotReadShas;
+  return v1;
+}
+
 /* ==================================================================== *
  * a fresh run, checkpointed
  * ==================================================================== */
 
 describe('preserve — a fresh run, checkpointed after every step', () => {
-  it('runs all six steps and leaves a complete run directory', { timeout: 180_000 }, async () => {
-    const plain = await writePlainFile();
-    const camera = v1Camera(plain);
-    const asBooted = new Uint8Array(camera.flash);
-    const test = testIo({ backend: backendOf(camera) });
-    const code = await run(
-      ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes', '--json'],
-      test.io,
-      signal(),
-    );
-    expect(code).toBe(EXIT_OK);
+  it(
+    'runs all six steps self-sourced and leaves a complete run directory',
+    { timeout: 180_000 },
+    async () => {
+      const plain = syntheticPlain();
+      const camera = v1Camera(plain);
+      const asBooted = new Uint8Array(camera.flash);
+      const test = testIo({ backend: backendOf(camera) });
+      const code = await run(['preserve', '--out', runDir(), '--yes', '--json'], test.io, signal());
+      expect(code).toBe(EXIT_OK);
 
-    const state = await loadState();
-    expect(state.version).toBe(1);
-    expect(state.nextStep).toBe('done');
-    expect(state.expectedVersion).toBe(EXPECTED_VERSION);
-    expect(state.imageSha256).toBe(await sha256hex(plain));
-    for (const step of ['backup', 'patch', 'commit', 'drain', 'restore', 'verify'] as const) {
-      expect(state.steps[step]?.status, `${step} done`).toBe('done');
-    }
-    expect(state.steps.commit?.notes).toMatch(/no reset sent in this session/);
-    expect(state.verify).toEqual({ diffBytes: 0, windowsRead: 31, badWindows: [] });
+      const state = await loadState();
+      expect(state.version).toBe(2);
+      expect(state.imageSource).toBe('device');
+      expect(state.nextStep).toBe('done');
+      expect(state.expectedVersion).toBe(EXPECTED_VERSION);
+      expect(state.imageSha256).toBe(await sha256hex(plain));
+      /* The double read: both shas recorded, and agreeing — the shas are of
+       * the whole 64 KiB slot capture (the image plus its erased tail). */
+      const bankWindow = new Uint8Array(0x10000).fill(0xff);
+      bankWindow.set(plain, 0);
+      const captureSha = await sha256hex(bankWindow);
+      expect(state.slotReadShas).toHaveLength(2);
+      expect(state.slotReadShas?.[0]).toBe(captureSha);
+      expect(state.slotReadShas?.[1]).toBe(captureSha);
+      for (const step of ['backup', 'patch', 'commit', 'drain', 'restore', 'verify'] as const) {
+        expect(state.steps[step]?.status, `${step} done`).toBe('done');
+      }
+      expect(state.steps.commit?.notes).toMatch(/no reset sent in this session/);
+      expect(state.verify).toEqual({ diffBytes: 0, windowsRead: 31, badWindows: [] });
 
-    /* The checkpoint files are all there, and the shas are as recorded. */
-    for (const name of [
-      PRESERVE_BACKUP_FILE,
-      PRESERVE_BANK_CAPTURE_FILE,
-      PRESERVE_PATCHED_FILE,
-      PRESERVE_DUMP_POSTWRITE_FILE,
-      PRESERVE_DUMP_ORIGINAL_FILE,
-      'manifest.json',
-      'README.md',
-    ]) {
-      const bytes = await readFile(join(runDir(), name));
-      const recorded = Object.values(state.steps)
-        .flatMap((record) => Object.entries(record.artifactShas ?? {}))
-        .filter(([entryName]) => entryName === name)
-        .map(([, sha]) => sha)
-        .at(-1);
-      expect(recorded, `${name} recorded`).toBeDefined();
-      expect(await sha256hex(new Uint8Array(bytes)), name).toBe(recorded);
-    }
-    /* The dump archive's decrypted slots came along. */
-    const decrypted = (await readdir(join(runDir(), 'decrypted'))).length;
-    expect(decrypted).toBeGreaterThan(0);
+      /* The checkpoint files are all there — the derived factory plaintext
+       * among them — and the shas are as recorded. */
+      for (const name of [
+        PRESERVE_BACKUP_FILE,
+        PRESERVE_BANK_CAPTURE_FILE,
+        PRESERVE_PLAIN_NAME,
+        PRESERVE_PATCHED_FILE,
+        PRESERVE_DUMP_POSTWRITE_FILE,
+        PRESERVE_DUMP_ORIGINAL_FILE,
+        'manifest.json',
+        'README.md',
+      ]) {
+        const bytes = await readFile(join(runDir(), name));
+        const recorded = Object.values(state.steps)
+          .flatMap((record) => Object.entries(record.artifactShas ?? {}))
+          .filter(([entryName]) => entryName === name)
+          .map(([, sha]) => sha)
+          .at(-1);
+        expect(recorded, `${name} recorded`).toBeDefined();
+        expect(await sha256hex(new Uint8Array(bytes)), name).toBe(recorded);
+      }
+      /* The derived plaintext artifact IS the camera's slot A content. */
+      const derived = await readFile(join(runDir(), PRESERVE_PLAIN_NAME));
+      expect(await sha256hex(new Uint8Array(derived))).toBe(await sha256hex(plain));
+      /* The dump archive's decrypted slots came along. */
+      const decrypted = (await readdir(join(runDir(), 'decrypted'))).length;
+      expect(decrypted).toBeGreaterThan(0);
 
-    /* The delivered dump is the camera's original content; the part was
-     * restored underneath the run. */
-    const delivered = await readFile(join(runDir(), PRESERVE_DUMP_ORIGINAL_FILE));
-    expect(await sha256hex(new Uint8Array(delivered))).toBe(await sha256hex(asBooted));
-    expect(await sha256hex(camera.flash)).toBe(await sha256hex(asBooted));
+      /* The delivered dump is the camera's original content; the part was
+       * restored underneath the run. */
+      const delivered = await readFile(join(runDir(), PRESERVE_DUMP_ORIGINAL_FILE));
+      expect(await sha256hex(new Uint8Array(delivered))).toBe(await sha256hex(asBooted));
+      expect(await sha256hex(camera.flash)).toBe(await sha256hex(asBooted));
 
-    /* The --json document names the run and its shas. */
-    const document = JSON.parse(test.stdout.text) as {
-      run: { nextStep: string; id: string };
-      sha256: { deliveredDump: string };
-    };
-    expect(document.run.nextStep).toBe('done');
-    expect(document.sha256.deliveredDump).toBe(await sha256hex(asBooted));
-  });
+      /* The --json document names the run, its self-sourced image, and the
+       * double read's shas. */
+      const document = JSON.parse(test.stdout.text) as {
+        image: { source: string; version: string; sha256: string };
+        run: { nextStep: string; id: string };
+        sha256: { slotReads: string[]; deliveredDump: string };
+      };
+      expect(document.run.nextStep).toBe('done');
+      expect(document.image).toEqual({
+        source: 'device',
+        version: EXPECTED_VERSION,
+        sha256: await sha256hex(plain),
+      });
+      expect(document.sha256.slotReads).toEqual([captureSha, captureSha]);
+      expect(document.sha256.deliveredDump).toBe(await sha256hex(asBooted));
+
+      /* The plan prints twice — on the human stream (stderr under --json):
+       * the generic one before the camera is touched, and the derived one
+       * after the patch step, before the first write. */
+      expect(test.stderr.text).toMatch(/read from the camera.s active slot, two agreeing reads/);
+      expect(test.stderr.text).toMatch(/derived from the camera/);
+      expect(test.stderr.text).toMatch(/v1 2014 chain/);
+      expect(test.stderr.text).toMatch(/bytes that move\s+10 on the part/);
+    },
+  );
 
   it(
     'writes no temporary files behind: every checkpoint write is a rename',
     { timeout: 180_000 },
     async () => {
-      const plain = await writePlainFile();
-      const camera = v1Camera(plain);
+      const camera = v1Camera(syntheticPlain());
       await run(
-        ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes'],
+        ['preserve', '--out', runDir(), '--yes'],
         testIo({ backend: backendOf(camera) }).io,
         signal(),
       );
@@ -221,9 +271,8 @@ describe('preserve — a fresh run, checkpointed after every step', () => {
     'refuses a second fresh run into a directory that already holds one',
     { timeout: 180_000 },
     async () => {
-      const plain = await writePlainFile();
-      const camera = v1Camera(plain);
-      const args = ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes'];
+      const camera = v1Camera(syntheticPlain());
+      const args = ['preserve', '--out', runDir(), '--yes'];
       expect(await run(args, testIo({ backend: backendOf(camera) }).io, signal())).toBe(EXIT_OK);
       const second = testIo({ backend: backendOf(camera) });
       expect(await run(args, second.io, signal())).toBe(EXIT_FAILED);
@@ -232,25 +281,87 @@ describe('preserve — a fresh run, checkpointed after every step', () => {
   );
 
   it(
+    'an interactive run confirms twice — before the camera, and at the derived plan, before the first write',
+    { timeout: 180_000 },
+    async () => {
+      const plain = syntheticPlain();
+      const camera = v1Camera(plain);
+      const asBooted = new Uint8Array(camera.flash);
+      /* Decline at the first prompt: nothing runs, nothing exists. */
+      const declined = testIo({ backend: backendOf(camera), answer: false, stdinIsTty: true });
+      expect(await run(['preserve', '--out', runDir()], declined.io, signal())).toBe(EXIT_FAILED);
+      expect(declined.stderr.text).toMatch(
+        /aborted at the confirmation prompt — nothing was written/,
+      );
+      expect(declined.questions).toHaveLength(1);
+
+      /* Accept both: the run completes, and the second question is the one at
+       * the derived plan, naming the write it gates. */
+      const accepted = testIo({ backend: backendOf(camera), answer: true, stdinIsTty: true });
+      expect(await run(['preserve', '--out', runDir()], accepted.io, signal())).toBe(EXIT_OK);
+      expect(accepted.questions).toHaveLength(2);
+      expect(accepted.questions[1]).toMatch(/Proceed to the commit/);
+      expect((await loadState()).nextStep).toBe('done');
+      const delivered = await readFile(join(runDir(), PRESERVE_DUMP_ORIGINAL_FILE));
+      expect(await sha256hex(new Uint8Array(delivered))).toBe(await sha256hex(asBooted));
+
+      /* Decline at the SECOND prompt instead: the backup and the derived plan
+       * are checkpointed, the camera is untouched (the commit is the first
+       * write, and it never ran), and a --resume finishes the run. */
+      const midCamera = v1Camera(plain);
+      const midRun = runDir('midrun');
+      const partial = testIo({
+        backend: backendOf(midCamera),
+        answers: [true, false],
+        stdinIsTty: true,
+      });
+      expect(await run(['preserve', '--out', midRun], partial.io, signal())).toBe(EXIT_FAILED);
+      expect(partial.stderr.text).toMatch(/aborted at the plan prompt — nothing was written/);
+      const torn: PreserveRunState = JSON.parse(
+        await readFile(join(midRun, PRESERVE_RUN_STATE_FILE), 'utf8'),
+      ) as PreserveRunState;
+      expect(torn.nextStep).toBe('commit');
+      expect(await sha256hex(midCamera.flash)).toBe(await sha256hex(asBooted));
+      const resumed = testIo({ backend: backendOf(midCamera) });
+      expect(await run(['preserve', '--resume', midRun, '--yes'], resumed.io, signal())).toBe(
+        EXIT_OK,
+      );
+      expect((await loadState('midrun')).nextStep).toBe('done');
+    },
+  );
+
+  it(
     'writes the initial checkpoint before the first step, so an early abort is resumable',
     { timeout: 180_000 },
     async () => {
-      const plain = await writePlainFile();
-      const camera = v1Camera(plain);
+      const camera = v1Camera(syntheticPlain());
       const controller = new AbortController();
       controller.abort(); /* the run is dead before it starts */
       const code = await run(
-        ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes'],
+        ['preserve', '--out', runDir(), '--yes'],
         testIo({ backend: backendOf(camera) }).io,
         controller.signal,
       );
       expect(code).toBe(EXIT_CANCELLED);
       /* The initial checkpoint stands: a resume re-runs the whole run. */
       const state = await loadState();
+      expect(state.version).toBe(2);
       expect(state.nextStep).toBe('backup');
       expect(Object.keys(state.steps)).toEqual([]);
     },
   );
+
+  it('refuses a positional argument — there is no image input anywhere', async () => {
+    const camera = v1Camera(syntheticPlain());
+    const refused = testIo({ backend: backendOf(camera) });
+    const code = await run(
+      ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes'],
+      refused.io,
+      signal(),
+    );
+    expect(code).toBe(EXIT_USAGE);
+    expect(refused.stderr.text).toMatch(/unexpected argument/);
+  });
 });
 
 /* ==================================================================== *
@@ -259,16 +370,16 @@ describe('preserve — a fresh run, checkpointed after every step', () => {
 
 describe('preserve — resume from a run the drain killed', () => {
   it(
-    'checkpoints the failure, then finishes on a healthy camera',
+    'checkpoints the failure, then finishes on a healthy camera — with no file but the run directory',
     { timeout: 180_000 },
     async () => {
-      const plain = await writePlainFile();
+      const plain = syntheticPlain();
       const asBooted = new Uint8Array(
         v1Camera(plain).flash,
       ); /* the pre-commit part, for the final compare */
       const wedged = v1Camera(plain, { stallDrain: true });
       const first = await run(
-        ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes'],
+        ['preserve', '--out', runDir(), '--yes'],
         testIo({ backend: backendOf(wedged) }).io,
         signal(),
       );
@@ -282,11 +393,13 @@ describe('preserve — resume from a run the drain killed', () => {
       expect(torn.steps.drain?.status).toBe('failed');
       expect(torn.steps.drain?.error).toMatch(/post-reset read window never came up/);
       /* The failure is recorded, the previous checkpoint stands, and the run
-       * directory holds the restore source. */
+       * directory holds the restore source AND the derived plaintext. */
       expect(await readFile(join(runDir(), PRESERVE_BANK_CAPTURE_FILE))).toBeTruthy();
+      expect(await readFile(join(runDir(), PRESERVE_PLAIN_NAME))).toBeTruthy();
 
       /* RESUME on the same part, healthy now: the drain runs, then restore and
-       * verify, and the run reaches done — the commit is NOT replayed. */
+       * verify, and the run reaches done — the commit is NOT replayed, and no
+       * image is asked for. */
       const samePart = v1Camera(plain, { flash: wedged.flash });
       const second = await run(
         ['preserve', '--resume', runDir(), '--yes'],
@@ -303,46 +416,73 @@ describe('preserve — resume from a run the drain killed', () => {
   );
 
   it(
-    'resuming at a patch-building step without the image refuses, with the command to run',
+    'resuming a run directory that lost the derived plaintext refuses, with the remedy',
     { timeout: 180_000 },
     async () => {
-      const plain = await writePlainFile();
+      const plain = syntheticPlain();
       const camera = v1Camera(plain);
       await run(
-        ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes'],
+        ['preserve', '--out', runDir(), '--yes'],
         testIo({ backend: backendOf(camera) }).io,
         signal(),
       );
-      /* Rewind the state to just before the commit: patch done, commit gone. */
+      /* Rewind the state to just before the commit AND take the derived
+       * plaintext out of the run directory: the migration shape a version-1
+       * run left behind (its plaintext lived outside). */
       const state = await loadState();
       const rewound: PreserveRunState = { ...state, nextStep: 'commit' };
       delete rewound.steps.commit;
       delete rewound.steps.drain;
       delete rewound.steps.restore;
       delete rewound.steps.verify;
-      await writeFile(
-        join(runDir(), PRESERVE_RUN_STATE_FILE),
-        `${JSON.stringify(rewound, null, 2)}\n`,
-      );
+      await saveState('run', rewound);
+      const plainFile = await readFile(join(runDir(), PRESERVE_PLAIN_NAME));
+      const { rm } = await import('node:fs/promises');
+      await rm(join(runDir(), PRESERVE_PLAIN_NAME));
 
-      /* No image positional: the commit rebuilds the patch, so it refuses with
-       * the command line that fixes it. */
       const probe = testIo({ backend: backendOf(camera) });
       const code = await run(['preserve', '--resume', runDir(), '--yes'], probe.io, signal());
-      expect(code).toBe(EXIT_USAGE);
-      expect(probe.stderr.text).toMatch(
-        /resuming at commit needs the factory plaintext .* preserve <image> --resume/,
-      );
-      /* And the same resume WITH the image passes the gate and re-commits. */
+      expect(code).toBe(EXIT_FAILED);
+      expect(probe.stderr.text).toMatch(/preserve_image_plain\.bin/);
+      expect(probe.stderr.text).toMatch(/version-1 run/);
+
+      /* The file goes back under its artifact name (from the run zip, or the
+       * version-1 image copied there) and the same resume just works. */
+      await writeFile(join(runDir(), PRESERVE_PLAIN_NAME), plainFile);
       const retry = testIo({ backend: backendOf(camera) });
-      expect(
-        await run(
-          ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--resume', runDir(), '--yes'],
-          retry.io,
-          signal(),
-        ),
-      ).toBe(EXIT_OK);
+      expect(await run(['preserve', '--resume', runDir(), '--yes'], retry.io, signal())).toBe(
+        EXIT_OK,
+      );
       expect((await loadState()).nextStep).toBe('done');
+    },
+  );
+
+  it(
+    'a version-1 run directory still loads: print-state and resume work on it',
+    { timeout: 180_000 },
+    async () => {
+      const plain = syntheticPlain();
+      const camera = v1Camera(plain);
+      await run(
+        ['preserve', '--out', runDir(), '--yes'],
+        testIo({ backend: backendOf(camera) }).io,
+        signal(),
+      );
+      /* Downgrade the on-disk state to the version-1 schema. */
+      await saveState('run', asVersion1(await loadState()));
+
+      const printed = testIo();
+      expect(
+        await run(['preserve', '--print-state', runDir(), '--json'], printed.io, signal()),
+      ).toBe(EXIT_OK);
+      const document = JSON.parse(printed.stdout.text) as { state: PreserveRunState };
+      expect(document.state.version).toBe(1);
+
+      const done = testIo();
+      expect(await run(['preserve', '--resume', runDir(), '--yes'], done.io, signal())).toBe(
+        EXIT_OK,
+      );
+      expect(done.stdout.text).toMatch(/run .* is already done — nothing to resume/);
     },
   );
 
@@ -350,10 +490,10 @@ describe('preserve — resume from a run the drain killed', () => {
     '--from-step past an incomplete commit warns loudly, and the run recovers safely',
     { timeout: 180_000 },
     async () => {
-      const plain = await writePlainFile();
+      const plain = syntheticPlain();
       const camera = v1Camera(plain);
       await run(
-        ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes'],
+        ['preserve', '--out', runDir(), '--yes'],
         testIo({ backend: backendOf(camera) }).io,
         signal(),
       );
@@ -367,10 +507,7 @@ describe('preserve — resume from a run the drain killed', () => {
       delete rewound.steps.drain;
       delete rewound.steps.restore;
       delete rewound.steps.verify;
-      await writeFile(
-        join(runDir(), PRESERVE_RUN_STATE_FILE),
-        `${JSON.stringify(rewound, null, 2)}\n`,
-      );
+      await saveState('run', rewound);
 
       const jumped = testIo({ backend: backendOf(camera) });
       const code = await run(
@@ -399,11 +536,11 @@ describe('preserve — resume from a run the drain killed', () => {
     '--from-step restore recovers a drain-abandoned run: warn, restore, verify, done',
     { timeout: 180_000 },
     async () => {
-      const plain = await writePlainFile();
+      const plain = syntheticPlain();
       const asBooted = new Uint8Array(v1Camera(plain).flash);
       const wedged = v1Camera(plain, { stallDrain: true });
       const first = await run(
-        ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes'],
+        ['preserve', '--out', runDir(), '--yes'],
         testIo({ backend: backendOf(wedged) }).io,
         signal(),
       );
@@ -436,10 +573,9 @@ describe('preserve — resume from a run the drain killed', () => {
   );
 
   it('--resume on a run that is already done says so and touches no camera', async () => {
-    const plain = await writePlainFile();
-    const camera = v1Camera(plain);
+    const camera = v1Camera(syntheticPlain());
     await run(
-      ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes'],
+      ['preserve', '--out', runDir(), '--yes'],
       testIo({ backend: backendOf(camera) }).io,
       signal(),
     );
@@ -454,15 +590,10 @@ describe('preserve — resume from a run the drain killed', () => {
   });
 
   it('--from-step needs --resume, and a bogus step id is a usage error', async () => {
-    await writePlainFile();
     const usage = testIo();
-    expect(
-      await run(
-        ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--from-step', 'drain', '--yes'],
-        usage.io,
-        signal(),
-      ),
-    ).toBe(EXIT_USAGE);
+    expect(await run(['preserve', '--from-step', 'drain', '--yes'], usage.io, signal())).toBe(
+      EXIT_USAGE,
+    );
     expect(usage.stderr.text).toMatch(/--from-step needs --resume/);
 
     const bogus = testIo();
@@ -476,38 +607,13 @@ describe('preserve — resume from a run the drain killed', () => {
     expect(bogus.stderr.text).toMatch(/'middle' is not a step/);
   });
 
-  it('--resume with a different image refuses by sha', { timeout: 180_000 }, async () => {
-    const plain = await writePlainFile();
-    const camera = v1Camera(plain);
-    await run(
-      ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes'],
-      testIo({ backend: backendOf(camera) }).io,
-      signal(),
-    );
-    const other = syntheticPlain();
-    other[0x400] = (other[0x400] ?? 0) ^ 0xff;
-    const dv = new DataView(other.buffer);
-    dv.setUint32(0x3ff0, 0, true);
-    dv.setUint32(0x3ff0, (0 - wordSum(other)) >>> 0, true);
-    await writeFile(join(dir, 'other.bin'), other);
-    const mismatch = testIo({ backend: backendOf(camera) });
-    const code = await run(
-      ['preserve', join(dir, 'other.bin'), '--resume', runDir(), '--yes'],
-      mismatch.io,
-      signal(),
-    );
-    expect(code).toBe(EXIT_FAILED);
-    expect(mismatch.stderr.text).toMatch(/is not the image this run was created from/);
-  });
-
   it(
     '--print-state reports the run, its next step, and the checkpoint files',
     { timeout: 180_000 },
     async () => {
-      const plain = await writePlainFile();
-      const camera = v1Camera(plain);
+      const camera = v1Camera(syntheticPlain());
       await run(
-        ['preserve', join(dir, 'plain-1.3.0.0.bin'), '--out', runDir(), '--yes'],
+        ['preserve', '--out', runDir(), '--yes'],
         testIo({ backend: backendOf(camera) }).io,
         signal(),
       );
@@ -520,12 +626,16 @@ describe('preserve — resume from a run the drain killed', () => {
       expect(code).toBe(EXIT_OK);
       /* No camera was needed: no backend was even injected. */
       const document = JSON.parse(printed.stdout.text) as {
+        state: PreserveRunState;
         run: { nextStep: string; id: string };
         inventory: { name: string; present: boolean; shaMatches: boolean | null }[];
       };
       expect(document.run.nextStep).toBe('done');
+      expect(document.state.version).toBe(2);
+      expect(document.state.imageSource).toBe('device');
       const files = document.inventory.map((entry) => entry.name);
       expect(files).toContain(PRESERVE_BACKUP_FILE);
+      expect(files).toContain(PRESERVE_PLAIN_NAME);
       expect(files).toContain(PRESERVE_DUMP_ORIGINAL_FILE);
       for (const entry of document.inventory) {
         expect(entry.present, entry.name).toBe(true);

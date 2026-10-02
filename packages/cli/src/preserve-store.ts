@@ -72,15 +72,17 @@ export function parseRunState(text: string, file: string): PreserveRunState {
     );
   }
   /* Inspected as unknown on purpose: the cast below is only honest after the
-   * checks, and a document that fails them is refused, not trimmed to fit. */
+   * checks, and a document that fails them is refused, not trimmed to fit.
+   * Both schemas load: version 2 (the run derives its image from the camera)
+   * and version 1 (the older self-sourcing shape, where the caller handed
+   * over a plaintext file — its artifact set is identical, so every step
+   * works as long as the directory carries the derived plaintext artifact). */
   const loose = doc as Record<string, unknown>;
   if (
     typeof doc !== 'object' ||
     doc === null ||
-    loose.version !== 1 ||
+    (loose.version !== 1 && loose.version !== 2) ||
     typeof loose.runId !== 'string' ||
-    typeof loose.imageSha256 !== 'string' ||
-    typeof loose.expectedVersion !== 'string' ||
     typeof loose.createdAt !== 'string' ||
     !(
       typeof loose.nextStep === 'string' &&
@@ -90,10 +92,23 @@ export function parseRunState(text: string, file: string): PreserveRunState {
     loose.steps === null
   ) {
     throw new CliError(
-      `${file} is not a version-1 preserve run state — this tool refuses to guess what a ` +
-        'document it did not write means. Start a new run, or restore the file from a copy.',
+      `${file} is not a preserve run state this tool wrote (want schema version 1 or 2) — ` +
+        'this tool refuses to guess what a document it did not write means. Start a new ' +
+        'run, or restore the file from a copy.',
       { code: 'preserve/state' },
     );
+  }
+  /* The build facts a version-2 run records at the backup; a version-1 run
+   * recorded them at create time. Either way they are strings once present. */
+  for (const field of ['imageSha256', 'expectedVersion'] as const) {
+    const value = loose[field];
+    if (value !== undefined && typeof value !== 'string') {
+      throw new CliError(
+        `${file}: ${field} is present but not a string — the run state is damaged; restore ` +
+          'it from a copy or start a new run',
+        { code: 'preserve/state' },
+      );
+    }
   }
   return doc as PreserveRunState;
 }

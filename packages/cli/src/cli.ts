@@ -97,11 +97,7 @@ export type ParsedCli =
 const RECIPIENTS: readonly RecipientPreference[] = ['interface', 'device', 'auto'];
 
 /** Commands that take exactly one file argument. */
-const FILE_COMMANDS: ReadonlySet<CommandName> = new Set<CommandName>([
-  'decrypt',
-  'flash',
-  'preserve',
-]);
+const FILE_COMMANDS: ReadonlySet<CommandName> = new Set<CommandName>(['decrypt', 'flash']);
 
 function parseInteger(name: string, text: string): number {
   if (!/^(0[xX][0-9a-fA-F]+|[0-9]+)$/.test(text.trim())) {
@@ -192,17 +188,9 @@ export function parseCli(argv: readonly string[]): ParsedCli {
   if (values.help) return { kind: 'help', command: commandWord, json: values.json };
 
   const takesFile = FILE_COMMANDS.has(commandWord);
-  /* `preserve` is the one file command whose positional is conditional: a
-   * `--print-state` run touches no image at all, and a `--resume` run needs
-   * it only when it resumes at a step that rebuilds the patch. The command
-   * itself refuses with the reason when the image it was given is not enough. */
-  const needsFile =
-    takesFile &&
-    !(
-      commandWord === 'preserve' &&
-      (values['print-state'] !== undefined || values.resume !== undefined)
-    );
-  if (needsFile && rest.length === 0) {
+  /* `preserve` takes NO positional at all: the image always derives from the
+   * camera itself, and `--resume`/`--print-state` need nothing else. */
+  if (takesFile && rest.length === 0) {
     throw new UsageError(`${commandWord} needs a file argument`);
   }
   if (rest.length > (takesFile ? 1 : 0)) {
