@@ -386,7 +386,11 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
         }
 
         const gate = canRunPhase({ state: current, phase, has: hasCheckpoint });
-        if (!gate.ok && !(gate.jumpable && allowJump)) {
+        /* The power-cycle assertion the row's re-run control armed satisfies
+         * the gate's one power-cycle gap — core's own retry gate takes the
+         * same flag, so the panel must not refuse what core will accept. */
+        const powerCycleArmed = gate.needsPowerCycle && options.powerCycled === true;
+        if (!gate.ok && !(gate.jumpable && allowJump) && !powerCycleArmed) {
           rep.log(`refused: this phase ${gateReason(gate) ?? 'cannot run'}`, 'error');
           rep.setStatus('Refused — the phase list above says what is missing.');
           return;
