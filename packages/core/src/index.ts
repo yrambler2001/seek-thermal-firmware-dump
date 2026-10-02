@@ -431,8 +431,10 @@ export {
 export type {
   BackupResult,
   BankKey,
+  CommitRouteId,
   CreatePreserveRunOptions,
   CreatedPreserveRun,
+  DrainCapability,
   PatchSite,
   PipelineArtifacts,
   PipelineOptions,
@@ -443,9 +445,11 @@ export type {
   PreserveStepId,
   PreserveStepOutcome,
   PreserveStepRecord,
+  RestoreFormId,
   SessionOpener,
   SlotDetection,
   SolvePlainResult,
+  StagedFormId,
   V1Patch,
   WindowBytes,
 } from './preservation/index.js';
