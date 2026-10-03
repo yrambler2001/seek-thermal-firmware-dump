@@ -2,7 +2,7 @@
  * The NEW build families, end to end, against the FW-V1 emulator — one
  * focused run per family, on the boots the RE records used:
  *
- *   1. Compact 1.3.0.8 8 Hz — the chimera the doc-35 forge ran (the 8 Hz
+ *   1. Compact 1.3.0.8 8 Hz — the chimera the doc-35 patch ran (the 8 Hz
  *      image spliced onto the PLAINTEXT 2014 donor 101310HSNEA2): the six
  *      steps, whole-part drain, delivered == as-booted. SELF-SOURCED: no
  *      image input anywhere — the backup step reads the active slot twice,
@@ -392,7 +392,7 @@ async function runFullInPlace(spec: {
    * THE FIRST-SESSION SHAPE (doc 35.4): the first session opened on a
    * freshly booted server can stall its first vendor INs while the guest
    * settles — the doc-34 retry shape (close, reopen, retry) covers it, and
-   * the doc's own forge runs each needed exactly one retry. So each step
+   * the doc's own patch runs each needed exactly one retry. So each step
    * runs on a ladder: two sessions on this server, then a fresh server,
    * three rounds — the same shape the §23 suite's withFreshSessions gives
    * read phases. The commit's landed case (the pre-check's "resume at

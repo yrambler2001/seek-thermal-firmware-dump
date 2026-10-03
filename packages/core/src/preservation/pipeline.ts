@@ -23,7 +23,7 @@
  *       erases the whole 64 KiB block and programs exactly the staged bytes,
  *       and a full 64 KiB stage would overrun the descriptor's staging
  *       buffer); commit (0x51 with the u16 sum); wire-89 reset — the same
- *       session, the proven forge shape. NO bootcfg write, NO other-slot
+ *       session, the proven patch shape. NO bootcfg write, NO other-slot
  *       write: the part's only change is the enumerated patch bytes inside
  *       the one active bank.
  *

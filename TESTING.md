@@ -4051,7 +4051,7 @@ Three focused runs, on the boots the RE records used, through the six steps with
 choreography (reset-free commit sessions, the drain ladder at 64-byte asks, the delivery audit
 with the reset's one tolerated orphan). A per-step session ladder covers the doc 35.4 first
 session shape (the first session on a freshly booted server can stall its first vendor INs;
-close, reopen, retry — the doc's forge runs each needed exactly one retry, and the 8 Hz run
+close, reopen, retry — the doc's patch runs each needed exactly one retry, and the 8 Hz run
 below needed exactly one too), with the commit's landed case recognized, never replayed.
 
 **1.3.0.8-FF through the recovery route — GREEN (the doc's chimeras, blank record):** backup →
@@ -4063,7 +4063,7 @@ one arm through the patched guard (106.4 s at 64-byte asks) → the restore gate
 | proof                                                                        | result                                                                                                                                                                                 |
 | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | commit moved                                                                 | EXACTLY the 6 patch bytes inside recovery 0x14070000 (0x238..0x23B, 0x3D69, 0x3E71 + the 0x70000 base); A, B, the bootloader block and the boot-config record untouched                |
-| raw dump == the post-commit part                                             | 0 diffs; sha256 `28d50575dd30971a19c1732ab87c53d30a4f8f0d00323677a3a3f0e293777291` — **byte for byte the doc 35.3.3 forge run's dump sha**, across sessions, choreography and codebase |
+| raw dump == the post-commit part                                             | 0 diffs; sha256 `28d50575dd30971a19c1732ab87c53d30a4f8f0d00323677a3a3f0e293777291` — **byte for byte the doc 35.3.3 patch run's dump sha**, across sessions, choreography and codebase |
 | delivered dump (recovery swapped back from the backup) == the as-booted part | 0 diffs; sha256 `dd935b331c2149199235e9c20739d2a821706626530639364b8cab2a9eab1d29` — the doc's own as-booted chimera sha                                                               |
 | detection                                                                    | the run's state names RECOVERY (the effectiveDetection override), and the commit, swap-back and refusal all act on 0x14070000                                                          |
 

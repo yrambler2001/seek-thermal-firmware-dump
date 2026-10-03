@@ -2,7 +2,7 @@
  * The preservation pipeline's plaintext and ciphertext math, for every build
  * whose widening patch is derived and proven.
  *
- * Ported from FW-V1 `ht-201/forge_v1_patch.py` (doc 34) and reduced to what the
+ * Ported from FW-V1 `ht-201/build_v1_patch.py` (doc 34) and reduced to what the
  * in-place route needs, then extended to the newly derived families (FW-V1
  * docs 35 — the two 1.3.0.8 builds — and the 1.0.3.x packaging doc,
  * `V1_WIDENING_1032`). Everything here is pure: bytes in, bytes out, no
@@ -60,7 +60,7 @@ import { SeekError } from '../errors.js';
 import { parseImageHeader } from '../image/header.js';
 
 /** The R16 xorshift128 generator, seeded [k1,k2,k3,k0], no whitening — the
- *  2016-donor at-rest form (`forge_v1_patch.py keystream`). Only needed where
+ *  2016-donor at-rest form (`build_v1_patch.py keystream`). Only needed where
  *  the slot's key is known (the emulator's donor); the in-place wire patch
  *  itself never needs it, because the keystream cancels in the conjugation. */
 export function keystream(
