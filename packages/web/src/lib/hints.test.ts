@@ -3,6 +3,7 @@ import { CancelledError, SeekError } from '@seek-fw/core';
 import {
   FIRMWARE_TOO_OLD_HINT,
   HOLDING_HINT,
+  POWER_CYCLE_HINT,
   UDEV_HINT,
   WINDOWS_HINT,
   hintFor,
@@ -100,6 +101,20 @@ describe('hintFor', () => {
       { detail: { profile: 'compact-2014', capability: 'dump', reason: '…' } },
     );
     expect(hintFor(capability, MAC)).toContain('Leave the family on auto');
+  });
+
+  it('turns the CLI resume remedy of a power-cycle refusal into the wizard’s own', () => {
+    const spent = new SeekError(
+      'pipeline/refused',
+      'the camera’s window reader is budgeted per boot and these reads came back from a spent ' +
+        'reader — power-cycle the camera (unplug and replug it, or use its power switch), then ' +
+        're-run `preserve --resume <run-directory>`. Signature: …',
+    );
+    expect(hintFor(spent, MAC)).toBe(POWER_CYCLE_HINT);
+    expect(hintFor(spent, MAC)).toContain('Connect device');
+    /* A refusal that names no power cycle gets no advice it cannot use. */
+    const other = new SeekError('pipeline/refused', 'cfg[0]=0x7 names no slot');
+    expect(hintFor(other, MAC)).toBeNull();
   });
 
   it('stays quiet when it has nothing to add', () => {

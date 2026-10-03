@@ -160,6 +160,12 @@ export interface PreservePhaseMeta {
   /** The camera leaves the bus mid-phase by design (the drain's or the
    *  restore's wire-89 reset): a disconnect there is the reset, not a swap. */
   readonly resetsCamera: boolean;
+  /** The phase ends by asking for an unplug and replug, and waits to see it,
+   *  when the committed patch lacks the arm tail's cursor reset: a part
+   *  patched without it keeps a dead reader after the drain that the wire
+   *  reboot does not revive (TESTING.md secs. 28.4, 35, 36). Only when the
+   *  phase's last step ran in that invocation. */
+  readonly replugAfter: boolean;
 }
 
 export const PRESERVE_PHASES: readonly PreservePhaseMeta[] = [
@@ -168,12 +174,15 @@ export const PRESERVE_PHASES: readonly PreservePhaseMeta[] = [
     label: 'Read & build',
     description:
       'Connect, read the device info, and let the run build itself: the 31 stock windows are ' +
-      'backed up — one admitted boot per window, the camera rebooting by command between ' +
-      'them — the active slot is read on two boots and the two reads must agree, the factory ' +
-      'plaintext is derived from that capture and gated, the patch is built offline, and the ' +
-      'plan below prints from what the camera produced. Read-only. About seven minutes.',
+      'backed up, each on a session the reader probe admits (a probe that finds the reader ' +
+      'spent or page-shifted reboots the camera by command first, and in Chrome each reboot ' +
+      'needs a "Connect device" click), the active slot is read twice and the two reads must ' +
+      'agree, the factory plaintext is derived from that capture and gated, the patch is ' +
+      'built offline, and the plan below prints from what the camera produced. Read-only. ' +
+      'Under a minute when no reboot is needed.',
     steps: ['backup', 'patch'],
     resetsCamera: true,
+    replugAfter: false,
   },
   {
     id: 'patch-dump',
@@ -181,21 +190,26 @@ export const PRESERVE_PHASES: readonly PreservePhaseMeta[] = [
     description:
       'THE WRITE, then the reward. The commit stages the conjugated patch into the active bank ' +
       '(image length only) behind the danger dialog — the one irreversible write of the run. ' +
-      'Then the camera is reset so it boots the patched image, and the whole 4 MiB part is ' +
-      'drained through the widened window.',
+      'Then the camera is reset so it boots the patched image (press "Connect device" when ' +
+      'the log asks — Chrome forgets this camera on every reboot), and the whole 4 MiB part ' +
+      'is drained through the widened window, and the run file is saved. A run whose patch ' +
+      'predates the reader fix ends by asking you to unplug the camera and plug it back in: ' +
+      'without the fix the drain leaves the reader dead until it is powered off.',
     steps: ['commit', 'drain'],
     resetsCamera: true,
+    replugAfter: true,
   },
   {
     id: 'restore-verify',
     label: 'Restore & verify',
     description:
       'Put the camera back. The original bank content is staged over the active bank (the ' +
-      'other write, behind the danger dialog) and the camera is reset; then the 31 windows ' +
-      'are re-read on the fresh boot and must match the backup byte for byte — the verdict ' +
-      'is shown on this row.',
+      'other write, behind the danger dialog) and the camera is reset (press "Connect ' +
+      'device" when the log asks); then the 31 windows are re-read on the fresh boot and must ' +
+      'match the backup byte for byte — the verdict is shown on this row.',
     steps: ['restore', 'verify'],
     resetsCamera: true,
+    replugAfter: false,
   },
 ];
 

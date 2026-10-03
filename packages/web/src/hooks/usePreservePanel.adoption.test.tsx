@@ -7,6 +7,13 @@
  *    NOT cancel: the opener ladder's boot silence is progress text, the
  *    re-enumerated unit (same vid/pid — this camera has no serial string) is
  *    auto-adopted on its connect event, and the phase continues;
+ *  - when Chrome does NOT hand the rebooted unit back (no serial string, so
+ *    no grant survives the re-enumeration — what real Chrome does), the REAL
+ *    opener ladder tells the user to press "Connect device", and that click
+ *    resumes the phase;
+ *  - phase ② ends by asking for an unplug and replug (the drain leaves the
+ *    reader dead), and completes only once it has seen the camera leave and a
+ *    camera come back — cancelling that wait keeps the recorded steps;
  *  - with a SECOND authorized camera on the bus, the reconnect cannot be
  *    told apart — the run stops loudly;
  *  - during phase ① (no reset expected) a disconnect stops the phase;
@@ -20,7 +27,7 @@
 
 import { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CancelledError, nextStepAfter, type Artifact } from '@seek-fw/core';
+import { CancelledError, nextStepAfter, type Artifact, type SessionOpener } from '@seek-fw/core';
 import { DEFAULT_OPTIONS_FORM } from '@/lib/options';
 import type * as PreserveClient from '@/lib/preserve/client';
 import { useDevice, type DeviceHandle } from './useDevice';
@@ -46,6 +53,14 @@ let hungStep: PreserveStepId | null = null;
 const deferreds = new Map<PreserveStepId, Deferred>();
 /** The state each fake step was handed, in call order. */
 const handed: [PreserveStepId, PreserveRunState][] = [];
+/** Which step opens one session through the wizard's REAL opener ladder, once
+ *  the test releases its gate — so the drop can land between the phase's
+ *  start and the open, where the reset puts it. */
+let openingStep: PreserveStepId | null = null;
+const openGates = new Map<PreserveStepId, () => void>();
+/** The sites the fake patch step records — empty is a patch without the arm
+ *  tail's cursor reset, which owes the replug after the drain. */
+let fakePatchSites: { name: string; offset: number; before: number[]; after: number[] }[] = [];
 
 function fakeOutcome(step: PreserveStepId, state: PreserveRunState): PreserveStepOutcome {
   const record = { status: 'done' as const, startedAt: 's', finishedAt: 'f', notes: 'fake' };
@@ -91,7 +106,7 @@ function fakeOutcome(step: PreserveStepId, state: PreserveRunState): PreserveSte
         state: {
           ...base,
           patch: {
-            sites: [],
+            sites: fakePatchSites,
             rebalanceWord: 0x30006240,
             stagedLength: 0x4000,
             chunkCount: 256,
@@ -119,11 +134,20 @@ function fakeOutcome(step: PreserveStepId, state: PreserveRunState): PreserveSte
 
 async function fakeRunStep(
   step: PreserveStepId,
+  opener: SessionOpener,
   state: PreserveRunState,
   signal: AbortSignal,
 ): Promise<PreserveStepOutcome> {
   handed.push([step, state]);
   const outcome = fakeOutcome(step, state);
+  if (step === openingStep) {
+    await new Promise<void>((resolve) => {
+      openGates.set(step, resolve);
+    });
+    const session = await opener.open();
+    await opener.close(session);
+    return outcome;
+  }
   if (step === hungStep) {
     return new Promise<PreserveStepOutcome>((resolve, reject) => {
       deferreds.set(step, { resolve });
@@ -145,12 +169,12 @@ vi.mock('@/lib/preserve/client', async (importOriginal) => {
     ...actual,
     runPreserveStep: (
       step: PreserveStepId,
-      _opener: unknown,
+      opener: SessionOpener,
       state: PreserveRunState,
       _load: unknown,
       _reporter: unknown,
       signal: AbortSignal,
-    ): Promise<PreserveStepOutcome> => fakeRunStep(step, state, signal),
+    ): Promise<PreserveStepOutcome> => fakeRunStep(step, opener, state, signal),
   };
 });
 
@@ -183,13 +207,46 @@ class FakeUsb {
     return Promise.resolve([...this.authorized]);
   }
 
+  /** The chooser: the unit the user picks, which Chrome then authorizes. */
+  picked: USBDevice | null = null;
+
+  requestDevice(): Promise<USBDevice> {
+    const unit = this.picked;
+    if (unit === null)
+      return Promise.reject(new DOMException('No device selected.', 'NotFoundError'));
+    this.authorized = [...this.authorized, unit];
+    return Promise.resolve(unit);
+  }
+
   fire(type: 'connect' | 'disconnect', device: USBDevice): void {
     for (const handler of this.handlers.get(type) ?? []) handler({ device });
   }
 }
 
+/** A unit the transport can open and close — enough for the opener ladder;
+ *  no transfer is ever sent to it. */
 function fakeCameraUnit(pid: number): USBDevice {
-  return { vendorId: 0x289d, productId: pid } as unknown as USBDevice;
+  const unit = {
+    vendorId: 0x289d,
+    productId: pid,
+    manufacturerName: 'Seek Thermal',
+    productName: 'PIR206 Thermal Camera',
+    serialNumber: '',
+    opened: false,
+    configuration: { configurationValue: 1 },
+    open: () => {
+      unit.opened = true;
+      return Promise.resolve();
+    },
+    close: () => {
+      unit.opened = false;
+      return Promise.resolve();
+    },
+    selectConfiguration: () => Promise.resolve(),
+    claimInterface: () => Promise.resolve(),
+    releaseInterface: () => Promise.resolve(),
+  };
+  return unit as unknown as USBDevice;
 }
 
 let usb: FakeUsb;
@@ -240,6 +297,9 @@ function linesOf(panel: PreservePanelApi, phase: PreservePhaseId): string {
 beforeEach(() => {
   hungStep = null;
   deferreds.clear();
+  openingStep = null;
+  openGates.clear();
+  fakePatchSites = [];
   handed.length = 0;
   downloads.length = 0;
   installUsb();
@@ -287,18 +347,160 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
       linesOf(current(mounted).panel, 'patch-dump').includes('adopting it and continuing'),
     );
 
-    /* The boot silence ends; the drain finishes; the phase completes. */
+    /* The boot silence ends; the drain finishes; the run file is saved and
+     * the phase asks for the replug. */
     act(() => {
       deferreds
         .get('drain')
         ?.resolve(fakeOutcome('drain', handed.at(-1)?.[1] ?? current(mounted).panel.state!));
     });
+    await waitFor(() =>
+      linesOf(current(mounted).panel, 'patch-dump').includes('Now unplug the camera'),
+    );
+    expect(current(mounted).panel.activePhase).toBe('patch-dump');
+    expect(current(mounted).panel.state?.steps.drain?.status).toBe('done');
+    expect(downloads.length).toBe(2); /* the phase ② zip, BEFORE the wait */
+
+    /* THE UNPLUG, then the replug and the Connect click. */
+    usb.authorized = [];
+    act(() => {
+      usb.fire('disconnect', unitA2);
+    });
+    await waitFor(() =>
+      linesOf(current(mounted).panel, 'patch-dump').includes('the camera is unplugged'),
+    );
+    expect(current(mounted).panel.activePhase).toBe('patch-dump');
+    const unitA3 = fakeCameraUnit(0x0010);
+    usb.picked = unitA3;
+    await act(async () => {
+      await current(mounted).device.connect();
+    });
+
     await waitFor(() => current(mounted).panel.activePhase === null);
-    expect(current(mounted).panel.activePhase).toBeNull();
+    expect(linesOf(current(mounted).panel, 'patch-dump')).toContain('back on a fresh boot');
     expect(current(mounted).panel.state?.nextStep).toBe('restore');
     expect(current(mounted).panel.state?.steps.commit?.status).toBe('done');
     expect(current(mounted).panel.state?.steps.drain?.status).toBe('done');
-    expect(downloads.length).toBe(2); /* the phase ② zip */
+    expect(downloads.length).toBe(2); /* saved once, not again after the replug */
+    mounted.unmount();
+  });
+
+  it('phase ②: Chrome does not hand the rebooted camera back — the ladder asks for the Connect click, and the click resumes the phase', async () => {
+    const unitA = fakeCameraUnit(0x0010);
+    const mounted = mountPanel([unitA]);
+    await waitFor(() => current(mounted).device.device !== null);
+    await runTo(mounted, 'read-build', () => current(mounted).panel.state?.nextStep === 'commit');
+
+    openingStep = 'drain';
+    act(() => {
+      void current(mounted).panel.runPhase('patch-dump');
+    });
+    await waitFor(() => openGates.has('drain'));
+
+    /* THE RESET, as real Chrome shows it for a camera with no serial string:
+     * the unit leaves, and the unit that comes back is a stranger — no
+     * connect event reaches the page and getDevices() answers empty. */
+    usb.authorized = [];
+    act(() => {
+      usb.fire('disconnect', unitA);
+    });
+    await waitFor(() =>
+      linesOf(current(mounted).panel, 'patch-dump').includes('the reset was expected'),
+    );
+
+    /* The drain opens its session AFTER the drop, through the ladder the
+     * phase built while the camera was still on the bus. */
+    act(() => {
+      openGates.get('drain')?.();
+    });
+    await waitFor(() =>
+      linesOf(current(mounted).panel, 'patch-dump').includes('Press "Connect device"'),
+    );
+    expect(current(mounted).panel.phaseReporters['patch-dump'].progress.text).toContain(
+      'Re-connect the camera',
+    );
+    expect(current(mounted).panel.activePhase).toBe('patch-dump'); /* still waiting, not failed */
+
+    /* THE CLICK: the user picks the camera in Chrome's chooser. */
+    const unitA2 = fakeCameraUnit(0x0010);
+    usb.picked = unitA2;
+    await act(async () => {
+      await current(mounted).device.connect();
+    });
+    expect(current(mounted).device.device).toBe(unitA2);
+
+    await waitFor(() =>
+      linesOf(current(mounted).panel, 'patch-dump').includes('Now unplug the camera'),
+    );
+    expect(linesOf(current(mounted).panel, 'patch-dump')).toContain('adopting it and continuing');
+    expect(current(mounted).panel.state?.steps.drain?.status).toBe('done');
+    expect(current(mounted).panel.state?.nextStep).toBe('restore');
+    expect(unitA2.opened).toBe(false); /* the ladder's session was closed */
+
+    /* Cancelling the replug wait ends the phase with its steps recorded and
+     * the replug still owed — no second save, no failure. */
+    act(() => {
+      current(mounted).panel.cancel();
+    });
+    await waitFor(() => current(mounted).panel.activePhase === null);
+    expect(linesOf(current(mounted).panel, 'patch-dump')).toContain('the replug wait was stopped');
+    expect(current(mounted).panel.phaseReporters['patch-dump'].progress.text).toContain(
+      'Unplug and replug the camera before the restore',
+    );
+    expect(current(mounted).panel.state?.steps.drain?.status).toBe('done');
+    expect(downloads.length).toBe(2);
+    mounted.unmount();
+  }, 15_000); /* the ladder's real 1 s pauses: the ask lands on its third attempt */
+
+  it('phase ②: a patch with the arm tail’s cursor reset owes no replug — the phase ends after the drain', async () => {
+    fakePatchSites = [
+      { name: 'arm cursor reset', offset: 0x3dc6, before: [0xa5, 0x81], after: [0xe5, 0x60] },
+    ];
+    const unitA = fakeCameraUnit(0x0010);
+    const mounted = mountPanel([unitA]);
+    await waitFor(() => current(mounted).device.device !== null);
+    await runTo(mounted, 'read-build', () => current(mounted).panel.state?.nextStep === 'commit');
+    act(() => {
+      void current(mounted).panel.runPhase('patch-dump');
+    });
+    await waitFor(() => current(mounted).panel.activePhase === null);
+    const log = linesOf(current(mounted).panel, 'patch-dump');
+    expect(log).toContain('no replug needed');
+    expect(log).not.toContain('Now unplug the camera');
+    expect(current(mounted).panel.state?.steps.drain?.status).toBe('done');
+    expect(current(mounted).panel.phaseReporters['patch-dump'].progress.text).toContain(
+      'The run file in your downloads is up to date',
+    );
+    mounted.unmount();
+  });
+
+  it('phase ②: two authorized cameras after the replug — the phase ends, and says which camera to leave', async () => {
+    const unitA = fakeCameraUnit(0x0010);
+    const mounted = mountPanel([unitA]);
+    await waitFor(() => current(mounted).device.device !== null);
+    await runTo(mounted, 'read-build', () => current(mounted).panel.state?.nextStep === 'commit');
+    act(() => {
+      void current(mounted).panel.runPhase('patch-dump');
+    });
+    await waitFor(() =>
+      linesOf(current(mounted).panel, 'patch-dump').includes('Now unplug the camera'),
+    );
+
+    usb.authorized = [];
+    act(() => {
+      usb.fire('disconnect', unitA);
+    });
+    const unitA2 = fakeCameraUnit(0x0010);
+    usb.authorized = [fakeCameraUnit(0x0010)];
+    usb.picked = unitA2; /* the chooser adds it: two authorized units */
+    await act(async () => {
+      await current(mounted).device.connect();
+    });
+
+    await waitFor(() => current(mounted).panel.activePhase === null);
+    expect(linesOf(current(mounted).panel, 'patch-dump')).toContain('cannot be told apart');
+    expect(linesOf(current(mounted).panel, 'patch-dump')).not.toContain('back on a fresh boot');
+    expect(current(mounted).panel.state?.steps.drain?.status).toBe('done');
     mounted.unmount();
   });
 
@@ -376,6 +578,12 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
     const mounted = mountPanel([]);
     await runTo(mounted, 'read-build', () => current(mounted).panel.state?.nextStep === 'commit');
     await runTo(mounted, 'patch-dump', () => current(mounted).panel.state?.nextStep === 'restore');
+
+    /* Phase ② now waits for the replug; there is no camera here to unplug. */
+    act(() => {
+      current(mounted).panel.cancel();
+    });
+    await waitFor(() => current(mounted).panel.activePhase === null);
 
     expect(handed.map(([step]) => step)).toEqual(['backup', 'patch', 'commit', 'drain']);
     const [, patchedState] = handed.find(([step]) => step === 'commit')!;

@@ -146,6 +146,20 @@ function isFirmwareTooOld(error: SeekError): boolean {
   return error.code === 'profile/unsupported' && typeof error.detail?.firmwareVersion === 'string';
 }
 
+/**
+ * The preserve refusals that name the power cycle (core's `spentReaderRefusal`)
+ * end on the CLI's remedy, `preserve --resume <run-directory>`. This page
+ * still holds the run, so its remedy is the replug and the Connect click — a
+ * replugged camera is a stranger to Chrome, like a rebooted one.
+ */
+export const POWER_CYCLE_HINT =
+  'In this wizard: unplug the camera and plug it back in, press "Connect device" and pick it, ' +
+  'then run the same phase again. The run is still loaded here — there is nothing to resume.';
+
+function isPowerCycleRefusal(error: SeekError): boolean {
+  return error.code === 'pipeline/refused' && error.message.includes('power-cycle the camera');
+}
+
 function liveUserAgent(): string {
   return typeof navigator === 'undefined' ? '' : navigator.userAgent;
 }
@@ -157,6 +171,7 @@ export function hintFor(error: unknown, userAgent: string = liveUserAgent()): st
   if (looksLikeAccessError(error)) return permissionHint(userAgent);
   if (isSeekError(error)) {
     if (isFirmwareTooOld(error)) return FIRMWARE_TOO_OLD_HINT;
+    if (isPowerCycleRefusal(error)) return POWER_CYCLE_HINT;
     return SEEK_HINTS[error.code] ?? null;
   }
   return null;

@@ -21,9 +21,12 @@
  *    289d:0010; this camera has no USB serial string, so vid/pid plus the
  *    active run context is the discriminator. During such a phase a
  *    disconnect does NOT cancel: the opener ladder rides through the boot
- *    silence, `useDevice` re-adopts the re-enumerated device on its own
- *    connect event (no user gesture — the permission carries), and the phase
- *    continues. A device that appears with no drop before it, or more than
+ *    silence and the phase continues once the camera is back. Chrome keeps
+ *    no grant for a device without a serial string, so the re-enumerated
+ *    unit is a stranger to it: the ladder tells the user to press "Connect
+ *    device", and that click is what re-adopts it (a camera Chrome DOES
+ *    still know comes back on its own connect event or from getDevices()).
+ *    A device that appears with no drop before it, or more than
  *    one authorized camera answering `getDevices()` when the reconnect
  *    lands, is a swap — the run stops loudly. A true swap that slips past
  *    anyway is caught downstream: every later session re-checks the firmware
@@ -44,6 +47,7 @@ import {
   CancelledError,
   SeekDevice,
   SEEK_VENDOR_ID,
+  clearsArmCursor,
   type SessionOpener,
   type WebUsbTransport,
 } from '@seek-fw/core';
@@ -97,6 +101,10 @@ export const OPEN_ATTEMPTS = 60;
  *  click is a human act, so the opener waits ten minutes, and Cancel is the
  *  way out of a wait nobody is coming back for. */
 export const OPEN_ATTEMPTS_PATIENT = 600;
+/** How long the drain's phase listens for the unplug and replug it asks for
+ *  — the same ten minutes the patient ladder gives the Connect click. Its
+ *  steps are recorded before it starts, so running out only leaves a warning. */
+export const REPLUG_WAIT_MS = OPEN_ATTEMPTS_PATIENT * 1000;
 
 export function phasePanelId(phase: PreservePhaseId): string {
   return `${PHASE_PANEL_PREFIX}${phase}`;
@@ -172,6 +180,20 @@ function waitMs(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/** How many authorized Seek cameras `getDevices()` answers with, or null when
+ *  Chrome cannot be asked. vid/pid is all the identity this camera offers, so
+ *  with two of them on the bus, which one came back cannot be told apart. */
+async function authorizedCameraCount(): Promise<number | null> {
+  const usb = getWebUsb();
+  if (usb === null) return null;
+  try {
+    const known = await usb.getDevices();
+    return known.filter((candidate) => candidate.vendorId === SEEK_VENDOR_ID).length;
+  } catch {
+    return null;
+  }
+}
+
 export function usePreservePanel(params: PreservePanelParams): PreservePanelApi {
   const { runner, device, form } = params;
 
@@ -219,6 +241,14 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
 
   /* ---- the session opener ladder --------------------------------------- */
 
+  /* The ladder outlives the render that built it — a phase holds its opener
+   * across the reset — so it reads the device seat through this ref. The
+   * `device` handle the phase started with is a snapshot: its `.device` is
+   * the USBDevice that dropped, never null, so a ladder reading it would
+   * never re-adopt and never tell the user to re-connect. */
+  const deviceRef = useRef(device);
+  deviceRef.current = device;
+
   const makeOpener = useCallback(
     (
       rep: ReporterHandle,
@@ -253,7 +283,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
               /* makeTransport reads the LIVE device, so an attempt that
                * lands after the reset's re-enumeration opens the camera
                * that came back, not the object that dropped. */
-              const transport = device.makeTransport({
+              const transport = deviceRef.current.makeTransport({
                 recipient: options.recipient,
                 onWarning: (message) => {
                   rep.log(message, 'warn');
@@ -280,8 +310,8 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
                * GONE (this camera has no serial number, so every reboot is a
                * new device to Chrome), the re-confirm is the user's click —
                * say so, loudly, once. */
-              if (device.device === null) {
-                const reattached = await device.reattach();
+              if (deviceRef.current.device === null) {
+                const reattached = await deviceRef.current.reattach();
                 if (reattached) {
                   rep.log('the camera is back on the bus — re-adopted it', 'ok');
                 } else if (!instructed && attempt >= 2) {
@@ -317,7 +347,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
       };
       return { opener, closeAll };
     },
-    [device, form],
+    [form],
   );
 
   /* ---- the generation guard: the reset is not a swap -------------------- */
@@ -326,6 +356,11 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
   /* Set when the current phase saw its camera leave, so the reconnect that
    * follows can be recognised as the reset's re-enumeration. */
   const sawDisconnect = useRef(false);
+  /* Set while the drain's phase waits for the unplug and replug. The guard
+   * records the departure as the unplug (a poll could miss a quick one) and
+   * leaves the arrival to the wait, which runs the count check itself and
+   * ends the phase on its verdict. */
+  const replugWatch = useRef<{ unplugged: boolean } | null>(null);
 
   const stopForSwap = useCallback(
     (rep: ReporterHandle, why: string): void => {
@@ -348,6 +383,16 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
     const rep = reportersRef.current[phase];
 
     if (device.device === null) {
+      if (replugWatch.current !== null) {
+        replugWatch.current.unplugged = true;
+        sawDisconnect.current = true;
+        rep.reporter.log(
+          'the camera is unplugged — plug it back in, then press "Connect device" and pick it',
+          'detail',
+        );
+        rep.setStatus('Plug the camera back in, then press "Connect device" …');
+        return;
+      }
       /* A device LEFT. On a phase that resets the camera this is the reset
        * itself — the opener ladder is already riding through the boot
        * silence, and the reconnect below re-adopts the unit. Anywhere else
@@ -373,32 +418,84 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
       return;
     }
     sawDisconnect.current = false;
+    if (replugWatch.current !== null) return;
     /* THE COUNT CHECK: vid/pid is all the identity this camera offers, so
      * with more than one authorized camera on the bus, WHICH one came back
      * cannot be told apart — stop, and let the steps' own version/bank
-     * gates be the backstop against anything that slipped through. */
+     * gates be the backstop against anything that slipped through. (An
+     * advisory check: when Chrome cannot be asked, the gates decide.) */
     void (async () => {
-      try {
-        const usb = getWebUsb();
-        if (usb !== null) {
-          const known = await usb.getDevices();
-          const seekUnits = known.filter((candidate) => candidate.vendorId === SEEK_VENDOR_ID);
-          if (seekUnits.length > 1) {
-            stopForSwap(
-              rep,
-              `${String(seekUnits.length)} authorized cameras answered when the camera ` +
-                're-enumerated — the one that came back cannot be told apart',
-            );
-            return;
-          }
-        }
-      } catch {
-        /* an advisory check; the steps' gates are the real backstop */
+      const units = await authorizedCameraCount();
+      if (units !== null && units > 1) {
+        stopForSwap(
+          rep,
+          `${String(units)} authorized cameras answered when the camera ` +
+            're-enumerated — the one that came back cannot be told apart',
+        );
+        return;
       }
       rep.reporter.log('the camera re-enumerated — adopting it and continuing the phase', 'ok');
       rep.setStatus('Camera back — continuing …');
     })();
   }, [device, runner, stopForSwap]);
+
+  /* ---- the replug that ends the drain's phase ---------------------------- */
+
+  /**
+   * The drain exhausts the camera's reader, and the wire reboot does not
+   * revive it — only a power cycle does (TESTING.md secs. 28.4, 35). So the
+   * phase that drains ends by asking for one, and WATCHES for it: the camera
+   * must leave the bus (the unplug), then a camera must fill the seat again
+   * (the replug, and the Connect click Chrome needs for a camera with no
+   * serial). The phase's steps are recorded and the run file saved before
+   * this starts, so a wait that is cancelled or runs out only leaves a
+   * warning behind.
+   */
+  const awaitReplug = useCallback(
+    async (
+      rep: ReporterHandle,
+      signal: AbortSignal,
+    ): Promise<'replugged' | 'ambiguous' | 'not-seen'> => {
+      const before = deviceRef.current.device;
+      const watch = { unplugged: before === null };
+      replugWatch.current = watch;
+      rep.log(
+        'Now unplug the camera, plug it back in, then press "Connect device" and pick it. The ' +
+          'drain leaves the camera’s reader dead until it is powered off, and the restore needs ' +
+          'a fresh boot. The run file is already saved.',
+        'warn',
+      );
+      rep.setStatus('Unplug the camera and plug it back in …');
+      try {
+        const deadline = Date.now() + REPLUG_WAIT_MS;
+        while (Date.now() < deadline && !signal.aborted) {
+          const seat = deviceRef.current.device;
+          if (seat === null) {
+            watch.unplugged = true;
+          } else if (watch.unplugged && seat !== before) {
+            const units = await authorizedCameraCount();
+            if (units !== null && units > 1) {
+              rep.log(
+                `${String(units)} authorized cameras answered when the camera came back — ` +
+                  'which one is plugged in cannot be told apart; leave only the camera this run ' +
+                  'patched connected before the restore (its version and bank checks are the ' +
+                  'backstop)',
+                'warn',
+              );
+              return 'ambiguous';
+            }
+            rep.log('the camera is back on a fresh boot — the restore can run', 'ok');
+            return 'replugged';
+          }
+          await waitMs(250, signal);
+        }
+        return 'not-seen';
+      } finally {
+        replugWatch.current = null;
+      }
+    },
+    [],
+  );
 
   /* ---- run one phase ---------------------------------------------------- */
 
@@ -466,6 +563,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
         const load = artifactLoader(checkpoints.current, extra.current);
         const { opener, closeAll } = makeOpener(rep, signal, meta.resetsCamera === true);
         let stepInFlight: PreserveStepId | null = null;
+        const ran = new Set<PreserveStepId>();
         try {
           for (const step of meta.steps) {
             if (current.steps[step]?.status === 'done') {
@@ -503,9 +601,48 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
             }
             current = outcome.state;
             applyState(current);
+            ran.add(step);
             rep.reporter.log(`${stepMeta(step).label} — done`, 'ok');
           }
           saveRunFile(lastCompletedStep(current));
+          const lastStep = meta.steps.at(-1);
+          const replugOwed =
+            meta.replugAfter &&
+            lastStep !== undefined &&
+            ran.has(lastStep) &&
+            !clearsArmCursor(current.patch?.sites ?? []);
+          if (meta.replugAfter && lastStep !== undefined && ran.has(lastStep) && !replugOwed) {
+            /* The committed patch carries the arm tail's cursor reset: the
+             * drain left the reader readable, and the restore reads on this
+             * boot (TESTING.md sec. 36). */
+            rep.reporter.log(
+              'the committed patch resets the reader’s cursor on every arm, so the drain left ' +
+                'it readable — no replug needed; the restore reads on this boot',
+              'detail',
+            );
+          }
+          if (replugOwed) {
+            const replug = await awaitReplug(rep, signal);
+            if (replug !== 'replugged') {
+              if (replug === 'not-seen') {
+                rep.log(
+                  (signal.aborted
+                    ? 'the replug wait was stopped'
+                    : `no replug seen in ${String(Math.round(REPLUG_WAIT_MS / 60_000))} min`) +
+                    ' — unplug the camera and plug it back in before the restore; the drain ' +
+                    'left its reader dead',
+                  'warn',
+                );
+              }
+              rep.reporter.progress(
+                1,
+                1,
+                `${meta.label} — done, and the run file is saved. Unplug and replug the camera ` +
+                  'before the restore.',
+              );
+              return;
+            }
+          }
           rep.reporter.progress(
             1,
             1,
@@ -539,7 +676,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
           rep.flush();
         }
       }),
-    [applyState, form, hasCheckpoint, makeOpener, phaseReporters, runner, saveRunFile],
+    [applyState, awaitReplug, form, hasCheckpoint, makeOpener, phaseReporters, runner, saveRunFile],
   );
 
   /* ---- resume from a run file ------------------------------------------ */
