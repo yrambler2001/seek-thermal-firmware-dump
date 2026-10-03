@@ -192,6 +192,15 @@ export interface BackupResult {
  *     2026-10-03 was this: the sweep's own first completed window poisoned
  *     the reader, and the "backup" it assembled was the poison's page-walk,
  *     not flash content. A fresh boot gives ONE full window, no more.
+ *     CORRECTION (TESTING.md sec. 35.4): these measurements ran while bank A
+ *     held the PATCHED image, left there by a run that stopped after its
+ *     commit. The patch widens the reader's position (descriptor +12) to a
+ *     word but the arm still zeroes it with `strh` (0x1008412E), so a read
+ *     that carries past 0xFFFF leaves the upper half stuck and every later
+ *     window serves one page further per full read. Stock firmware wraps the
+ *     halfword and is clean: five full windows on one session, and an
+ *     over-read, all read correctly. The probe-and-reboot design below
+ *     stays, because a run can find a camera that is still patched.
  *  2. PER-BOOT PAGE BIAS. A healthy boot serves window m at plan(m) plus one
  *     64 KiB page for some boots (window m answers with the plan's block m+1).
  *     The bias is chosen per boot, stable within it, and cleared by any
@@ -281,14 +290,27 @@ export async function openProbedSession(
     } catch (error) {
       await opener.close(device);
       /* A stall is the dead reader's wire answer; reboot by command on the
-       * next open and try again — the wire-89 clears the poison (measured). */
-      reporter.log(`${label}: the reader probe stalled — rebooting by command and retrying`, 'warn');
+       * next open and try again — the wire-89 clears the completion poison
+       * (measured on stock). It did NOT revive the reader a 4 MiB drain
+       * exhausted (TESTING.md secs. 28.4, 35), so the log names the probe's
+       * own failure and the reboot's outcome: every attempt must say what the
+       * wire answered, not only that it failed. */
+      reporter.log(
+        `${label}: the reader probe stalled (${errorMessage(error)}) — rebooting by command ` +
+          'and retrying',
+        'warn',
+      );
       try {
         const reboot = await opener.open();
-        await resetDevice(reboot).catch(() => undefined);
+        const outcome = await resetDevice(reboot);
+        reporter.log(
+          `${label}: reboot command ${outcome === 'sent' ? 'acknowledged' : 'not acknowledged'}`,
+          'detail',
+        );
         await opener.close(reboot);
-      } catch {
+      } catch (rebootError) {
         /* the camera may already be down; the next open's ladder rides it */
+        reporter.log(`${label}: reboot command not sent (${errorMessage(rebootError)})`, 'detail');
       }
       continue;
     }

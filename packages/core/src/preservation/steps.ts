@@ -1825,9 +1825,16 @@ async function runRestoreStep(
   }
 
   /* The restore session is ADMITTED like every read session. After a drain
-   * the reader is completion-poisoned and the mode-3 probe answers blank —
-   * the probe's reboot-and-retry loop clears it by command, which is the
-   * old "power-cycle the camera" remedy, automatic now (TESTING.md sec. 34). */
+   * the patched reader's position sits at its 4 MiB limit, which the arm's
+   * halfword reset cannot clear, so every read stalls (TESTING.md sec.
+   * 35.4) — unless the patch carries the arm tail's cursor reset (sec. 36),
+   * when the probe reads on the drain's own boot. The probe's
+   * reboot-and-retry loop was meant to clear the stall by command, but on
+   * silicon it has not: four wire reboots in a row with no disconnect
+   * between them (the reboot never took). The web wizard therefore asks for
+   * a replug after a drain on a patch without the reset (TESTING.md secs.
+   * 28.4, 35, 36). The loop stays (it is free when it works, and a resumed
+   * run may not have replugged); its refusal names the power cycle. */
   const restored = await (async () => {
     const { device, cfgHead } = await openProbedSession(
       opener,
