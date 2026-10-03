@@ -80,6 +80,17 @@ import type { Runner } from './useRunner';
 export const LOAD_PANEL_ID = 'preserve:load';
 export const PHASE_PANEL_PREFIX = 'preserve:phase:';
 
+/** The JS asset this hook is executing from — the build stamp every run logs,
+ *  so a stale bundle can never masquerade as the new code again. */
+function bundleTag(): string {
+  try {
+    const url = import.meta.url;
+    return url === undefined || url === '' ? 'unknown' : (url.split('/').pop() ?? url);
+  } catch {
+    return 'unknown';
+  }
+}
+
 /** The opener ladder: ~60 attempts, 1 s apart — the CLI's post-reset shape. */
 export const OPEN_ATTEMPTS = 60;
 
@@ -389,6 +400,11 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
             current = created.state;
             applyState(current);
             rep.reporter.log(`run ${current.runId} created`, 'detail');
+            /* THE BUILD STAMP: which JS asset this run is executing from. A
+             * stale tab has masqueraded as the new code three times — Chrome
+             * caches the page hard — so every run names its bundle and a
+             * stale one is visible at a glance. */
+            rep.reporter.log(`wizard build: ${String(bundleTag())}`, 'detail');
             rep.reporter.log(
               'the image will be read from the camera’s own active slot — there is no ' +
                 'image file to pick anywhere in this wizard',
