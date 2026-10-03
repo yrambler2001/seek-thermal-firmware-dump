@@ -19,6 +19,7 @@
 
 export {
   buildV1Patch,
+  clearsArmCursor,
   conjugateCapture,
   keystream,
   preWideningRefusal,

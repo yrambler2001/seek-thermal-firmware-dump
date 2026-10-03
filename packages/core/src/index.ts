@@ -401,6 +401,7 @@ export {
   bankWindow,
   buildV1Patch,
   cfgWindow,
+  clearsArmCursor,
   commitToBank,
   conjugateCapture,
   createPreserveRun,

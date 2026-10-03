@@ -95,7 +95,9 @@ const EXPECTED_VERSION = '1.3.0.0';
  *  both pinned to the hardware campaign's shas (TESTING.md sec. 28.2), so the
  *  flow's outputs cannot drift a byte without this suite saying so. */
 const CORPUS_FLASH_SHA = '40447c7e6da5cbc84621f4694ffff5bda0f783e7807a45e80443383b19a8eb72';
-const CORPUS_RAW_DUMP_SHA = '7ada1be6b211329189ff3e87d109e9d5ac5f2fcb9e891d054127e72f53d499f9';
+/** The five-site post-commit part (TESTING.md sec. 36); the hardware campaign's
+ *  7ada1be6… was the four-site one. */
+const CORPUS_RAW_DUMP_SHA = 'b22e9e20a9928241348c089f4e046c62f8a3f73db0ecb29dd2ce17eaa1cb6dcd';
 /** A wire-89 mid-session leaves its own URB unanswered; the reboot wait is the
  *  measured shape (the part re-initializes USB within it, on this emulator). */
 const REBOOT_WAIT_MS = 15_000;

@@ -1492,11 +1492,11 @@ async function runPatchStep(
  * stalled permanently at 28,544 B. At a 64-ask serve == ask always, and
  * sixteen asks deliver a contiguous, byte-accurate 1 KiB.
  *
- * THE LENGTH: 1 KiB is ENOUGH — the rebalance word at 0x238 (568) is one of
- * the ten patch bytes, 0 on the factory image (buildV1Patch refuses a busy
+ * THE LENGTH: 1 KiB is ENOUGH — the rebalance word at 0x238 (568) is among
+ * the patch bytes, 0 on the factory image (buildV1Patch refuses a busy
  * rebalance word) and the nonzero rebalance on the patched one — so the head
  * alone distinguishes original from patched, which is the only question the
- * pre-checks exist to answer. The instruction-site bytes (0x3DB7..0x3C71) lie
+ * pre-checks exist to answer. The instruction-site bytes (0x3C1C..0x3DC7) lie
  * beyond it and are NOT checked live.
  */
 const BANK_HEAD_BYTES = 0x400;

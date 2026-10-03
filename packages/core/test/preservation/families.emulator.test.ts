@@ -358,7 +358,7 @@ function progressReporter(label: string): Reporter {
  * commit (reset-free commit session, its `.final` is the ground truth); the
  * DRAIN step runs on the ladder (reset once, then a fresh server); RESTORE
  * on its own server (the polite-stop treatment); VERIFY on a fresh boot.
- * Offline asserts: the commit's 6-or-10-byte diff set, raw == post-commit,
+ * Offline asserts: the commit's enumerated diff set, raw == post-commit,
  * delivered == as-booted, restored .final == as-booted.
  */
 async function runFullInPlace(spec: {
@@ -891,7 +891,7 @@ describe.skipIf(missingPlain('0.9.0.7', PLAIN_0907) !== null)(
   'family compact-0.9.0.7 — full in-place on the 2014 donor (emulator)',
   () => {
     it(
-      'self-sourced: backup derives the image, then patch (four sites), commit, whole-part drain, restore, verify; delivered == as-booted',
+      'self-sourced: backup derives the image, then patch (five sites), commit, whole-part drain, restore, verify; delivered == as-booted',
       { timeout: 5_400_000 },
       async () => {
         const plain = new Uint8Array(readFileSync(PLAIN_0907!));
@@ -899,8 +899,10 @@ describe.skipIf(missingPlain('0.9.0.7', PLAIN_0907) !== null)(
           label: '0907',
           expectedSlotPrefix: plain,
           expectedDiffOffsets: [
-            0x238, 0x239, 0x23b, 0x3c1c, 0x3c1d, 0x3c68, 0x3c69, 0x3c70, 0x3c71, 0x3db7,
-          ] /* the rebalance word + the widen byte + both bytes of each trio site (doc 36.4.2) */,
+            0x238, 0x239, 0x23a, 0x23b, 0x3c1c, 0x3c1d, 0x3c68, 0x3c69, 0x3c70, 0x3c71, 0x3db7,
+            0x3dc6, 0x3dc7,
+          ] /* the rebalance word + the widen byte + both bytes of each trio site (doc 36.4.2)
+             + the arm tail's cursor reset (TESTING.md sec. 36) */,
           bankFlashOffset: 0x50000 /* bank A: the donor's blank cfg boots A */,
           boot: { entry: '18.31.47', donor: DONOR_2014 },
           restore: true,
@@ -916,7 +918,7 @@ describe.skipIf(missingPlain('0.8.0.0', PLAIN_0800) !== null)(
   'family compact-0.8.0.0 — the indirect mode-2 hazard, full in-place on the 2014 donor (emulator)',
   () => {
     it(
-      'self-sourced: the patch carries the mode-2 nop site (12 bytes), commit, whole-part drain, restore, verify; delivered == as-booted',
+      'self-sourced: the patch carries the mode-2 nop site (15 bytes), commit, whole-part drain, restore, verify; delivered == as-booted',
       { timeout: 5_400_000 },
       async () => {
         const plain = new Uint8Array(readFileSync(PLAIN_0800!));
@@ -931,9 +933,10 @@ describe.skipIf(missingPlain('0.8.0.0', PLAIN_0800) !== null)(
           label: '0800',
           expectedSlotPrefix: plain,
           expectedDiffOffsets: [
-            0x238, 0x239, 0x23b, 0x3bbc, 0x3bbd, 0x3c08, 0x3c09, 0x3c10, 0x3c11, 0x3ce4, 0x3ce5,
-            0x3d67,
-          ] /* the rebalance word + widen + trio + the mode-2 nop (doc 36.4.2) */,
+            0x238, 0x239, 0x23a, 0x23b, 0x3bbc, 0x3bbd, 0x3c08, 0x3c09, 0x3c10, 0x3c11, 0x3ce4,
+            0x3ce5, 0x3d67, 0x3d76, 0x3d77,
+          ] /* the rebalance word + widen + trio + the mode-2 nop (doc 36.4.2) + the arm
+             tail's cursor reset (TESTING.md sec. 36) */,
           bankFlashOffset: 0x50000,
           boot: { entry: '09.17.37', donor: DONOR_2014 },
           restore: true,
@@ -962,8 +965,9 @@ describe.skipIf(missingPlain('0.7.0.7', PLAIN_0707) !== null)(
           label: '0707',
           expectedSlotPrefix: plain,
           expectedDiffOffsets: [
-            0x238, 0x239, 0x3ae4, 0x3ae5, 0x3b30, 0x3b31, 0x3b38, 0x3b39, 0x3c89,
-          ] /* the rebalance word (0x00009240 — two bytes) + widen + trio (doc 36.5) */,
+            0x239, 0x3ae4, 0x3ae5, 0x3b30, 0x3b31, 0x3b38, 0x3b39, 0x3c89, 0x3c98, 0x3c99,
+          ] /* the rebalance word (0x0000B300 — one byte) + widen + trio (doc 36.5) + the
+             arm tail's cursor reset (TESTING.md sec. 36) */,
           bankFlashOffset: 0x50000,
           boot: { entry: '14.15.36', donor: DONOR_2014 },
           restore: true,

@@ -7,7 +7,7 @@
  *    independent of any vendored input.
  *  - THE CORPUS PLAINTEXT of Compact 1.3.0.0, when the emulator directory
  *    (SEEK_EMU_DIR, or FW-V1 beside this repository) carries it: the patch
- *    must produce EXACTLY the ten enumerated byte changes and the known
+ *    must produce EXACTLY the thirteen enumerated byte changes and the known
  *    rebalance word, and — when the 2016 donor dump is present too — the
  *    plain-XOR-keystream model must reproduce the donor's factory slot A
  *    byte for byte, which is the control that proves the whole cipher model.
@@ -119,7 +119,7 @@ function syntheticPlain(): Uint8Array {
   bytes[REBALANCE_WORD_OFFSET + 3] = 0;
   const dv = new DataView(bytes.buffer);
   /* The header's version word: the closed 1.x set, which the v1-2014 detect
-   * carries — 0.9.0.7 shares this build's four sites byte for byte, and the
+   * carries — 0.9.0.7 shares this build's five sites byte for byte, and the
    * version word is the gate that keeps the table from matching both. */
   dv.setUint32(0x200, 0xa1b2c3d4, true);
   dv.setUint32(0x20c, 0x0000_0301, true); /* bytes 01 03 00 00 -> "1.3.0.0" */
@@ -269,7 +269,7 @@ describe('v1 patch builder — the zero-keystream case (the 2014 plaintext banks
     const patch = buildV1Patch(plain);
     const payload = conjugateCapture(plain, patch); /* the capture is the plaintext itself */
     expect(bytesToHex(payload)).toBe(bytesToHex(patch.patched));
-    /* Exactly the ten enumerated bytes move — the wire-80 payload differs
+    /* Exactly the thirteen enumerated bytes move — the wire-80 payload differs
      * from the capture by the mask and nothing else. */
     const applied: number[] = [];
     for (let i = 0; i < payload.length; i++) {
@@ -305,13 +305,17 @@ describe('v1 patch builder — the zero-keystream case (the 2014 plaintext banks
  * the corpus plaintext (gated: needs the emulator directory's corpus)
  * ==================================================================== */
 
-/** The ten bytes the 2014 patch set must move, bank-relative (doc 34.11). */
+/** The thirteen bytes the 2014 patch set must move, bank-relative: doc 34.11's
+ *  ten, plus the arm tail's cursor reset (0x3DC6/0x3DC7) and the rebalance
+ *  word's third byte, which the new sum now moves too (TESTING.md sec. 36). */
 const EXPECTED_DIFF_OFFSETS = [
-  0x238, 0x239, 0x23b, 0x3c1c, 0x3c1d, 0x3c68, 0x3c69, 0x3c70, 0x3c71, 0x3db7,
+  0x238, 0x239, 0x23a, 0x23b, 0x3c1c, 0x3c1d, 0x3c68, 0x3c69, 0x3c70, 0x3c71, 0x3db7, 0x3dc6,
+  0x3dc7,
 ];
 
-/** The rebalance word for this exact patch set (doc 34.5). */
-const EXPECTED_REBALANCE_1300 = 0x30006240;
+/** The rebalance word for this exact patch set — doc 34.5's 0x30006240 was
+ *  the four-site set's; the arm-tail site moves it (TESTING.md sec. 36). */
+const EXPECTED_REBALANCE_1300 = 0x50c06240;
 
 describe('v1 patch builder — the Compact 1.3.0.0 corpus plaintext', () => {
   const plain = corpusPlain1300();
@@ -327,13 +331,13 @@ describe('v1 patch builder — the Compact 1.3.0.0 corpus plaintext', () => {
     expect(dv.getUint32(REBALANCE_WORD_OFFSET, true)).toBe(0); /* the free word */
   });
 
-  it.skipIf(plain === null)('moves EXACTLY the ten enumerated bytes', () => {
+  it.skipIf(plain === null)('moves EXACTLY the thirteen enumerated bytes', () => {
     const patch = buildV1Patch(plain!);
     expect([...patch.diffOffsets]).toEqual(EXPECTED_DIFF_OFFSETS);
-    expect(patch.diffOffsets.length).toBe(10);
+    expect(patch.diffOffsets.length).toBe(13);
   });
 
-  it.skipIf(plain === null)('rebalances through word 142 = 0x30006240', () => {
+  it.skipIf(plain === null)('rebalances through word 142 = 0x50C06240', () => {
     const patch = buildV1Patch(plain!);
     expect(hexUp(patch.rebalanceWord)).toBe(hexUp(EXPECTED_REBALANCE_1300));
     expect(patch.patchedWordSum).toBe(0);

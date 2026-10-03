@@ -654,9 +654,10 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
   /* ---- the 0.x line: the wire-88 reader and the generation gate ------------ */
 
   /** A synthetic 0.x factory plaintext: the widen tail (unique), the reader
-   *  trio at ONE build's widen-relative layout, no indirect mode-2 body, the
-   *  build's header version word, and a balance. The recipe the real images
-   *  follow (doc 36.3.2), at synthetic offsets. */
+   *  trio at ONE build's widen-relative layout, the arm tail's halfword cursor
+   *  reset at widen + 0x12, no indirect mode-2 body, the build's header
+   *  version word, and a balance. The recipe the real images follow (doc
+   *  36.3.2; TESTING.md sec. 36.2), at synthetic offsets. */
   function zeroXPlain(versionWord: number, layout: readonly number[]): Uint8Array {
     const bytes = new Uint8Array(IMAGE_LENGTH);
     let state = 0x12345678;
@@ -673,6 +674,7 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
     layout.forEach((delta, i) => {
       put(WIDEN_AT + delta, trioBefore[i] ?? '');
     });
+    put(WIDEN_AT + 0x12, 'a581'); /* strh r5,[r4,#12] */
     const dv = new DataView(bytes.buffer);
     dv.setUint32(0x200, 0xa1b2c3d4, true);
     dv.setUint32(0x204, IMAGE_LENGTH, true);
@@ -1290,8 +1292,8 @@ describe('describeStepGate — every prerequisite refusal', () => {
 
 describe('runPreserveStep — the recovery behaviours', () => {
   const plain = syntheticPlain();
-  /* The ten bytes: the four instruction sites plus the rebalance word at
-   * 0x238 (three of its four bytes move on this image). */
+  /* The thirteen bytes: the five instruction sites plus the rebalance word at
+   * 0x238 (all four of its bytes move on this image). */
   const patchRanges: readonly [number, number][] = [
     ...V1_2014_PATCH_SITES.map((s) => [s.offset, s.offset + s.before.length] as [number, number]),
     [REBALANCE_WORD_OFFSET, REBALANCE_WORD_OFFSET + 4] as [number, number],
@@ -1348,11 +1350,11 @@ describe('runPreserveStep — the recovery behaviours', () => {
 
       expect(afterPatch.nextStep).toBe('commit');
       expect(afterPatch.patch?.stagedLength).toBe(plain.length);
-      expect(afterPatch.patch?.diffCount).toBe(10);
+      expect(afterPatch.patch?.diffCount).toBe(13);
       expect(afterPatch.patch?.chunkCount).toBe(Math.ceil(plain.length / 64));
       const patched = await store.load(PRESERVE_PATCHED_FILE);
       expect(patched?.length).toBe(plain.length);
-      /* Exactly the ten enumerated bytes differ. */
+      /* Exactly the thirteen enumerated bytes differ. */
       let diffs = 0;
       for (let i = 0; i < plain.length; i++) {
         if (plain[i] !== patched?.[i]) {
@@ -1360,7 +1362,7 @@ describe('runPreserveStep — the recovery behaviours', () => {
           diffs++;
         }
       }
-      expect(diffs).toBe(10);
+      expect(diffs).toBe(13);
     },
   );
 
@@ -1412,7 +1414,7 @@ describe('runPreserveStep — the recovery behaviours', () => {
           diffs++;
         }
       }
-      expect(diffs).toBe(10);
+      expect(diffs).toBe(13);
     },
   );
 
@@ -1583,7 +1585,7 @@ describe('runPreserveStep — the recovery behaviours', () => {
           rawDiffs++;
         }
       }
-      expect(rawDiffs).toBe(10);
+      expect(rawDiffs).toBe(13);
       /* And the part was restored: the camera's flash is the as-booted image. */
       expect(await sha256hex(camera.flash)).toBe(await sha256hex(asBooted));
     },

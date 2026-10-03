@@ -131,13 +131,54 @@ export interface PatchSite {
   readonly what: string;
 }
 
+/** The arm tail's cursor reset, as the widened reader needs it: every
+ *  BeginFirmwareUpgrade mode branches into one tail that zeroes the cursor
+ *  with `strh r5,[r4,#12]`. With the trio above the reader keeps the cursor
+ *  as a WORD, so the halfword zero leaves its upper half standing: once a
+ *  read carries past 0xFFFF (one full window, or the drain), every later arm
+ *  serves that many 64 KiB pages up, and after the 4 MiB drain every read
+ *  fails the limit check and stalls until a reboot (TESTING.md sec. 35.4;
+ *  A/B on the emulator: the post-drain probe stalls without this site and
+ *  reads the record with it). Every trio build carries the same tail, 0x12
+ *  past its widen site. */
+export const ARM_CURSOR_RESET_FROM_WIDEN = 0x12;
+export const ARM_CURSOR_RESET_BEFORE: readonly number[] = [0xa5, 0x81];
+export const ARM_CURSOR_RESET_AFTER: readonly number[] = [0xe5, 0x60];
+const ARM_CURSOR_RESET_WHAT =
+  'strh r5,[r4,#12] -> str r5,[r4,#12]: the arm tail zeroes the cursor as a HALFWORD, so ' +
+  'with the trio widened a cursor past 0xFFFF keeps its upper half — every later arm serves ' +
+  'pages up, and after the drain every read stalls. STR imm T1 0x60E5, imm5=3';
+
+/** The 1.x site, at its fixed offset (VMA 0x1008412E = widen 0x3DB4 + 0x12). */
+const ARM_CURSOR_RESET_2014: PatchSite = {
+  offset: 0x3dc6,
+  before: ARM_CURSOR_RESET_BEFORE,
+  after: ARM_CURSOR_RESET_AFTER,
+  what: `${ARM_CURSOR_RESET_WHAT} (VMA 0x1008412E)`,
+};
+
+/** Whether a committed patch carries the arm-tail cursor reset — by the site's
+ *  own bytes, so a run state written before the site existed reads false. A
+ *  part patched without it keeps a dead reader after the drain until it is
+ *  power-cycled; one patched with it reads on. */
+export function clearsArmCursor(
+  sites: readonly { readonly before: readonly number[]; readonly after: readonly number[] }[],
+): boolean {
+  const same = (a: readonly number[], b: readonly number[]): boolean =>
+    a.length === b.length && a.every((v, i) => v === b[i]);
+  return sites.some(
+    (site) =>
+      same(site.before, ARM_CURSOR_RESET_BEFORE) && same(site.after, ARM_CURSOR_RESET_AFTER),
+  );
+}
+
 /** The vma the raw image offsets map to (payload VMA = raw + 0x10080368). */
 export const V1_PAYLOAD_VMA_BASE = 0x10080368;
 
 /** The free header word that balances the plaintext sum: word 142, offset 0x238. */
 export const REBALANCE_WORD_OFFSET = 142 * 4;
 
-/** The four instruction sites of the 2014 builds (1.0.0.0 / 1.2.0.0 / 1.3.0.0). */
+/** The five instruction sites of the 2014 builds (1.0.0.0 / 1.2.0.0 / 1.3.0.0). */
 export const V1_2014_PATCH_SITES: readonly PatchSite[] = [
   {
     offset: 0x3db4,
@@ -172,6 +213,7 @@ export const V1_2014_PATCH_SITES: readonly PatchSite[] = [
       'strh r3,[r4,#12] -> str r3,[r4,#12] (VMA 0x10083FD8): the matching halfword STORE ' +
       'of the advanced cursor. STR imm T1 0x60E3, imm5=3',
   },
+  ARM_CURSOR_RESET_2014,
 ];
 
 /* ==================================================================== *
@@ -637,6 +679,17 @@ function trio0xSites(widenAt: number, layout: readonly number[]): PatchSite[] {
   });
 }
 
+/** The arm tail's cursor reset for a 0.x build, at widen + 0x12 (the same
+ *  tail as the 1.x line; checked on every corpus image of the line). */
+function armCursorReset0xSite(widenAt: number): PatchSite {
+  return {
+    offset: widenAt + ARM_CURSOR_RESET_FROM_WIDEN,
+    before: ARM_CURSOR_RESET_BEFORE,
+    after: ARM_CURSOR_RESET_AFTER,
+    what: `${ARM_CURSOR_RESET_WHAT} (located widen + 0x${ARM_CURSOR_RESET_FROM_WIDEN.toString(16)})`,
+  };
+}
+
 /** The mode-2 indirect->direct nop, at its unique shape. */
 function mode2DerefSite(plain: Uint8Array): PatchSite {
   const at = oneIn(
@@ -685,7 +738,11 @@ function zeroXProfile(spec: ZeroXSpec): BuildPatchProfile {
     detect,
     locate: (plain) => {
       const widen = widen0xSite(plain);
-      const sites = [widen, ...trio0xSites(widen.offset, spec.layout)];
+      const sites = [
+        widen,
+        ...trio0xSites(widen.offset, spec.layout),
+        armCursorReset0xSite(widen.offset),
+      ];
       return spec.extra ? [...sites, mode2DerefSite(plain)] : sites;
     },
     keysOf: () => null,
@@ -705,14 +762,23 @@ const ZERO_X_PROVEN =
   'plaintext 1.3.0.0 donor (doc 36.3.3); no native flash dump of any of these builds exists, ' +
   'so the first hardware run is the first silicon evidence.';
 
+/** The arm tail's cursor reset joined the 0.x patch after doc 36's runs, so
+ *  every sha doc 36 measured is the four-site set's. */
+const ZERO_X_FIFTH_SITE =
+  'The patch also carries the arm tail’s cursor reset (TESTING.md sec. 36), without which ' +
+  'the drain leaves the reader dead until a power cycle; doc 36’s shas are the four-site ' +
+  'set’s, and the five-site set is re-proven in place on the emulator on each layout’s ' +
+  'representative (0.9.0.7, 0.8.0.0, 0.7.0.7).';
+
 const PLAIN_0X_CAPABILITY = (drainSha: string): DrainCapability => ({
   wholePart: true,
   losslessReadUnit: 64,
   note:
-    'one widened-window arm drains the whole 4 MiB part (doc 36.4: full in-place — commit 0x0, ' +
-    `exactly the 10 patch bytes vs as-booted, 0-diff restore, factory reader back); ` +
-    `in-place drain sha256 ${drainSha}…; the stock cap is exactly 65,536 B per arm; byte-exact ` +
-    `at the 64-byte ask. ${ZERO_X_PROVEN}`,
+    'one widened-window arm drains the whole 4 MiB part (doc 36.4, four-site: full in-place — ' +
+    'commit 0x0, exactly the patch bytes vs as-booted, 0-diff restore, factory reader back; ' +
+    `in-place drain sha256 ${drainSha}…); the stock cap is exactly 65,536 B per arm; ` +
+    'byte-exact at the 64-byte ask. 13 bytes move (word 142 = 0x50C06240). ' +
+    `${ZERO_X_FIFTH_SITE} ${ZERO_X_PROVEN}`,
 });
 
 /* ---- the 0.x profiles themselves ------------------------------------------- */
@@ -734,9 +800,10 @@ const ZERO_X_PROFILES: readonly BuildPatchProfile[] = [
         'mode-2 window serves the part ROTATED: mode 2 shares mode 0’s boot-config walk ' +
         'and arms the A/B slot the active-slot word does not name (slot B 0x14060000 on the ' +
         'donor’s blank record) — the drain unrotates before delivery. Full in-place ' +
-        'proven including the boot-back (ip1–ip4 green, doc 36.4.2: in-place drain sha ' +
-        '5e1b5db4… at the rotated offsets, restore 0-diff, factory window exact on the ' +
-        `rotated compare). 9 bytes move (word 142 = 0x00009240). ${ZERO_X_PROVEN}`,
+        'proven including the boot-back (ip1–ip4 green, doc 36.4.2, four-site: in-place ' +
+        'drain sha 5e1b5db4… at the rotated offsets, restore 0-diff, factory window exact on ' +
+        'the rotated compare). 10 bytes move (word 142 = 0x0000B300). ' +
+        `${ZERO_X_FIFTH_SITE} ${ZERO_X_PROVEN}`,
     },
   }),
   zeroXProfile({
@@ -752,12 +819,11 @@ const ZERO_X_PROFILES: readonly BuildPatchProfile[] = [
       note:
         'the reader answers on WIRE 88, not 79 (0x4F stalls; doc 36.5.0); the factory mode 2 ' +
         'is the INDIRECT pair — it arms *(0x14000000) and serves 0 B (measured) — so the nop ' +
-        'site is part of the patch and MUST be committed before any mode-2 arm (12 bytes ' +
-        'move). Full in-place through ip3 (doc 36.4.2: in-place drain sha 18649ea1…, ' +
-        'exactly the 12 patch bytes, restore 0-diff); the ip4 boot-back stage is OPEN — it ' +
-        'died on transport timeouts, not on the patch (doc 36.10 item 5) — everything it ' +
-        'would check is proven on the siblings. ' +
-        ZERO_X_PROVEN,
+        'site is part of the patch and MUST be committed before any mode-2 arm (15 bytes ' +
+        'move). Full in-place through ip3 (doc 36.4.2, four-site: in-place drain sha ' +
+        '18649ea1…, restore 0-diff); the ip4 boot-back stage is OPEN — it died on transport ' +
+        'timeouts, not on the patch (doc 36.10 item 5) — everything it would check is proven ' +
+        `on the siblings. ${ZERO_X_FIFTH_SITE} ${ZERO_X_PROVEN}`,
     },
   }),
   zeroXProfile({
@@ -774,10 +840,10 @@ const ZERO_X_PROFILES: readonly BuildPatchProfile[] = [
         'the factory mode 2 is the INDIRECT pair: it arms *(0x14000000) — the bootloader ' +
         'vector’s initial SP — and an armed read served 32 KiB of SRAM and then faulted ' +
         'the guest (measured, doc 36.3.1): the nop site is part of the patch and MUST be ' +
-        'committed before any mode-2 arm (12 bytes move). Full in-place through ip3 (doc ' +
-        '36.4.2: in-place drain sha c82556c1…, exactly the 12 patch bytes, restore 0-diff); ' +
-        'the ip4 boot-back stage is OPEN on transport timeouts (doc 36.10 item 5) — ' +
-        `everything it would check is proven on the siblings. ${ZERO_X_PROVEN}`,
+        'committed before any mode-2 arm (15 bytes move). Full in-place through ip3 (doc ' +
+        '36.4.2, four-site: in-place drain sha c82556c1…, restore 0-diff); the ip4 boot-back ' +
+        'stage is OPEN on transport timeouts (doc 36.10 item 5) — everything it would check ' +
+        `is proven on the siblings. ${ZERO_X_FIFTH_SITE} ${ZERO_X_PROVEN}`,
     },
   }),
   zeroXProfile({
@@ -889,10 +955,11 @@ function detect2016Shapes(plain: Uint8Array): boolean {
   );
 }
 
-/** The four-site 2014 chain (1.0.0.0 / 1.2.0.0 / 1.3.0.0): widen + the halfword
- *  reader trio at the doc-34 offsets, word-sum-0 acceptance, plaintext banks.
+/** The five-site 2014 chain (1.0.0.0 / 1.2.0.0 / 1.3.0.0): widen + the halfword
+ *  reader trio at the doc-34 offsets + the arm tail's cursor reset, word-sum-0
+ *  acceptance, plaintext banks.
  *  The detect carries the header's version word (the closed 1.x set) because
- *  the 0.x line's 0.9.0.7 carries the SAME four sites at the SAME offsets with
+ *  the 0.x line's 0.9.0.7 carries the SAME five sites at the SAME offsets with
  *  the SAME before bytes — the two builds are byte-identical apart from their
  *  version identity — and two matching profiles is a refusal, never a guess. */
 const V1_2014_PROFILE: BuildPatchProfile = {
@@ -1092,8 +1159,8 @@ export interface V1Patch {
   readonly patched: Uint8Array;
   /** Byte offsets where `patched` differs from `factory` — the pipeline's
    *  whole effect on the part, enumerated. For the 2014 patch set: exactly
-   *  the ten bytes 0x238, 0x239, 0x23B, 0x3C1C, 0x3C1D, 0x3C68, 0x3C69,
-   *  0x3C70, 0x3C71, 0x3DB7. */
+   *  the thirteen bytes 0x238..0x23B, 0x3C1C, 0x3C1D, 0x3C68, 0x3C69,
+   *  0x3C70, 0x3C71, 0x3DB7, 0x3DC6, 0x3DC7. */
   readonly diffOffsets: readonly number[];
   /** `factory[o] ^ patched[o]` per diff offset — the conjugation mask. */
   readonly mask: Uint8Array;

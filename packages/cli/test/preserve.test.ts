@@ -254,7 +254,7 @@ describe('preserve — a fresh run, checkpointed after every step', () => {
       expect(test.stderr.text).toMatch(/read from the camera.s active slot, two agreeing reads/);
       expect(test.stderr.text).toMatch(/derived from the camera/);
       expect(test.stderr.text).toMatch(/v1 2014 chain/);
-      expect(test.stderr.text).toMatch(/bytes that move\s+10 on the part/);
+      expect(test.stderr.text).toMatch(/bytes that move\s+13 on the part/);
     },
   );
 

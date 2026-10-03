@@ -35,7 +35,7 @@
  *   shape of a reset on the wire.
  *
  *   OFFLINE — P2's proof: the post-commit state differs from the as-booted
- *     state by EXACTLY the ten enumerated patch bytes inside the ACTIVE
+ *     state by EXACTLY the enumerated patch bytes inside the ACTIVE
  *     bank — not the boot-config block, not the bootloader block, not the
  *     other two banks, not the bank's erased tail.
  *
@@ -346,7 +346,7 @@ async function withDrainAfterReset(
   row: RowEmulators,
   bootOptions: BootOptions,
   probeBytes: Uint8Array,
-): Promise<Uint8Array> {
+): Promise<{ dump: Uint8Array; postDrainHead: Uint8Array }> {
   let lastError: unknown = null;
   for (let round = 0; round < 3; round++) {
     const emu = await boot(row, bootOptions);
@@ -407,7 +407,14 @@ async function withDrainAfterReset(
               process.stderr.write(
                 `[preservation] r${String(round)}s${String(session)} probe (advisory): ${probe.detail}\n`,
               );
-              return dump;
+              /* THE RESTORE'S FIRST READ, on the drain's own boot (TESTING.md
+               * sec. 36): the arm tail's cursor reset in the patch zeroes the
+               * whole cursor, so a fresh mode-3 arm after the 4 MiB drain (and
+               * after the probe's own arm) reads the boot-config record. The
+               * four-site patch stalled here until a power cycle. */
+              await seek.armWindow(cfgWindow());
+              const postDrainHead = (await seek.readArmed(READ_CHUNK, BOOT_CONFIG_BYTES)).data;
+              return { dump, postDrainHead };
             }),
           );
         } catch (error) {
@@ -733,7 +740,7 @@ describe.skipIf(UNSUPPORTED !== null)(
           },
         );
 
-        it('P2 ground truth: exactly the ten enumerated bytes moved, inside the active bank only', () => {
+        it('P2 ground truth: exactly the enumerated patch bytes moved, inside the active bank only', () => {
           const { asbooted, truth, bankCapture, detection, patch } = st;
           expect(asbooted).not.toBeNull();
           expect(truth).not.toBeNull();
@@ -791,9 +798,14 @@ describe.skipIf(UNSUPPORTED !== null)(
             const probeBytes = backupSlice(st.backup!, PROBE_OFFSET - READ_CHUNK, READ_CHUNK);
 
             let rawDump: Uint8Array;
+            let postDrainHead: Uint8Array;
             const startedAt = Date.now();
             try {
-              rawDump = await withDrainAfterReset(row, { flash: truthPath }, probeBytes);
+              ({ dump: rawDump, postDrainHead } = await withDrainAfterReset(
+                row,
+                { flash: truthPath },
+                probeBytes,
+              ));
             } catch (error) {
               process.stderr.write(
                 `--- last emulator log after the P3 failure ---\n${row.lastLog(120)}\n`,
@@ -807,6 +819,12 @@ describe.skipIf(UNSUPPORTED !== null)(
             );
             expect(rawDump.length).toBe(FLASH_SIZE);
             st.rawDump = rawDump;
+            /* No dead reader after the drain: the boot-config record answers
+             * on the same boot, exactly as the P1 sweep read it. */
+            expect(
+              [...postDrainHead],
+              'the restore’s first read on the drain’s boot (the post-drain stall)',
+            ).toEqual([...st.backup!.byAddress.get(0x14010000)!.subarray(0, BOOT_CONFIG_BYTES)]);
 
             /* The DELIVERED image: the ACTIVE bank swapped back from the P1
              * backup — recovery, not A, on the dump whose record names it. */
@@ -836,14 +854,15 @@ describe.skipIf(UNSUPPORTED !== null)(
            * self-sourced flow's outputs must stay identical to what the
            * hardware campaign measured on the same part — delivered == the
            * as-booted part content (the vendored dump), raw == the
-           * post-commit part (the full sha measured in the emulator too, and
-           * pinned in the resume suite). */
+           * post-commit part (pinned in the resume suite too). The raw pin
+           * is the FIVE-site part (TESTING.md sec. 36); the campaign's
+           * 7ada1be6… was the four-site one. */
           if (spec.key === 'corpus') {
             expect(sha256(processedDump!), 'delivered dump, pinned to the hardware campaign').toBe(
               DUMP_SHA256['6.bin'],
             );
             expect(sha256(rawDump!), 'raw post-write dump, pinned to the hardware campaign').toBe(
-              '7ada1be6b211329189ff3e87d109e9d5ac5f2fcb9e891d054127e72f53d499f9',
+              'b22e9e20a9928241348c089f4e046c62f8a3f73db0ecb29dd2ce17eaa1cb6dcd',
             );
           }
           process.stderr.write(
