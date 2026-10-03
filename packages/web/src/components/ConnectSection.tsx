@@ -34,7 +34,11 @@ export function ConnectSection({
   return (
     <Section id="connect" step="1" title="Connect" icon={<PlugZap />}>
       <Toolbar label="Device actions">
-        <Button variant="default" onClick={onConnect} disabled={!canUseUsb || busy}>
+        {/* CONNECT STAYS LIVE DURING A RUN: the preserve pipeline reboots the
+         * camera by command, and this camera has no USB serial number, so
+         * Chrome cannot re-recognise it afterwards — the re-confirm gesture
+         * IS the recovery. Everything else still locks while busy. */}
+        <Button variant="default" onClick={onConnect} disabled={!canUseUsb}>
           <Plug />
           {connected ? 'Change device' : 'Connect device'}
         </Button>

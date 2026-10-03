@@ -93,6 +93,10 @@ function bundleTag(): string {
 
 /** The opener ladder: ~60 attempts, 1 s apart — the CLI's post-reset shape. */
 export const OPEN_ATTEMPTS = 60;
+/** The patient ladder for the phases that reboot the camera: the re-confirm
+ *  click is a human act, so the opener waits ten minutes, and Cancel is the
+ *  way out of a wait nobody is coming back for. */
+export const OPEN_ATTEMPTS_PATIENT = 600;
 
 export function phasePanelId(phase: PreservePhaseId): string {
   return `${PHASE_PANEL_PREFIX}${phase}`;
@@ -219,6 +223,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
     (
       rep: ReporterHandle,
       signal: AbortSignal,
+      patient: boolean = false,
     ): { opener: SessionOpener; closeAll: () => Promise<void> } => {
       const opened: WebUsbTransport[] = [];
       const closeAll = async (): Promise<void> => {
@@ -234,7 +239,15 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
         open: async () => {
           const options = readOptions(form);
           let lastError: unknown = null;
-          for (let attempt = 0; attempt < OPEN_ATTEMPTS; attempt++) {
+          /* A camera that reboots loses Chrome's permission — this unit has no
+           * USB serial number, so Chrome cannot re-recognise it — and only the
+           * user's "Connect device" click re-grants it. The opener therefore
+           * waits PATIENTLY (the phase that resets asks for the long ladder;
+           * Cancel is the escape hatch) and tells the user exactly what to
+           * click, once, at the moment it matters. */
+          const attempts = patient ? OPEN_ATTEMPTS_PATIENT : OPEN_ATTEMPTS;
+          let instructed = false;
+          for (let attempt = 0; attempt < attempts; attempt++) {
             if (signal.aborted) throw new CancelledError('cancelled while opening the camera');
             try {
               /* makeTransport reads the LIVE device, so an attempt that
@@ -255,25 +268,36 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
               if (attempt === 0) {
                 rep.log(
                   `camera did not open (${errorMessage(error)}) — retrying for up to ` +
-                    `${String(OPEN_ATTEMPTS)} s; a camera that has just been reset is ` +
-                    'silent for about ten seconds while it boots',
+                    `${String(Math.round(attempts / 60))} min; a camera that has just been ` +
+                    'reset is silent for a couple of seconds while it boots',
                   'warn',
                 );
                 rep.setStatus('Camera rebooting — waiting for it to come back …');
               }
               /* A missed `connect` event must not strand the run: the camera
                * re-enumerates while the page holds nothing, and getDevices()
-               * finds it without any event or gesture. Both outcomes are
-               * logged, so a browser that cannot see the bus is visible in
-               * the wizard's own log. */
+               * finds it when Chrome still holds the grant. When the grant is
+               * GONE (this camera has no serial number, so every reboot is a
+               * new device to Chrome), the re-confirm is the user's click —
+               * say so, loudly, once. */
               if (device.device === null) {
                 const reattached = await device.reattach();
                 if (reattached) {
                   rep.log('the camera is back on the bus — re-adopted it', 'ok');
-                } else if (attempt % 10 === 9) {
+                } else if (!instructed && attempt >= 2) {
+                  instructed = true;
                   rep.log(
-                    `the browser still reports no authorized camera on the bus ` +
-                      `(${String(attempt + 1)} s)`,
+                    'Chrome lost the camera when it rebooted (this camera has no USB serial ' +
+                      'number, so Chrome cannot re-recognise it on its own). Press ' +
+                      '"Connect device" above and pick the camera — the phase continues by ' +
+                      'itself the moment it is re-connected.',
+                    'warn',
+                  );
+                  rep.setStatus('Re-connect the camera — press "Connect device" and pick it …');
+                } else if (instructed && attempt % 30 === 29) {
+                  rep.log(
+                    `still waiting for the re-connect — "Connect device" above, then pick the ` +
+                      `camera (${String(attempt + 1)} s)`,
                     'warn',
                   );
                 }
@@ -282,8 +306,11 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
             await waitMs(1000, signal);
           }
           throw new Error(
-            `the camera did not come back after ${String(OPEN_ATTEMPTS)} s of retrying: ` +
-              `${errorMessage(lastError)} — replug it and run the phase again`,
+            `the camera did not come back after ${String(Math.round(attempts / 60))} min of ` +
+              'retrying: ' +
+              `${errorMessage(lastError)} — if Chrome asked nothing, replug the camera and ` +
+              'run the phase again; if the log said to re-connect it, the "Connect device" ' +
+              'click is what it was waiting for',
           );
         },
         close: closeAll,
@@ -437,7 +464,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
         }
 
         const load = artifactLoader(checkpoints.current, extra.current);
-        const { opener, closeAll } = makeOpener(rep, signal);
+        const { opener, closeAll } = makeOpener(rep, signal, meta.resetsCamera === true);
         let stepInFlight: PreserveStepId | null = null;
         try {
           for (const step of meta.steps) {
