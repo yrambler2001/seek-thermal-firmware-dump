@@ -87,6 +87,7 @@ function deviceHandle(camera: WebUsbDevice): DeviceHandle {
     connect: () => Promise.resolve({ kind: 'cancelled' }),
     forget: () => Promise.resolve({ kind: 'cancelled' }),
     makeTransport: () => new WebUsbTransport(camera, { recipient: 'interface' }),
+    reattach: async () => false,
   };
 }
 

@@ -45,6 +45,15 @@ export interface DeviceHandle {
   readonly canForgetDevice: boolean;
   connect: () => Promise<ConnectOutcome>;
   forget: () => Promise<ConnectOutcome>;
+  /**
+   * Adopts an authorized Seek camera straight from `navigator.usb.getDevices()`
+   * — no chooser, no gesture, no reliance on the connect event. The reattach
+   * path for the reset dance: a camera rebooted by command re-enumerates while
+     * the page holds nothing, and a missed `connect` event must not strand the
+   * run when the device is demonstrably back on the bus. True when one was
+   * adopted.
+   */
+  reattach: () => Promise<boolean>;
   /** Builds a fresh transport. Never cached: each run opens and closes its own. */
   makeTransport: (options: TransportOptions) => WebUsbTransport;
 }
@@ -144,6 +153,21 @@ export function useDevice(): DeviceHandle {
     }
   }, [adopt]);
 
+  const reattach = useCallback(async (): Promise<boolean> => {
+    if (current.current !== null) return true;
+    const usb = getWebUsb();
+    if (usb === null) return false;
+    try {
+      const known = await usb.getDevices();
+      const match = known.find((candidate) => candidate.vendorId === SEEK_VENDOR_ID);
+      if (match === undefined) return false;
+      adopt(match, NO_DEVICE);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [adopt]);
+
   const makeTransport = useCallback((options: TransportOptions): WebUsbTransport => {
     /* Read through the ref, not the state: the preserve wizard's opener
      * ladder holds this closure across a reset — the camera that
@@ -168,8 +192,9 @@ export function useDevice(): DeviceHandle {
       canForgetDevice: device !== null && canForget(device),
       connect,
       forget,
+      reattach,
       makeTransport,
     }),
-    [device, description, generation, connect, forget, makeTransport],
+    [device, description, generation, connect, forget, reattach, makeTransport],
   );
 }

@@ -250,6 +250,12 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
                 );
                 rep.setStatus('Camera rebooting — waiting for it to come back …');
               }
+              /* A missed `connect` event must not strand the run: the camera
+               * re-enumerates while the page holds nothing, and getDevices()
+               * finds it without any event or gesture. */
+              if (device.device === null) {
+                await device.reattach();
+              }
             }
             await waitMs(1000, signal);
           }
