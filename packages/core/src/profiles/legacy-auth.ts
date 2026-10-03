@@ -14,8 +14,8 @@
  *     if (mode > 0x21)  return 0x20000;   // "Invalid memory region"
  *     if (req_len != 2) {
  *         if (req_len != 0x12)              return 0x20100;  // "Invalid parameter"
- *         if (memcmp(arg + 2, KEY, 16) != 0) return 0x80000;  // "Invalid backdoor key"
- *     } else if ((unsigned)(mode - 2) <= 7) return 0x80000;  // "Invalid backdoor key"
+ *         if (memcmp(arg + 2, KEY, 16) != 0) return 0x80000;  // invalid key
+ *     } else if ((unsigned)(mode - 2) <= 7) return 0x80000;  // invalid key
  *
  * and then switches on the mode to pick the block. What follows from it:
  *
