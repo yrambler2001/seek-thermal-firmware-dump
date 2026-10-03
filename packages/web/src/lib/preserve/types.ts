@@ -168,11 +168,12 @@ export const PRESERVE_PHASES: readonly PreservePhaseMeta[] = [
     label: 'Read & build',
     description:
       'Connect, read the device info, and let the run build itself: the 31 stock windows are ' +
-      'backed up, the active slot is read twice and the two reads must agree, the factory ' +
+      'backed up — one admitted boot per window, the camera rebooting by command between ' +
+      'them — the active slot is read on two boots and the two reads must agree, the factory ' +
       'plaintext is derived from that capture and gated, the patch is built offline, and the ' +
-      'plan below prints from what the camera produced. Read-only.',
+      'plan below prints from what the camera produced. Read-only. About seven minutes.',
     steps: ['backup', 'patch'],
-    resetsCamera: false,
+    resetsCamera: true,
   },
   {
     id: 'patch-dump',

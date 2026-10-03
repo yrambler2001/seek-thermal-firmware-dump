@@ -32,6 +32,31 @@ export const CFG_MODE = 3;
 /** The image-select record the bootloader keeps in the boot-config block. */
 export const BOOT_CONFIG_BYTES = 28;
 
+/**
+ * The first 28 bytes of the block at 0x14020000 — the page-shift anchor,
+ * measured against the J-Link dump of the reference Compact (sha 40447c7e…,
+ * 2026-10-03). Some boots serve every window one 64 KiB page UP (window m
+ * answers with the plan's block m+1): the mode-3 probe then returns THESE
+ * bytes instead of the boot-config record, which is how the pipeline tells a
+ * page-shifted boot from a healthy one before it trusts any window read.
+ */
+export const PAGE_SHIFT_ANCHOR = Uint8Array.from(
+  Object.freeze([
+    0x01, 0x00, 0x31, 0xf7, 0x10, 0x00, 0x13, 0x00, 0xce, 0x00, 0x09, 0x00, 0x8a, 0x00, 0xca,
+    0x00, 0x31, 0x30, 0x31, 0x33, 0x31, 0x30, 0x48, 0x53, 0x4e, 0x45, 0x41, 0x32,
+  ]) as readonly number[],
+);
+
+/** True when a mode-3 probe read is the page-shift anchor instead of the
+ *  boot-config record — the boot is serving windows one page up. */
+export function isPageShiftedHead(block: Uint8Array): boolean {
+  if (block.length < PAGE_SHIFT_ANCHOR.length) return false;
+  for (let i = 0; i < PAGE_SHIFT_ANCHOR.length; i++) {
+    if (block[i] !== PAGE_SHIFT_ANCHOR[i]) return false;
+  }
+  return true;
+}
+
 /** The three app-image banks, in the bootloader's A/B/recovery order. */
 export const BANKS = [
   { key: 'a', mode: 7, address: 0x14050000 },

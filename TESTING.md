@@ -4984,3 +4984,68 @@ flip ladder runs on a written record (cfg[0]=0, the measured real-camera state),
 canary stays silent.
 `gating.test.ts` — a failed backup with `powerCycleRequired` holds phase ① for the assertion
 and leaves the other phases untouched; a failed backup without the flag re-runs normally.
+
+## 34. The silicon reader model: the completion poison and the page bias, and the pipeline rebuilt one boot per window (2026-10-03)
+
+### 34.1 The measurements (read-only probes vs the J-Link dump, sha 40447c7e…)
+
+Sec. 33's diagnosis was right that the failures were reader-shaped and wrong about the
+mechanism. Probing the real Compact against ground truth pinned TWO quirks, neither a
+budget:
+
+- **The completion poison.** A window drain that serves the window's LAST byte kills the
+  reader for the rest of the boot: the next arms serve a misaligned page-walk, then blank.
+  Measured: mode 3 full 64 KiB answers, then modes 7/3/5/7 all blank on the same boot. The
+  stock reader gives ONE full window per boot. EVERY phase-① failure before this section —
+  the 15:41 stale/blank sweep, the 22:39 blank verdict, the "budgeted per boot" refusals —
+  was the sweep poisoning its own reader, and the "backup" it assembled was the poison's
+  page-walk, not flash content (byte-compared: the sweep's serves walked flash at
+  +0x20000 per arm, not the requested addresses).
+- **The per-boot page bias.** A healthy boot serves window m at plan(m) + P·0x10000 for
+  some boots, P chosen per boot and stable within it (one measured boot served all 31
+  windows one page up; six other boots served page 0). The mode-3 probe identifies it: a
+  shifted boot's cfg read returns the 0x14020000 anchor (`010031f7 10001300 …`, the dump's
+  bytes) instead of the record.
+
+What also held under the byte-compare: the window plan and the WRITE path were correct all
+along (isolated arms match the RE switch table byte for byte; modes 7/8/9 are banks A/B/R),
+and the browser/WebUSB was never at fault — every failure reproduces on the CLI.
+
+### 34.2 What works, measured
+
+- Small reads and re-arms are healthy indefinitely; a fresh arm always re-serves from
+  byte 0 (no seek exists — an incomplete drain's tail cannot be picked up later).
+- The completion poison is CLEARED by the wire-89 reboot (measured: complete m3 → m7
+  blank → reset by command → m7 serves the image head, cfg record correct). No physical
+  power cycle needed.
+- The page bias re-rolls per boot, so a shifted boot is fixed by rebooting again.
+
+### 34.3 The rebuild
+
+`backupWindows` and `verifyAgainstBackup` are now ONE ADMITTED BOOT PER WINDOW: each
+segment opens, the mode-3 probe classifies the boot (written record = healthy; the anchor
+= page-shifted; blank retries once — a genuinely blank-record camera proceeds; anything
+else reboots by command and retries, four boots then the power-cycle refusal), the window
+is read FULL (completing is fine — nothing else reads on that boot), and the session
+closes. NO eager reset: the NEXT segment's probe is what detects the poisoned boot (blank)
+and reboots — which also means a reader that does not poison (the emulator's) is never
+reset at all. The detection comes free from the probe heads (`detectActiveSlotFromHead`),
+the capture reads on its own admitted boot, and the commit/restore sessions are admitted
+the same way — the restore's old "power-cycle the camera" dead end after a drain is now
+the probe's automatic reboot. The drain checks its own head: a dump beginning with four
+zero bytes is a page-shifted boot, rebooted and re-drained. Phase ① on silicon is
+therefore ~31 boots × ~13 s ≈ 7 minutes, fully automatic, complete bytes.
+
+The old per-boot ladders (the boot-config re-arm ladder, the same-boot re-arm of the
+capture) are gone: a re-arm on the same boot would read the poison. The capture ladder
+re-reads on fresh boots instead, and the sweep canary stays as the all-blank wedge detector.
+
+### 34.4 What the tests pin
+
+`steps.test.ts` — `classifyReaderBoot`'s three-way sort (the anchor first); the probe
+admits a healthy boot first-try, reboots a page-shifted boot and admits the next, proceeds
+on two genuinely blank boots, and refuses four garbage boots with the remedy; the capture
+ladder flips on a swallowed sweep row and refuses garbage on three boots.
+`pipeline.emulator.test.ts` — the whole P1→P4 pipeline through the segmented sweep (the
+emulator's single-import usbip server: every wire stage owns its attach; withFreshSessions
+hands the work the emulator, not a held session).

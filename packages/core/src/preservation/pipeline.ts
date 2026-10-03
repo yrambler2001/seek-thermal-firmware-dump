@@ -88,6 +88,7 @@ import {
   bankWindow,
   cfgWindow,
   isBlankWindow,
+  isPageShiftedHead,
   isStaleDescriptorWord,
   parseBootConfig,
   preservationWindows,
@@ -175,33 +176,183 @@ export interface BackupResult {
   readonly bytes: number;
 }
 
+/* ==================================================================== *
+ * P1 — the 31-window backup (read-only), one boot per window
+ * ==================================================================== */
+
 /**
- * Read all 31 stock windows, each one complete. Read-only.
+ * THE SILICON READER MODEL (measured 2026-10-03 against the J-Link dump of the
+ * reference Compact, sha 40447c7e…; TESTING.md sec. 34). Two quirks govern
+ * every window read on a stock camera, and neither is a budget:
  *
- * THE READER CANARY (measured 2026-10-02, run preserve-2026-10-02T22-39-43Z): a
- * camera whose window reader was spent by earlier same-boot attempts serves
- * BLANK at full length, so every window here passes the length check and the
- * step burns the whole sweep before the slot ladder refuses far downstream —
- * with the boot-config read along the way accepting the blank fill as a genuine
- * blank record ("boots bank A"). The canary watches the two rows whose BOTH
- * being unprogrammed no honest reader can serve: the boot-config block (the
- * sweep's first window, 0x14010000) and bank A (0x14050000). A blank record is
- * what makes the bootloader's fixed validate order boot bank A, so bank A must
- * then hold the image that is running; a record naming bank B or recovery is
- * written, not blank. The one honest exception is the measured arm swallow —
- * a single arm serving blank while the reader is alive — so the co-occurrence
- * is settled the way every ladder here settles a suspect read: bank A is
- * re-armed ONCE and re-read. Blank again is the spent reader (deterministic
- * fill) and the refusal fires five windows in, naming the power cycle; a real
- * re-read was a swallowed arm, and the re-read replaces the row, logged. With
- * the canary passed, `detectActiveSlot`'s blank verdict stands on a reader
- * proven to serve real bytes this boot.
+ *  1. COMPLETION POISON. A drain that serves a window's LAST byte kills the
+ *     reader for the rest of the boot — every later arm serves a misaligned
+ *     page-walk, then blank. Measured: mode 3 full 64 KiB OK, then modes
+ *     7/3/5/7 all blank on the same boot. Every phase-① failure before
+ *     2026-10-03 was this: the sweep's own first completed window poisoned
+ *     the reader, and the "backup" it assembled was the poison's page-walk,
+ *     not flash content. A fresh boot gives ONE full window, no more.
+ *  2. PER-BOOT PAGE BIAS. A healthy boot serves window m at plan(m) plus one
+ *     64 KiB page for some boots (window m answers with the plan's block m+1).
+ *     The bias is chosen per boot, stable within it, and cleared by any
+ *     reboot; the mode-3 probe identifies it (the page-shift anchor).
+ *
+ * What survives on silicon: a fresh arm re-serves from byte 0; small reads and
+ * re-arms are healthy indefinitely; the completion poison is CLEARED by the
+ * wire-89 firmware reboot (measured — no physical power cycle needed). Hence
+ * the shape of everything below: ONE window per boot — arm, read it FULL
+ * (completing is fine; nothing else is read on that boot), reboot by command,
+ * next. 31 windows ≈ 13 s each. Every session is admitted by the mode-3
+ * probe: a written record is a healthy boot, the page-shift anchor is a
+ * page-shifted boot (reboot and retry), blank retries once (a genuinely blank
+ * record is legitimate) before it proceeds, anything else reboots and retries.
+ */
+
+/** How the mode-3 probe read classifies this boot's reader. */
+export type ReaderBoot = 'healthy' | 'page-shifted' | 'blank';
+
+/** True when a probe head is a written boot-config record (cfg0 0/1/2 with
+ *  the bank addresses). */
+function isWrittenCfgRecord(head: Uint8Array): boolean {
+  return cfgRecordShape(head) === 'written';
+}
+
+export function classifyReaderBoot(head: Uint8Array): ReaderBoot {
+  /* The anchor first: its cfg0 names no slot, so the record shape alone would
+   * misread it as written. */
+  if (isPageShiftedHead(head)) return 'page-shifted';
+  if (isWrittenCfgRecord(head)) return 'healthy';
+  return 'blank';
+}
+
+/** How many fresh boots one segment may demand before the reader is refused.
+ *  Two of them may legitimately be blank (a genuinely blank-record camera
+ *  reads blank on every boot and must proceed); the third blank is a wedged
+ *  reader and the refusal names the physical power cycle. */
+export const SEGMENT_BOOT_ATTEMPTS = 4;
+
+/**
+ * Open ONE admitted session: ride the opener's ladder through any reset
+ * silence, then probe the reader with the mode-3 head read. A boot that is
+ * page-shifted or unreadable is rebooted by command and retried; a blank
+ * probe proceeds after two blank boots (a genuinely blank-record camera).
+ * Returns the device and its probe head — the head IS the boot-config record
+ * on a healthy boot, so callers get the slot detection for free.
+ */
+export async function openProbedSession(
+  opener: SessionOpener,
+  reporter: Reporter,
+  signal: AbortSignal | undefined,
+  label: string,
+  prepare?: (device: SeekDevice) => void,
+): Promise<{ device: SeekDevice; cfgHead: Uint8Array; boots: number }> {
+  let blankBoots = 0;
+  for (let attempt = 1; attempt <= SEGMENT_BOOT_ATTEMPTS; attempt++) {
+    assertLive(signal);
+    const device = await opener.open();
+    prepare?.(device);
+    let head: Uint8Array;
+    try {
+      await device.armWindow(cfgWindow());
+      /* THE START-UP WINDOW, the version read's shape: after a reboot the
+       * firmware refuses (or stalls) every request while it initializes —
+       * ~10 ms of real time on the real camera, but on the EMULATOR the
+       * camera's clock only advances while requests are outstanding, so the
+       * probe must keep asking, a pause between each, until the dispatcher
+       * comes up. 26 reads, 20 ms apart, exactly the version read's window. */
+      head = await (async (): Promise<Uint8Array> => {
+        let lastError: unknown = null;
+        for (let probeRead = 0; probeRead < 26; probeRead++) {
+          assertLive(signal);
+          try {
+            if (probeRead > 0) await sleep(20);
+            return await drainExact(device, BOOT_CONFIG_BYTES, `${label} reader probe`, {
+              retries: 0,
+              timeoutMs: 5000,
+              ...(signal === undefined ? {} : { signal }),
+            });
+          } catch (error) {
+            lastError = error;
+            if (!isWireStall(error) && !(error instanceof Error)) throw error;
+          }
+        }
+        throw lastError ?? new Error('the reader probe never answered');
+      })();
+    } catch (error) {
+      await opener.close(device);
+      /* A stall is the dead reader's wire answer; reboot by command on the
+       * next open and try again — the wire-89 clears the poison (measured). */
+      reporter.log(`${label}: the reader probe stalled — rebooting by command and retrying`, 'warn');
+      try {
+        const reboot = await opener.open();
+        await resetDevice(reboot).catch(() => undefined);
+        await opener.close(reboot);
+      } catch {
+        /* the camera may already be down; the next open's ladder rides it */
+      }
+      continue;
+    }
+    const boot = classifyReaderBoot(head);
+    if (boot === 'healthy') {
+      return { device, cfgHead: head, boots: attempt };
+    }
+    if (
+      boot === 'blank' &&
+      head.every((b) => b === 0xff) /* stale garbage never proceeds — only a
+                                       * genuinely unprogrammed record does */
+    ) {
+      blankBoots += 1;
+      if (blankBoots >= 2) {
+        /* Two independent boots read an unprogrammed record: a genuinely
+         * blank-record camera. Proceed — the sweep's canary still refuses an
+         * all-blank reader, and the window reads themselves are validated
+         * downstream. */
+        reporter.log(
+          `${label}: the boot-config record reads as unprogrammed on two boots — ` +
+            'treating it as a genuinely blank record and proceeding',
+          'detail',
+        );
+        return { device, cfgHead: head, boots: attempt };
+      }
+    }
+    reporter.log(
+      `${label}: the reader came up ` +
+        (boot === 'page-shifted'
+          ? 'page-shifted (every window answers one page up)'
+          : 'unreadable (the probe served blank or garbage)') +
+        ' — rebooting by command and retrying',
+      'warn',
+    );
+    await resetDevice(device).catch(() => undefined);
+    await opener.close(device);
+  }
+  throw new SeekError(
+    'pipeline/refused',
+    spentReaderRefusal(
+      `${label}: the reader probe failed on ${String(SEGMENT_BOOT_ATTEMPTS)} consecutive ` +
+        'boots (blank, page-shifted or stalled each time) — the wire reboot did not revive ' +
+        'it; power-cycle the camera (unplug and replug it, or use its power switch), then re-run',
+    ),
+  );
+}
+
+/**
+ * Read all 31 stock windows, each one complete — one boot per window.
+ * Read-only.
+ *
+ * THE READER CANARY rides along: the two rows whose BOTH being unprogrammed no
+ * honest reader can serve — the boot-config block (0x14010000) and bank A
+ * (0x14050000). A blank record is what makes the bootloader's fixed validate
+ * order boot bank A, so bank A must then hold the running image; a record
+ * naming bank B or recovery is written, not blank. One re-arm separates the
+ * honest exception (the measured single-arm swallow) from a wedged reader.
  */
 export async function backupWindows(
-  device: SeekDevice,
+  opener: SessionOpener,
   reporter: Reporter,
   chunk: number = READ_CHUNK,
   signal?: AbortSignal,
+  prepare?: (device: SeekDevice) => void,
 ): Promise<BackupResult> {
   const windows = preservationWindows();
   const out: WindowBytes[] = [];
@@ -214,16 +365,29 @@ export async function backupWindows(
   const bankAAddress = BANKS[0].address;
   for (const entry of windows) {
     assertLive(signal);
-    device.assertNotCancelled();
     reporter.progress(
       index,
       windows.length,
       `P1 backup window ${hexUp(entry.address, 8)}`,
       'items',
     );
-    await device.armWindow(entry);
-    let read = await device.readArmed(chunk, WINDOW_BYTES);
+    const { device } = await openProbedSession(
+      opener,
+      reporter,
+      signal,
+      `P1 window ${hexUp(entry.address, 8)}`,
+      prepare,
+    );
+    let read: Awaited<ReturnType<SeekDevice['readArmed']>>;
+    try {
+      await device.armWindow(entry);
+      read = await device.readArmed(chunk, WINDOW_BYTES);
+    } catch (error) {
+      await opener.close(device);
+      throw error;
+    }
     if (read.data.length !== WINDOW_BYTES) {
+      await opener.close(device);
       const why = read.stopReason === null ? '' : ` (${read.stopReason})`;
       throw new Error(
         `P1: backup window ${hexUp(entry.address, 8)} came back ` +
@@ -234,12 +398,13 @@ export async function backupWindows(
     }
     if (entry.address === 0x14010000) cfgRowBlank = isBlankWindow(read.data);
     if (entry.address === bankAAddress && cfgRowBlank && isBlankWindow(read.data)) {
-      /* Both canary rows blank. One re-arm separates a spent reader from the
-       * measured single-arm swallow (the third descriptor lifetime this costs
-       * bank A is the canary's own, and it runs only on this path). */
+      /* Both canary rows blank. One re-arm separates a wedged reader from the
+       * measured single-arm swallow (this segment's boot is otherwise done —
+       * the re-arm costs nothing the segment wasn't already spending). */
       await device.armWindow(entry);
       const again = await device.readArmed(chunk, WINDOW_BYTES);
       if (again.data.length !== WINDOW_BYTES || isBlankWindow(again.data)) {
+        await opener.close(device);
         throw new SeekError(
           'pipeline/refused',
           spentReaderRefusal(
@@ -255,13 +420,21 @@ export async function backupWindows(
       reporter.log(
         `the sweep’s bank A row (${hexUp(bankAAddress, 8)}) served blank and was ` +
           're-verified on a fresh arm — the re-read is the row (the measured single-arm ' +
-          'swallow, not a spent reader: the boot-config row is blank because the record is)',
+          'swallow, not a wedged reader: the boot-config row is blank because the record is)',
         'detail',
       );
-      read = again;
+      out.push({ mode: entry.subcmd, address: entry.address, bytes: again.data });
+      byAddress.set(entry.address, again.data);
+    } else {
+      out.push({ mode: entry.subcmd, address: entry.address, bytes: read.data });
+      byAddress.set(entry.address, read.data);
     }
-    out.push({ mode: entry.subcmd, address: entry.address, bytes: read.data });
-    byAddress.set(entry.address, read.data);
+    /* The window's last byte was just served — the poison is armed on a real
+     * camera. NO eager reset here: the NEXT segment's mode-3 probe is what
+     * detects the poisoned boot (it serves blank) and reboots by command
+     * itself, so a reader that does not poison (the emulator's) is never
+     * reset at all. */
+    await opener.close(device);
     index++;
   }
   reporter.progress(windows.length, windows.length, 'P1 backup complete', 'items');
@@ -273,74 +446,11 @@ export async function backupWindows(
  * ==================================================================== */
 
 /**
- * Read the 28-byte boot-config record and name the active slot. Read-only.
- *
- * THE VERIFIED ARM (measured on the real Compact, 2026-10-02 probe files): a
- * first-session arm swallow comes and goes between boots — in one fresh-boot
- * run the mode-3 read served BLANK while the immediately-following mode-7
- * read served correctly, and the J-Link ground truth shows a real camera's
- * record is WRITTEN (cfg[0]=0, then the A/B addresses), so an unprogrammed
- * 0xFF-fill record is not taken at face value. The ladder: a record that
- * parses (cfg[0] 0, 1 or 2 written) is accepted as served; an unprogrammed
- * fill or a stale-SRAM word is re-armed ONCE and re-read — the re-read is
- * used when it names a record, two agreeing unprogrammed reads accept the
- * blank verdict (a genuinely blank record), and a second consecutive garbage
- * read refuses with the power-cycle remedy. One retry, never loops.
- *
- * The two-agreeing-blanks acceptance is sound because `backupWindows`' canary
- * has already run by the time this is called: a reader that serves blank for
- * BOTH the boot-config row and bank A was refused in the sweep, so a blank
- * verdict here comes from a reader proven to serve real bytes this boot.
+ * Name the active slot from a probe head already in hand — the mode-3 read
+ * `openProbedSession` admits every session with. Read-only, no wire.
  */
-export async function detectActiveSlot(device: SeekDevice): Promise<SlotDetection> {
-  const read = async (label: string): Promise<Uint8Array> => {
-    await device.armWindow(cfgWindow());
-    try {
-      return await drainExact(device, BOOT_CONFIG_BYTES, label, {
-        retries: 3,
-        timeoutMs: 5000,
-      });
-    } catch (error) {
-      if (isWireStall(error)) {
-        throw new SeekError('pipeline/refused', spentReaderRefusal(`${label} stalled`), {
-          cause: error,
-        });
-      }
-      throw error;
-    }
-  };
-
-  const block = await read('boot-config read');
-  const shape = cfgRecordShape(block);
-  if (shape === 'written') return parseBootConfig(block);
-
-  const again = await read('boot-config read (re-armed)');
-  const againShape = cfgRecordShape(again);
-  if (againShape === 'written') {
-    const detection = parseBootConfig(again);
-    return {
-      ...detection,
-      verdict:
-        `${detection.verdict}; re-verified: the first read served ` +
-        `${shapeNoun(shape)} — re-armed once and this re-read is the record used`,
-    };
-  }
-  if (shape === 'unprogrammed' && againShape === 'unprogrammed') {
-    const detection = parseBootConfig(again);
-    return {
-      ...detection,
-      verdict:
-        `${detection.verdict}; re-verified: the record read as unprogrammed twice — re-armed ` +
-        'once, the re-read agreed, and the blank verdict stands on two agreeing reads',
-    };
-  }
-  throw new SeekError(
-    'pipeline/refused',
-    spentReaderRefusal(
-      `the boot-config read served garbage twice (${shapeNoun(shape)}, then ` +
-        `${shapeNoun(againShape)}) — no record can be read from either`,
-    ),
-  );
+export function detectActiveSlotFromHead(cfgHead: Uint8Array): SlotDetection {
+  return parseBootConfig(cfgHead);
 }
 
 /** Which of the three known shapes a 28-byte boot-config read carries:
@@ -364,17 +474,6 @@ function cfgRecordShape(block: Uint8Array): 'written' | 'unprogrammed' | 'stale'
     return 'stale';
   }
   return 'written';
-}
-
-function shapeNoun(shape: 'written' | 'unprogrammed' | 'stale'): string {
-  switch (shape) {
-    case 'written':
-      return 'a written record';
-    case 'unprogrammed':
-      return 'an unprogrammed 0xFF-fill record';
-    case 'stale':
-      return 'an SRAM-shaped word (the bootloader vector’s initial SP)';
-  }
 }
 
 /**
@@ -706,14 +805,17 @@ export function unrotateDump(dump: Uint8Array, base: number): Uint8Array {
 
 /**
  * P4's verify: re-read the 31 stock windows and compare every one against the
- * P1 backup.
+ * P1 backup — one admitted boot per window, the backup's own discipline (the
+ * completing read poisons the reader, and the segment ends with the wire
+ * reboot that clears it).
  */
 export async function verifyAgainstBackup(
-  device: SeekDevice,
+  opener: SessionOpener,
   backup: BackupResult,
   reporter: Reporter,
   chunk: number = READ_CHUNK,
   signal?: AbortSignal,
+  prepare?: (device: SeekDevice) => void,
 ): Promise<{ diffBytes: number; windowsRead: number; badWindows: readonly number[] }> {
   const windows = preservationWindows();
   let diffBytes = 0;
@@ -723,15 +825,28 @@ export async function verifyAgainstBackup(
   for (const entry of windows) {
     index++;
     assertLive(signal);
-    device.assertNotCancelled();
     reporter.progress(
       index,
       windows.length,
       `P4 verify window ${hexUp(entry.address, 8)}`,
       'items',
     );
-    await device.armWindow(entry);
-    const read = await device.readArmed(chunk, WINDOW_BYTES);
+    const { device } = await openProbedSession(
+      opener,
+      reporter,
+      signal,
+      `P4 verify ${hexUp(entry.address, 8)}`,
+      prepare,
+    );
+    let read: Awaited<ReturnType<SeekDevice['readArmed']>>;
+    try {
+      await device.armWindow(entry);
+      read = await device.readArmed(chunk, WINDOW_BYTES);
+    } finally {
+      /* No eager reset: the next segment's probe detects a poisoned boot and
+       * reboots by command itself. */
+      await opener.close(device);
+    }
     if (read.data.length !== WINDOW_BYTES) {
       badWindows.push(entry.subcmd);
       continue;

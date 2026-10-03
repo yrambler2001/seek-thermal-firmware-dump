@@ -338,7 +338,7 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
     mounted.unmount();
   });
 
-  it('phase ① expects no reset: a mid-phase disconnect stops the phase', async () => {
+  it('phase ① resets the camera mid-phase now: a disconnect rides instead of stopping', async () => {
     const unitA = fakeCameraUnit(0x0010);
     const mounted = mountPanel([unitA]);
     await waitFor(() => current(mounted).device.device !== null);
@@ -350,17 +350,25 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
     });
     await waitFor(() => handed.some(([step]) => step === 'backup'));
 
+    /* The backup step reboots the camera by command between windows, so the
+     * disconnect is the reset working: the phase does NOT stop — it waits
+     * for the re-enumeration. */
     act(() => {
       usb.fire('disconnect', unitA);
     });
-    await waitFor(() => current(mounted).panel.activePhase === null);
-    expect(current(mounted).panel.activePhase).toBeNull();
-    expect(linesOf(current(mounted).panel, 'read-build')).toContain(
-      'the camera left the bus mid-phase',
+    await waitFor(() =>
+      linesOf(current(mounted).panel, 'read-build').includes(
+        'the camera left the bus — the reset was expected',
+      ),
     );
-    expect(
-      current(mounted).panel.state?.steps.backup,
-    ).toBeUndefined(); /* a cancel is not recorded */
+    expect(current(mounted).panel.activePhase).toBe('read-build');
+
+    /* Cancel to end the hung step; a cancel is not recorded. */
+    act(() => {
+      current(mounted).panel.cancel();
+    });
+    await waitFor(() => current(mounted).panel.activePhase === null);
+    expect(current(mounted).panel.state?.steps.backup).toBeUndefined();
     mounted.unmount();
   });
 

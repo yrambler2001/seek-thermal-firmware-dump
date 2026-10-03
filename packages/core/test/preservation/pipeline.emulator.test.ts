@@ -96,14 +96,16 @@ import { WebUsbTransport } from '../../src/protocol/webusb.js';
 import { FLASH_BASE, FLASH_SIZE } from '../../src/profiles/modern-4x.js';
 import {
   BACKUP_WINDOW_COUNT,
+  BOOT_CONFIG_BYTES,
   PostResetWedgeError,
   PROBE_OFFSET,
   READ_CHUNK,
   backupSlice,
   backupWindows,
+  cfgWindow,
   commitToBank,
   conjugateCapture,
-  detectActiveSlot,
+  detectActiveSlotFromHead,
   drainWholePart,
   postProcessDump,
   probeWidenedWindow,
@@ -113,6 +115,7 @@ import {
   solvePlainFromCapture,
   verifyAgainstBackup,
   type BackupResult,
+  type SessionOpener,
   type SlotDetection,
 } from '../../src/preservation/index.js';
 import { buildV1Patch, sum16, wordSum } from '../../src/preservation/patch.js';
@@ -256,6 +259,31 @@ async function withDevice<T>(
   }
 }
 
+/** A `SessionOpener` over one emulator server — what the segment-based
+ *  `backupWindows`/`verifyAgainstBackup` open per window. Each open attaches
+ *  afresh; the close drops that attach. */
+function emulatorOpener(emu: Emulator, label: string): SessionOpener {
+  let attached: Awaited<ReturnType<Emulator['attach']>> | null = null;
+  return {
+    open: async () => {
+      attached = await emu.attach({ urbTimeoutMs: URB_TIMEOUT_MS });
+      const transport = new WebUsbTransport(attached, {
+        recipient: 'auto',
+        api: 'usbip (emulator)',
+        host: 'vitest preservation',
+        clock: attached.deadlineClock,
+      });
+      await transport.open();
+      assertRealHostPath(attached, transport.info, label);
+      return new SeekDevice(transport, { reporter: silentReporter });
+    },
+    close: async () => {
+      await attached?.close().catch(() => undefined);
+      attached = null;
+    },
+  };
+}
+
 interface BootOptions {
   readonly flash?: string;
   readonly flashOut?: string;
@@ -280,7 +308,7 @@ async function boot(row: RowEmulators, options: BootOptions): Promise<Emulator> 
 async function withFreshSessions<T>(
   row: RowEmulators,
   bootOptions: BootOptions,
-  work: (seek: SeekDevice) => Promise<T>,
+  work: (emu: Emulator) => Promise<T>,
 ): Promise<T> {
   let lastError: unknown = null;
   for (let round = 0; round < 3; round++) {
@@ -288,9 +316,9 @@ async function withFreshSessions<T>(
     try {
       for (let session = 0; session < 2; session++) {
         try {
-          return await row.guard(emu, () =>
-            withDevice(emu, `session r${String(round)}s${String(session)}`, work),
-          );
+          /* No withDevice wrapper: the usbip server serves one import at a
+           * time, and the segmented work attaches per window itself. */
+          return await row.guard(emu, () => work(emu));
         } catch (error) {
           lastError = error;
         }
@@ -603,55 +631,70 @@ describe.skipIf(UNSUPPORTED !== null)(
                * truth, before any wire traffic. */
               expect(emu.ready.flash_sha256).toBe(spec.sourceSha);
               await row.guard(emu, async () => {
-                await withDevice(emu, 'P1+P2 session', async (seek) => {
+                /* The usbip server serves ONE import at a time, so every
+                 * wire stage here owns its attach: the version read first,
+                 * then the segmented sweep (which attaches per window), then
+                 * the commit. */
+                await withDevice(emu, 'P1+P2 version session', async (seek) => {
                   expect(await readVersion(seek)).toBe(EXPECTED_VERSION);
                   /* The reset payload this pipeline sends is u16 0 — never the
                    * non-zero value that arms the TIMER1-driven arm route. */
                   expect([...resetOpPayload()]).toEqual([0, 0]);
+                });
 
-                  /* ---- P1: the backup (read-only) ------------------------- */
-                  st.backup = await backupWindows(seek, silentReporter);
-                  expect(st.backup.windows.length).toBe(BACKUP_WINDOW_COUNT);
-                  expect(st.backup.bytes).toBe(BACKUP_WINDOW_COUNT * 0x10000);
+                /* ---- P1: the backup (read-only), one admitted boot per
+                 * window; the emulator's reader never poisons, so the
+                 * segments ride straight through -------------------- */
+                st.backup = await backupWindows(
+                  emulatorOpener(emu, 'P1 segment'),
+                  silentReporter,
+                );
+                expect(st.backup.windows.length).toBe(BACKUP_WINDOW_COUNT);
+                expect(st.backup.bytes).toBe(BACKUP_WINDOW_COUNT * 0x10000);
 
-                  /* ---- P2: detect, verify, conjugate, commit --------------- */
-                  const detection = await detectActiveSlot(seek);
-                  st.detection = detection;
-                  expect(
-                    detection.cfg0,
-                    `cfg[0]=${String(detection.cfg0)} should be ${String(spec.expectCfg0)}`,
-                  ).toBe(spec.expectCfg0);
-                  expect(detection.blank).toBe(spec.expectBlank);
-                  expect(detection.bank).toBe(spec.expectBank);
+                /* ---- P2: detect, verify, conjugate, commit --------------- */
+                const cfgRow = st.backup.byAddress.get(0x14010000);
+                expect(cfgRow, 'the P1 backup holds the boot-config block').toBeDefined();
+                const detection = detectActiveSlotFromHead(
+                  cfgRow!.subarray(0, BOOT_CONFIG_BYTES),
+                );
+                st.detection = detection;
+                expect(
+                  detection.cfg0,
+                  `cfg[0]=${String(detection.cfg0)} should be ${String(spec.expectCfg0)}`,
+                ).toBe(spec.expectCfg0);
+                expect(detection.blank).toBe(spec.expectBlank);
+                expect(detection.bank).toBe(spec.expectBank);
 
-                  const capture = st.backup.byAddress.get(detection.bankAddress);
-                  expect(capture, 'the P1 backup holds the active bank').toBeDefined();
-                  st.bankCapture = capture!;
-                  /* SELF-SOURCED, and the version cross-checked: the factory
-                   * plaintext is DERIVED from this case's capture (identity —
-                   * the 2014 banks hold the image as-is), its header version
-                   * must equal what the camera reports, and the build table's
-                   * gates run on the derived image before anything is
-                   * trusted. */
-                  const derived = derivedFor(spec.key, capture!);
-                  st.plain = derived.plain;
-                  st.patch = derived.patch;
-                  const says = parseImageHeader(st.plain)?.versionStr;
-                  expect(says, 'the derived image’s header version').toBe(EXPECTED_VERSION);
+                const capture = st.backup.byAddress.get(detection.bankAddress);
+                expect(capture, 'the P1 backup holds the active bank').toBeDefined();
+                st.bankCapture = capture!;
+                /* SELF-SOURCED, and the version cross-checked: the factory
+                 * plaintext is DERIVED from this case's capture (identity —
+                 * the 2014 banks hold the image as-is), its header version
+                 * must equal what the camera reports, and the build table's
+                 * gates run on the derived image before anything is
+                 * trusted. */
+                const derived = derivedFor(spec.key, capture!);
+                st.plain = derived.plain;
+                st.patch = derived.patch;
+                const says = parseImageHeader(st.plain)?.versionStr;
+                expect(says, 'the derived image’s header version').toBe(EXPECTED_VERSION);
 
-                  /* The zero-keystream identity: with no cipher the staged
-                   * payload IS the patched plaintext. */
-                  st.payload = conjugateCapture(capture!, st.patch);
-                  expect(st.payload.length).toBe(st.plain.length);
-                  const commit = await commitToBank(seek, detection.bank, st.payload, {
+                /* The zero-keystream identity: with no cipher the staged
+                 * payload IS the patched plaintext. */
+                st.payload = conjugateCapture(capture!, st.patch);
+                expect(st.payload.length).toBe(st.plain.length);
+                await withDevice(emu, 'P2 commit session', async (seek) => {
+                  const commit = await commitToBank(seek, detection.bank, st.payload!, {
                     label: 'P2 in-place patch',
                     reporter: silentReporter,
                     commitTimeoutMs: 60_000,
                   });
                   st.commit = commit;
                   expect(commit.status).toBe(0); /* the measured commit verdict */
-                  expect(commit.chunks).toBe(Math.ceil(st.plain.length / 64)); /* 747 for 1.3.0.0 */
-                  expect(commit.sum16).toBe(sum16(st.payload));
+                  expect(commit.chunks).toBe(Math.ceil(st.plain!.length / 64)); /* 747 for 1.3.0.0 */
+                  expect(commit.sum16).toBe(sum16(st.payload!));
                   /* NO reset in this session: the reset is P3's opener (its own
                    * phase), and keeping it out of here lets this server stop
                    * politely and write the `.final` the ground truth needs. */
@@ -830,7 +873,9 @@ describe.skipIf(UNSUPPORTED !== null)(
                   await withDevice(emu, 'P4 restore session', async (seek) => {
                     /* The patched image still reports the build's version. */
                     expect(await readVersion(seek)).toBe(EXPECTED_VERSION);
-                    const detection = await detectActiveSlot(seek);
+                    await seek.armWindow(cfgWindow());
+                    const head = (await seek.readArmed(READ_CHUNK, BOOT_CONFIG_BYTES)).data;
+                    const detection = detectActiveSlotFromHead(head);
                     expect(detection.bankAddress).toBe(st.detection!.bankAddress);
                     expect(detection.blank).toBe(
                       spec.expectBlank,
@@ -876,9 +921,9 @@ describe.skipIf(UNSUPPORTED !== null)(
               : scratch('asbooted.bin');
             let verify: RunState['verify'];
             try {
-              verify = await withFreshSessions(row, { flash: verifySource }, async (seek) => {
-                return verifyAgainstBackup(seek, st.backup!, silentReporter);
-              });
+              verify = await withFreshSessions(row, { flash: verifySource }, (emu2) =>
+                verifyAgainstBackup(emulatorOpener(emu2, 'P4 verify segment'), st.backup!, silentReporter),
+              );
             } catch (error) {
               process.stderr.write(
                 `--- last emulator log after the P4 verify failure ---\n${row.lastLog(120)}\n`,

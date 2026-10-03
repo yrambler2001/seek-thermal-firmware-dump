@@ -88,10 +88,11 @@ import {
   backupSlice,
   backupWindows,
   commitToBank,
-  detectActiveSlot,
+  detectActiveSlotFromHead,
   drainExact,
   drainWholePart,
   isWireStall,
+  openProbedSession,
   postProcessDump,
   probeWidenedWindow,
   readVersion,
@@ -120,6 +121,7 @@ import { solvePlainFromCapture } from './solve.js';
 import {
   BACKUP_WINDOW_COUNT,
   BANKS,
+  BOOT_CONFIG_BYTES,
   WINDOW_BYTES,
   bankWindow,
   doubleReadWindows,
@@ -892,9 +894,9 @@ export function backupResultFromImage(image: Uint8Array): BackupResult {
  * ==================================================================== */
 
 /** One arm of the double read: arm `entry` and serve the whole 64 KiB through
- *  the drain path. A stall here is the spent-reader signature — the reads
- *  came back from a reader this boot already spent — so the error carries the
- *  power-cycle remedy, not a bare wire failure. */
+ *  the drain path. A stall here is the dead-reader wire answer; the caller's
+ *  segment machinery reboots and retries, so a stall surfacing from here has
+ *  already exhausted its boots. */
 async function armAndDrainSlot(
   device: SeekDevice,
   entry: WindowEntry,
@@ -921,28 +923,6 @@ async function armAndDrainSlot(
     }
     throw error;
   }
-}
-
-/** The active slot's SECOND read: one fresh arm of the bank's own window
- *  (mode 7/8/9 per detection), the whole 64 KiB through the drain path. The
- *  FIRST read is the sweep's own captured row at the bank address — served
- *  through the sweep's plan-window arm — so the active slot is served exactly
- *  TWICE per boot: the sweep's row, then this arm. The reader of the real
- *  Compact is budgeted per boot, so no block may be served a third time
- *  (TESTING.md secs. 23.3, 28.4). */
-async function readSlotFreshArm(
-  device: SeekDevice,
-  bank: BankKey,
-  signal: AbortSignal | undefined,
-): Promise<{ read: Uint8Array; mode: number }> {
-  const bankEntry = bankWindow(bank);
-  const read = await armAndDrainSlot(
-    device,
-    bankEntry,
-    `the active slot’s fresh-arm read (the bank window, mode ${String(bankEntry.subcmd)})`,
-    signal,
-  );
-  return { read, mode: bankEntry.subcmd };
 }
 
 /**
@@ -1083,7 +1063,7 @@ function deriveFactoryImage(
  *  the derivation with its gate set. The FF route's re-point runs this twice —
  *  the first pass names the build, the second captures the bank that runs. */
 async function captureAndDerive(
-  device: SeekDevice,
+  opener: SessionOpener,
   byAddress: ReadonlyMap<number, Uint8Array>,
   detection: SlotDetection,
   version: string,
@@ -1107,53 +1087,86 @@ async function captureAndDerive(
     );
   }
   const [bankEntry, planEntry] = doubleReadWindows(detection.bank);
-  const { read: fresh, mode: freshMode } = await readSlotFreshArm(device, detection.bank, signal);
+
+  /* THE ACTIVE SLOT'S SECOND READ, one admitted boot of its own: a full
+   * 64 KiB drain completes the window (which poisons the reader for the rest
+   * of that boot — TESTING.md sec. 34), so the segment ends with the wire
+   * reboot. The FIRST read is the sweep's own captured row at the bank
+   * address, served on its own boot. */
+  const readBankOnFreshBoot = async (label: string): Promise<Uint8Array> => {
+    const { device } = await openProbedSession(opener, reporter, signal, label, (d) => {
+      applyReaderOp(d, version);
+    });
+    try {
+      return await armAndDrainSlot(device, bankEntry, label, signal);
+    } finally {
+      /* No eager reset: the next segment's probe detects the poisoned boot
+       * and reboots by command itself. */
+      await opener.close(device);
+    }
+  };
+
+  const fresh = await readBankOnFreshBoot(
+    `the active slot’s fresh-boot read (the bank window, mode ${String(bankEntry.subcmd)})`,
+  );
+  const freshMode = bankEntry.subcmd;
 
   /* THE VERIFIED-ARM LADDER on the slot reads. `sweepRow` is the first read
-   * (the sweep's plan-window arm); `fresh` is the second (one fresh arm of
-   * the bank window). Both are sanity-checked against the header expectation;
-   * garbage is re-armed ONCE; a second consecutive garbage read refuses with
-   * the power-cycle remedy. Two plausible reads that differ stay a refusal —
-   * the byte-agreement rule is the trust anchor. */
+   * (the sweep's own boot); `fresh` is the second (its own admitted boot).
+   * Both are sanity-checked against the header expectation; a garbage read is
+   * re-read ONCE ON A FRESH BOOT (a re-arm on the same boot would serve the
+   * completion poison's blank); two plausible reads that differ stay a
+   * refusal — the byte-agreement rule is the trust anchor. */
   let capture = sweepRow;
   let verifiedSecond: Uint8Array = fresh;
   let serveNote = 'both reads agree';
   if (!slotReadIsPlausible(sweepRow)) {
     if (!slotReadIsPlausible(fresh)) {
-      fail(
-        spentReaderRefusal(
-          `the active slot’s reads served garbage twice (${slotGarbageNoun(sweepRow)}; then ` +
-            `${slotGarbageNoun(fresh)})`,
-        ),
+      /* Both boots served garbage. One more admitted boot for the sweep row's
+       * side: the sweep's own boot may have been the swallowed one. */
+      const rescued = await readBankOnFreshBoot(
+        'the active slot’s re-read after two garbage reads (the bank window)',
       );
+      if (!slotReadIsPlausible(rescued)) {
+        fail(
+          spentReaderRefusal(
+            `the active slot’s reads served garbage on three boots (${slotGarbageNoun(sweepRow)}; ` +
+              `${slotGarbageNoun(fresh)}; then ${slotGarbageNoun(rescued)})`,
+          ),
+        );
+      }
+      capture = rescued;
+      verifiedSecond = rescued;
+      serveNote =
+        'the sweep’s row and the fresh-boot read both served garbage — a third boot’s read ' +
+        'is the capture, and the archive’s row is repaired to it';
+    } else {
+      /* The flip: the sweep's boot was swallowed and the fresh boot reads a
+       * real image — the re-read is the capture, and the archive's row is
+       * repaired to it so the run directory stays self-consistent. */
+      capture = fresh;
+      serveNote =
+        'the sweep’s row served garbage and was re-verified — the fresh boot’s read is the ' +
+        'capture';
     }
-    /* The flip: the sweep's arm was swallowed and the fresh arm reads a real
-     * image — the re-read is the capture, and the archive's row is repaired
-     * to it so the run directory stays self-consistent. */
-    capture = fresh;
-    serveNote =
-      'the sweep’s row served garbage and was re-verified — the fresh arm’s read is the capture';
   } else if (!equalBytes(sweepRow, fresh)) {
     const sha1 = await sha256hex(sweepRow);
     const sha2 = await sha256hex(fresh);
     if (!slotReadIsPlausible(fresh)) {
-      /* The fresh arm was swallowed: re-arm ONCE. */
-      const again = await armAndDrainSlot(
-        device,
-        bankEntry,
-        'the active slot’s re-armed read (the bank window)',
-        signal,
+      /* The fresh boot was swallowed: one more admitted boot. */
+      const again = await readBankOnFreshBoot(
+        'the active slot’s re-read (the fresh boot served garbage)',
       );
       if (equalBytes(again, sweepRow)) {
         verifiedSecond = again;
         serveNote =
-          'the fresh arm served garbage and was re-armed once — the re-read agrees with the ' +
-          'sweep’s row';
+          'the fresh boot served garbage and was re-read on another boot — the re-read ' +
+          'agrees with the sweep’s row';
       } else if (!slotReadIsPlausible(again)) {
         fail(
           spentReaderRefusal(
-            `the active slot’s fresh arm served garbage twice (${slotGarbageNoun(fresh)}; then ` +
-              `${slotGarbageNoun(again)})`,
+            `the active slot’s fresh-boot reads served garbage twice (${slotGarbageNoun(fresh)}; ` +
+              `then ${slotGarbageNoun(again)})`,
           ),
         );
       } else {
@@ -1177,8 +1190,8 @@ async function captureAndDerive(
     await sha256hex(verifiedSecond),
   ];
   reporter.log(
-    `the active slot served twice (the sweep’s plan-window row, mode ` +
-      `${String(planEntry.subcmd)}, + one fresh arm of the bank window, mode ` +
+    `the active slot served on two admitted boots (the sweep’s own boot, mode ` +
+      `${String(planEntry.subcmd)}, + one fresh boot of the bank window, mode ` +
       `${String(freshMode)}): ${serveNote} (sha256 ${slotReadShas[1]})`,
     'detail',
   );
@@ -1229,72 +1242,101 @@ async function runBackupStep(
 ): Promise<PreserveStepOutcome> {
   const expectedPrefix = expectedPrefixOf(state);
 
-  const read = await withSession(opener, async (device) => {
+  /* THE VERSION GATE, its own small-read session: GetFirmwareInfo is not the
+   * window reader and answers on any boot. No gate yet — the camera's own
+   * report is the version the run expects from here on. The derived image's
+   * header must agree with it (below). */
+  const version = await withSession(opener, async (device) => {
     assertLive(signal);
-    /* No gate yet — the camera's own report is the version the run expects
-     * from here on. The derived image's header must agree with it (below). */
-    const version = await readVersion(device);
+    const v = await readVersion(device);
     /* THE GENERATION GATE, before a single window read: the 2014 builds older
      * than 0.7.0.7 are outside the widening route (doc 36.7, measured) and
      * this run refuses with that evidence instead of reading anything. */
-    const tooOld = preWideningRefusal(version);
+    const tooOld = preWideningRefusal(v);
     if (tooOld !== null) fail(tooOld);
+    return v;
+  });
+  /* THE SWEEP + CAPTURE: one admitted boot per window (each segment's probe
+   * read IS the boot-config record), the capture on its own admitted boot —
+   * and each completing read ends with the wire reboot that clears the reader
+   * poison (TESTING.md sec. 34). */
+  const read = await (async (): Promise<{
+    version: string;
+    detection: SlotDetection;
+    capture: Uint8Array;
+    slotReadShas: readonly [string, string];
+    readModes: readonly [number, number];
+    serveNote: string;
+    derived: ReturnType<typeof deriveFactoryImage>;
+    repointed: boolean;
+    assembled: Uint8Array;
+  }> => {
+  reporter.log(`camera reports firmware ${version}`, 'detail');
+  const prepareReader = (device: SeekDevice): void => {
     applyReaderOp(device, version);
-    reporter.log(`camera reports firmware ${version}`, 'detail');
+  };
 
-    const backup = await backupWindows(device, reporter, READ_CHUNK, signal);
-    const byAddress = backup.byAddress;
-    const detection = effectiveDetection(state, await detectActiveSlot(device));
-    reporter.log(`slot: ${detection.verdict}`, 'detail');
+  /* THE SWEEP: one admitted boot per window, each segment's probe read IS the
+   * boot-config record, and each completing read ends with the wire reboot
+   * that clears the reader poison (TESTING.md sec. 34). */
+  const backup = await backupWindows(opener, reporter, READ_CHUNK, signal, prepareReader);
+  const byAddress = backup.byAddress;
+  const cfgRow = byAddress.get(0x14010000);
+  if (cfgRow === undefined) fail('the backup does not hold the boot-config block');
+  const detection = effectiveDetection(
+    state,
+    detectActiveSlotFromHead(cfgRow.subarray(0, BOOT_CONFIG_BYTES)),
+  );
+  reporter.log(`slot: ${detection.verdict}`, 'detail');
 
-    let didRepoint = false;
-    let read2 = await captureAndDerive(
-      device,
-      byAddress,
-      detection,
+  let didRepoint = false;
+  let read2 = await captureAndDerive(
+    opener,
+    byAddress,
+    detection,
+    version,
+    expectedPrefix,
+    reporter,
+    signal,
+  );
+  /* The archive rows may have been repaired by the verified-arm ladder (a
+   * swallowed sweep row is replaced by the verified capture). */
+  let archiveRows: ReadonlyMap<number, Uint8Array> = read2.byAddress;
+  /* THE RECOVERY RE-POINT, IN-STEP. A build whose route is recovery-only
+   * (the FF build) cannot run from the cfg-named bank: the 2014 bootloader
+   * rejects its 0xFFFF-sum image at slots A/B and boots the recovery bank
+   * UNCHECKED (doc 35.3) — so the bank that truly runs is recovery, and
+   * the capture that matters is recovery's. The route is only KNOWN once a
+   * capture has been derived, so the first pass may derive from the
+   * cfg-named bank; if it names a recovery-only route, the detection is
+   * re-pointed and the bank that runs is captured and derived in full. */
+  if (read2.derived.patch.route === 'recovery-only' && read2.detection.bank !== 'r') {
+    const repointed = effectiveDetection({ ...state, route: 'recovery-only' }, detection);
+    reporter.log(`slot re-pointed: ${repointed.verdict}`, 'detail');
+    read2 = await captureAndDerive(
+      opener,
+      archiveRows,
+      repointed,
       version,
       expectedPrefix,
       reporter,
       signal,
     );
-    /* The archive rows may have been repaired by the verified-arm ladder (a
-     * swallowed sweep row is replaced by the verified capture). */
-    let archiveRows: ReadonlyMap<number, Uint8Array> = read2.byAddress;
-    /* THE RECOVERY RE-POINT, IN-STEP. A build whose route is recovery-only
-     * (the FF build) cannot run from the cfg-named bank: the 2014 bootloader
-     * rejects its 0xFFFF-sum image at slots A/B and boots the recovery bank
-     * UNCHECKED (doc 35.3) — so the bank that truly runs is recovery, and
-     * the capture that matters is recovery's. The route is only KNOWN once a
-     * capture has been derived, so the first pass may derive from the
-     * cfg-named bank; if it names a recovery-only route, the detection is
-     * re-pointed and the bank that runs is captured and derived in full. */
-    if (read2.derived.patch.route === 'recovery-only' && read2.detection.bank !== 'r') {
-      const repointed = effectiveDetection({ ...state, route: 'recovery-only' }, detection);
-      reporter.log(`slot re-pointed: ${repointed.verdict}`, 'detail');
-      read2 = await captureAndDerive(
-        device,
-        archiveRows,
-        repointed,
-        version,
-        expectedPrefix,
-        reporter,
-        signal,
-      );
-      archiveRows = read2.byAddress;
-      didRepoint = true;
-    }
-    return {
-      version,
-      detection: read2.detection,
-      capture: read2.capture,
-      slotReadShas: read2.slotReadShas,
-      readModes: read2.readModes,
-      serveNote: read2.serveNote,
-      derived: read2.derived,
-      repointed: didRepoint,
-      assembled: assembleBackupImage(archiveRows),
-    };
-  });
+    archiveRows = read2.byAddress;
+    didRepoint = true;
+  }
+  return {
+    version,
+    detection: read2.detection,
+    capture: read2.capture,
+    slotReadShas: read2.slotReadShas,
+    readModes: read2.readModes,
+    serveNote: read2.serveNote,
+    derived: read2.derived,
+    repointed: didRepoint,
+    assembled: assembleBackupImage(archiveRows),
+  };
+  })();
 
   /* THE PRE-FLASH DUMP ARCHIVE, offline from the assembled backup: the same
    * decrypt/report path the `decrypt` command runs on a dump file — the
@@ -1510,49 +1552,56 @@ async function runCommitStep(
    * capture with the plaintext diff folded through — the keystream cancels. */
   const patchedSlot = conjugateCapture(capture, patch);
 
-  const commit = await withSession(opener, async (device) => {
-    assertLive(signal);
-    const version = await gateVersion(device, state);
-    reporter.log(`camera reports firmware ${version}`, 'detail');
+  /* The commit session is ADMITTED like every read session (the mode-3 probe
+   * first — a boot that comes up page-shifted or unreadable is rebooted by
+   * command before anything is staged), and NO reset is sent after: the
+   * session's post-commit flash state is the ground truth, and the wire-89
+   * belongs to the drain step's own first session. */
+  const commit = await (async () => {
+    const { device } = await openProbedSession(opener, reporter, signal, 'the commit session');
+    try {
+      assertLive(signal);
+      const version = await gateVersion(device, state);
+      reporter.log(`camera reports firmware ${version}`, 'detail');
 
-    /* THE PRE-COMMIT READ-BACK (one ask at the bank's head): what is in the
-     * bank RIGHT NOW decides what may be written. A crash between the commit
-     * transfer and its checkpoint leaves this run at nextStep `commit`;
-     * re-running it must never stage a second commit blind. The head carries
-     * the rebalance word (0x238), which is 0 on the original and the nonzero
-     * rebalance on the patched bytes — enough to tell the two apart. The
-     * comparison is against SLOT bytes (what the reader serves): the patched
-     * expectation is the conjugated capture, which is the payload itself on
-     * the plaintext families. */
-    const live = await readBankHead(
-      device,
-      detection.bank,
-      'commit pre-check (the active bank head as it lies)',
-    );
-    if (equalBytes(live, patchedSlot.subarray(0, BANK_HEAD_BYTES))) {
-      fail(
-        'the active bank already holds the patched bytes — the commit landed in a previous ' +
-          'attempt and must not be replayed. Resume at the drain step (--resume), which ' +
-          'boots the patched image and continues from there.',
+      /* THE PRE-COMMIT READ-BACK (one ask at the bank's head): what is in the
+       * bank RIGHT NOW decides what may be written. A crash between the commit
+       * transfer and its checkpoint leaves this run at nextStep `commit`;
+       * re-running it must never stage a second commit blind. The head carries
+       * the rebalance word (0x238), which is 0 on the original and the nonzero
+       * rebalance on the patched bytes — enough to tell the two apart. The
+       * comparison is against SLOT bytes (what the reader serves): the patched
+       * expectation is the conjugated capture, which is the payload itself on
+       * the plaintext families. */
+      const live = await readBankHead(
+        device,
+        detection.bank,
+        'commit pre-check (the active bank head as it lies)',
       );
-    }
-    if (!equalBytes(live, capture.subarray(0, BANK_HEAD_BYTES))) {
-      fail(
-        'the active bank head changed since the backup (it holds neither the original capture ' +
-          'nor the patched bytes) — refusing to write over an unknown bank state. Head hex: ' +
-          `live ${bytesToHex(live, 24)} vs capture ${bytesToHex(capture.subarray(0, 24))}`,
-      );
-    }
+      if (equalBytes(live, patchedSlot.subarray(0, BANK_HEAD_BYTES))) {
+        fail(
+          'the active bank already holds the patched bytes — the commit landed in a previous ' +
+            'attempt and must not be replayed. Resume at the drain step (--resume), which ' +
+            'boots the patched image and continues from there.',
+        );
+      }
+      if (!equalBytes(live, capture.subarray(0, BANK_HEAD_BYTES))) {
+        fail(
+          'the active bank head changed since the backup (it holds neither the original capture ' +
+            'nor the patched bytes) — refusing to write over an unknown bank state. Head hex: ' +
+            `live ${bytesToHex(live, 24)} vs capture ${bytesToHex(capture.subarray(0, 24))}`,
+        );
+      }
 
-    const done = await commitToBank(device, detection.bank, payload, {
-      label: 'preserve commit',
-      reporter,
-      ...(signal === undefined ? {} : { signal }),
-    });
-    /* NO reset in this session: its post-commit flash state is the ground
-     * truth, and the wire-89 belongs to the drain step's own first session. */
-    return done;
-  });
+      return await commitToBank(device, detection.bank, payload, {
+        label: 'preserve commit',
+        reporter,
+        ...(signal === undefined ? {} : { signal }),
+      });
+    } finally {
+      await opener.close(device);
+    }
+  })();
 
   const nextState: PreserveRunState = {
     ...state,
@@ -1635,6 +1684,29 @@ async function runDrainStep(
         chunk: state.drainChunk ?? READ_CHUNK,
         ...(signal === undefined ? {} : { signal }),
       });
+      /* THE PAGE-SHIFT CHECK (TESTING.md sec. 34): a page-shifted boot serves
+       * the widened window one 64 KiB page up, so the dump would start with
+       * the boot-config block's `00 00 00 00` instead of a vector's segment
+       * SP (the bootloader's 0x10018000 unrotated, the image's 0x10008000
+       * rotated). No legitimate part image starts with four zero bytes. The
+       * bias re-rolls per boot, so the camera is rebooted by command and the
+       * attempt loop takes another boot. */
+      if (
+        rawDump[0] === 0 &&
+        rawDump[1] === 0 &&
+        rawDump[2] === 0 &&
+        rawDump[3] === 0
+      ) {
+        reporter.log(
+          'the drain came back one page high (a page-shifted boot — the dump starts with the ' +
+            'boot-config block, not a vector) — rebooting by command and taking another boot',
+          'warn',
+        );
+        await resetDevice(device).catch(() => undefined);
+        rawDump = null;
+        lastError = 'page-shifted boot (rebooting for another)';
+        continue;
+      }
       /* Advisory, AFTER the drain and on what budget remains: the full
        * 4 MiB completion is the liveness proof; the probe only comments on
        * the budget and can stall without meaning anything is wrong. */
@@ -1742,71 +1814,63 @@ async function runRestoreStep(
     payload = stagedFormOf(buildV1Patch(plain), plain);
   }
 
-  const restored = await withSession(opener, async (device) => {
-    assertLive(signal);
-    const version = await gateVersion(device, state);
-    reporter.log(`camera reports firmware ${version}`, 'detail');
-
-    /* The stall path, measured on silicon (TESTING.md secs. 23.3, 28.4): the
-     * drain's asks spend the reader's whole per-arm budget, and the exhausted
-     * reader stays dead — every later wire-79 read stalls at its first read,
-     * the boot-config record first of all, while the same session's version
-     * read still answers. A stall here is that signature, so it carries the
-     * remedy with it. */
-    let now: SlotDetection;
+  /* The restore session is ADMITTED like every read session. After a drain
+   * the reader is completion-poisoned and the mode-3 probe answers blank —
+   * the probe's reboot-and-retry loop clears it by command, which is the
+   * old "power-cycle the camera" remedy, automatic now (TESTING.md sec. 34). */
+  const restored = await (async () => {
+    const { device, cfgHead } = await openProbedSession(
+      opener,
+      reporter,
+      signal,
+      'the restore session',
+    );
     try {
-      now = effectiveDetection(state, await detectActiveSlot(device));
-    } catch (error) {
-      if (isWireStall(error)) {
-        throw new SeekError(
-          'pipeline/refused',
-          'the restore’s first read (the boot-config record) stalled. After a drain that ' +
-            'spent the reader’s whole per-arm budget the reader stays dead — every later ' +
-            'wire-79 read stalls at its first read — until the camera is power-cycled ' +
-            '(TESTING.md secs. 23.3 and 28.4). Power-cycle the camera (unplug and replug it), ' +
-            'then re-run `preserve --resume <run-directory>`.',
-          { cause: error },
+      assertLive(signal);
+      const version = await gateVersion(device, state);
+      reporter.log(`camera reports firmware ${version}`, 'detail');
+
+      const now = effectiveDetection(state, detectActiveSlotFromHead(cfgHead));
+      if (now.bank !== detection.bank || now.bankAddress !== detection.bankAddress) {
+        fail(
+          `the active slot changed between the backup (${detection.bankAddress.toString(16)}) ` +
+            `and now (${now.bankAddress.toString(16)}) — refusing to restore over a different ` +
+            'bank than the one this run patched',
         );
       }
-      throw error;
-    }
-    if (now.bank !== detection.bank || now.bankAddress !== detection.bankAddress) {
-      fail(
-        `the active slot changed between the backup (${detection.bankAddress.toString(16)}) ` +
-          `and now (${now.bankAddress.toString(16)}) — refusing to restore over a different ` +
-          'bank than the one this run patched',
-      );
-    }
 
-    /* Head read (see BANK_HEAD_BYTES): the rebalance word at 0x238 is 0 on
-     * the original and the nonzero rebalance on the patched bytes. */
-    const live = await readBankHead(
-      device,
-      detection.bank,
-      'restore pre-check (the active bank head as it lies)',
-    );
-    if (equalBytes(live, original.subarray(0, BANK_HEAD_BYTES))) {
-      /* A previous restore landed and its checkpoint did not: the recovery is
-       * to mark the step done, not to erase and reprogram the same bytes. */
+      /* Head read (see BANK_HEAD_BYTES): the rebalance word at 0x238 is 0 on
+       * the original and the nonzero rebalance on the patched bytes. */
+      const live = await readBankHead(
+        device,
+        detection.bank,
+        'restore pre-check (the active bank head as it lies)',
+      );
+      if (equalBytes(live, original.subarray(0, BANK_HEAD_BYTES))) {
+        /* A previous restore landed and its checkpoint did not: the recovery is
+         * to mark the step done, not to erase and reprogram the same bytes. */
+        reporter.log(
+          'restore: the bank already holds the original content — nothing to stage',
+          'detail',
+        );
+        return false;
+      }
       reporter.log(
-        'restore: the bank already holds the original content — nothing to stage',
+        'restore: the bank holds something other than the original content — staging the backup ' +
+          'over it (the backup is the authority this run restores from)',
         'detail',
       );
-      return false;
+      await commitToBank(device, detection.bank, payload, {
+        label: 'preserve restore',
+        reporter,
+        ...(signal === undefined ? {} : { signal }),
+      });
+      await resetDevice(device);
+      return true;
+    } finally {
+      await opener.close(device);
     }
-    reporter.log(
-      'restore: the bank holds something other than the original content — staging the backup ' +
-        'over it (the backup is the authority this run restores from)',
-      'detail',
-    );
-    await commitToBank(device, detection.bank, payload, {
-      label: 'preserve restore',
-      reporter,
-      ...(signal === undefined ? {} : { signal }),
-    });
-    await resetDevice(device);
-    return true;
-  });
+  })();
 
   const notes = restored
     ? `original bank content staged back (${String(payload.length)} B${
@@ -1845,13 +1909,11 @@ async function runVerifyStep(
   const attempts = state.postResetAttempts ?? 2;
   let last: Awaited<ReturnType<typeof verifyAgainstBackup>> | null = null;
   for (let n = 1; n <= attempts; n++) {
-    const read = await withSession(opener, (device) => {
-      assertLive(signal);
-      /* The windows re-read through the build's own reader wire (wire 88 on
-       * the 0.7.x builds) — the op comes from the state's pinned version, as
-       * in every step after the backup. */
-      applyReaderOp(device, state.expectedVersion);
-      return verifyAgainstBackup(device, backup, reporter, READ_CHUNK, signal);
+    /* One admitted boot per window — the sweep's own discipline; the reader
+     * op comes from the state's pinned version, as in every step after the
+     * backup. */
+    const read = await verifyAgainstBackup(opener, backup, reporter, READ_CHUNK, signal, (d) => {
+      applyReaderOp(d, state.expectedVersion);
     });
     last = read;
     if (read.badWindows.length === 0) break;
