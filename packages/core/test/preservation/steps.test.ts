@@ -711,6 +711,18 @@ describe('runPreserveStep(backup) — the double read and the derived-image gate
       /* The reads served: the derived plaintext is the synthetic image. */
       expect(await store.load(PRESERVE_PLAIN_NAME)).not.toBeNull();
       expect(state.imageSha256).toBe(await sha256hex(plain));
+
+      /* THE COMMIT SESSION TOO: its admission probe is a window read that runs
+       * BEFORE the version gate, so it must take the run's reader wire from
+       * the state — on 0x4f it stalls four boots and refuses (the regression
+       * the 0.7.0.7 emulator row caught, TESTING.md sec. 36.6). */
+      const patched = await step('patch', camera, state, store);
+      const committed = await step('commit', camera, patched, store);
+      expect(committed.steps.commit?.status).toBe('done');
+      expect(
+        camera.calls.some((c) => c.direction === 'in' && c.op === OP.GET_FEATURED_FIRMWARE_DATA),
+        'no window read may go out on wire 79 against a 0.7.x build, the commit session included',
+      ).toBe(false);
     },
   );
 

@@ -1556,9 +1556,19 @@ async function runCommitStep(
    * first — a boot that comes up page-shifted or unreadable is rebooted by
    * command before anything is staged), and NO reset is sent after: the
    * session's post-commit flash state is the ground truth, and the wire-89
-   * belongs to the drain step's own first session. */
+   * belongs to the drain step's own first session. The probe is a window
+   * read, so it runs on the run's reader wire: it comes BEFORE the version
+   * gate that would otherwise set it, and on a 0.7.x build wire 79 stalls. */
   const commit = await (async () => {
-    const { device } = await openProbedSession(opener, reporter, signal, 'the commit session');
+    const { device } = await openProbedSession(
+      opener,
+      reporter,
+      signal,
+      'the commit session',
+      (d) => {
+        applyReaderOp(d, state.expectedVersion);
+      },
+    );
     try {
       assertLive(signal);
       const version = await gateVersion(device, state);
@@ -1824,6 +1834,10 @@ async function runRestoreStep(
       reporter,
       signal,
       'the restore session',
+      (d) => {
+        /* The probe is a window read: the run's reader wire, as at commit. */
+        applyReaderOp(d, state.expectedVersion);
+      },
     );
     try {
       assertLive(signal);
