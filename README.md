@@ -224,16 +224,16 @@ runs.
 
 ### The supported builds
 
-| Build                                                    | Family       | Patch                                                              | Staged form                        | Restore                 | Drain (whole part)                                                                                                                                                                                                              |
-| -------------------------------------------------------- | ------------ | ------------------------------------------------------------------ | ---------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0                      | v1-2014      | widen + the 3-halfword reader trio, word 142 rebalanced            | plain (the capture, conjugated)    | capture verbatim        | yes — one widened-window arm; byte-exact at the 64-byte ask                                                                                                                                                                     |
-| Compact 0.9.0.2 / 0.9.0.6 / 0.9.0.7 / 0.9.1.0 / 0.10.0.0 | v1-2014      | widen + the reader trio (per-layout offsets), word 142 rebalanced  | plain                              | capture verbatim        | yes — 10 bytes move; full in-place proven on the emulator (doc 36.4); stock cap 65,536 B/arm                                                                                                                                    |
-| Compact 0.8.0.0 / 0.7.0.8                                | v1-2014      | widen + trio + the mode-2 indirection nop (12 bytes)               | plain                              | capture verbatim        | yes — the nop site MUST be committed before any mode-2 arm (the factory mode 2 arms `*(0x14000000)` and faults under an armed read); full in-place through ip3; the ip4 boot-back stage is open (transport timeouts, doc 36.10) |
-| Compact 0.7.0.7                                          | v1-2014      | widen + trio (9 bytes, word 142 := `0x00009240`)                   | plain                              | capture verbatim        | yes — reads on **wire 88**, and the widened window serves the part ROTATED from the slot the cfg does not name (slot B on the donor); the drain unrotates; full in-place incl. the boot-back (doc 36.4.2)                       |
-| Compact 1.3.0.8 (8 Hz "insecure")                        | v1-2014      | widen only (the 2017 reader is already 32-bit; no guard), `0x3000` | plain                              | capture verbatim        | yes — proven in-place on the 2014 donor                                                                                                                                                                                         |
-| Compact 1.3.0.8 FF (16 Hz)                               | v1-2014-ff   | guard + widen, word 142 := `0x485523E8` (the accept solve)         | plain ⊕ ks0 ⊕ ksD (two keystreams) | **refused** (see below) | commit + drain proven **through the recovery slot only**; the in-place variant is derived, not run                                                                                                                              |
-| Compact Pro 1.0.3.0 (9 Hz)                               | compact-2016 | guard + widen (by shape), `0xF1003000`                             | plain ⊕ ks(block 0)                | factory image, staged   | yes — the doc-33 chain                                                                                                                                                                                                          |
-| Compact Pro 1.0.3.2 (9 Hz and 18 Hz FF)                  | compact-2016 | guard + widen + the arm-tail hook nop, `0x29FD6B0F`                | plain ⊕ ks(block 0)                | factory image, staged   | **refused** — 128 B is the lossless read unit and the EP0 sessions die at ~64–81 KB; backup → patch → commit → restore → verify only                                                                                            |
+| Build                                                    | Family       | Patch                                                                | Staged form                        | Restore                 | Drain (whole part)                                                                                                                                                                                                              |
+| -------------------------------------------------------- | ------------ | -------------------------------------------------------------------- | ---------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Compact 1.0.0.0 / 1.2.0.0 / 1.3.0.0                      | v1-2014      | widen + reader trio + arm cursor reset, word 142 rebalanced          | plain (the capture, conjugated)    | capture verbatim        | yes — one widened-window arm; byte-exact at the 64-byte ask                                                                                                                                                                     |
+| Compact 0.9.0.2 / 0.9.0.6 / 0.9.0.7 / 0.9.1.0 / 0.10.0.0 | v1-2014      | widen + trio (per-layout offsets) + arm cursor reset, word 142       | plain                              | capture verbatim        | yes — 13 bytes move; full in-place proven on the emulator (doc 36.4); stock cap 65,536 B/arm                                                                                                                                    |
+| Compact 0.8.0.0 / 0.7.0.8                                | v1-2014      | widen + trio + arm cursor reset + the mode-2 nop (15 bytes)          | plain                              | capture verbatim        | yes — the nop site MUST be committed before any mode-2 arm (the factory mode 2 arms `*(0x14000000)` and faults under an armed read); full in-place through ip3; the ip4 boot-back stage is open (transport timeouts, doc 36.10) |
+| Compact 0.7.0.7                                          | v1-2014      | widen + trio + arm cursor reset (10 bytes, word 142 := `0x0000B300`) | plain                              | capture verbatim        | yes — reads on **wire 88**, and the widened window serves the part ROTATED from the slot the cfg does not name (slot B on the donor); the drain unrotates; full in-place incl. the boot-back (doc 36.4.2)                       |
+| Compact 1.3.0.8 (8 Hz "insecure")                        | v1-2014      | widen only (the 2017 reader is already 32-bit; no guard), `0x3000`   | plain                              | capture verbatim        | yes — proven in-place on the 2014 donor                                                                                                                                                                                         |
+| Compact 1.3.0.8 FF (16 Hz)                               | v1-2014-ff   | guard + widen, word 142 := `0x485523E8` (the accept solve)           | plain ⊕ ks0 ⊕ ksD (two keystreams) | **refused** (see below) | commit + drain proven **through the recovery slot only**; the in-place variant is derived, not run                                                                                                                              |
+| Compact Pro 1.0.3.0 (9 Hz)                               | compact-2016 | guard + widen (by shape), `0xF1003000`                               | plain ⊕ ks(block 0)                | factory image, staged   | yes — the doc-33 chain                                                                                                                                                                                                          |
+| Compact Pro 1.0.3.2 (9 Hz and 18 Hz FF)                  | compact-2016 | guard + widen + the arm-tail hook nop, `0x29FD6B0F`                  | plain ⊕ ks(block 0)                | factory image, staged   | **refused** — 128 B is the lossless read unit and the EP0 sessions die at ~64–81 KB; backup → patch → commit → restore → verify only                                                                                            |
 
 Three 0.x-specific facts the plan print states and the gates enforce:
 
@@ -291,12 +291,19 @@ Two build-specific facts the plan print states and the gates enforce:
 
 ### The patch, and the ciphertext rule
 
-The patch is four instruction edits in the build's own update machinery (the reader-window
-widening `mov.w r3,#0x10000 → #0x400000` and the three halfword loads/stores of the wire-79
-reader's 32-bit cursor that wrapped every 64 KiB), plus one free header word rebalanced so the
-bootloader's plaintext word-sum check still passes. Together they move exactly **ten bytes** on
-the part: 0x238, 0x239, 0x23B, 0x3C1C, 0x3C1D, 0x3C68, 0x3C69, 0x3C70, 0x3C71, 0x3DB7 (bank-
-relative).
+The patch is five instruction edits in the build's own update machinery, plus one free header
+word rebalanced so the bootloader's plaintext word-sum check still passes:
+
+- the reader-window widening, `mov.w r3,#0x10000 → #0x400000`;
+- the three halfword loads/stores of the wire-79 reader's cursor, which wrapped every 64 KiB;
+- the arm tail's cursor reset, `strh r5,[r4,#12] → str r5,[r4,#12]`. Without it, the arm zeroes
+  only the low half of the now 32-bit cursor. After a read that crosses 64 KiB, every later
+  window is served pages too far up, and after the drain every read stalls until a power cycle
+  (TESTING.md §35.4, §36).
+
+Together they move exactly **thirteen bytes** on the part: 0x238..0x23B, 0x3C1C, 0x3C1D, 0x3C68,
+0x3C69, 0x3C70, 0x3C71, 0x3DB7, 0x3DC6, 0x3DC7 (bank-relative). The 0.x line carries the same
+arm-tail edit at its own offsets (see the table above).
 
 A flash slot does not hold the firmware image; it holds the image XOR a keystream. The wire-79
 reader serves those SLOT BYTES. Pasting the new plaintext bytes into a ciphertext capture corrupts
@@ -399,7 +406,12 @@ time; the run there is self-sourced exactly as the CLI's is — the image comes 
 active slot, never from a file the person picked — and each completed step re-issues a
 downloadable `preserve-run-<runId>.zip` (the run state plus every checkpoint produced so far,
 the derived plaintext included), from which the run resumes. The commit session never resets; the
-drain step owns the wire-89 and waits out the ~10 s reboot by itself ("camera rebooting…").
+drain step owns the wire-89 and waits out the reboot ("camera rebooting…"). This camera has no USB
+serial number, so Chrome forgets it on every reboot: when the log asks, press "Connect device" and
+pick it again, and the phase continues by itself. A run whose committed patch predates the
+arm-tail cursor reset (the fifth site) ends Patch & dump by asking you to unplug the camera and
+plug it back in: without that site the drain leaves the reader dead until it is powered off. With
+it, the restore reads on the same boot and no replug is asked for.
 
 ## Operation mode 0, and why a cold camera used to hang
 

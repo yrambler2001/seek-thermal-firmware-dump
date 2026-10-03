@@ -5049,3 +5049,300 @@ ladder flips on a swallowed sweep row and refuses garbage on three boots.
 `pipeline.emulator.test.ts` — the whole P1→P4 pipeline through the segmented sweep (the
 emulator's single-import usbip server: every wire stage owns its attach; withFreshSessions
 hands the work the emulator, not a held session).
+
+## 35. The reset wait that never asked for the click, and the drained reader four wire reboots did not revive (2026-10-03)
+
+Run `preserve-2026-10-03T19-09-25Z` (the web wizard, Chrome on macOS, the bench Compact
+1.3.0.0) ended green: delivered dump sha `40447c7e…` (the J-Link sha of sec. 34), verify 31/31
+windows at 0 differing bytes. Two things went wrong on the way, both visible in the run's own
+log and in the timestamps its run files carry.
+
+### 35.1 The opener ladder read a snapshot of the device seat
+
+**What happened.** Phase ② logged `camera did not open (… The device was disconnected.) —
+retrying for up to 10 min` and `the camera left the bus — the reset was expected`, then sat
+silent until the operator thought to press "Connect device". The "press Connect device"
+instruction dbc7d8f added never appeared.
+
+**Why.** The ladder in `makeOpener` checked `device.device === null` on the `DeviceHandle` the
+phase was started with. That handle is a render's snapshot: its `.device` is the USBDevice that
+dropped, never null, so neither the `getDevices()` re-adopt nor the instruction could fire.
+`makeTransport` was not affected (it reads `useDevice`'s ref), which is why the click, once
+made, did resume the phase.
+
+**The fix.** The ladder reads the seat through a ref refreshed every render.
+
+**The premise, corrected.** Sec. 30.2's "this needs no user gesture — the permission from the
+first open carries" does not hold for this camera. Chrome stores a persistent WebUSB grant only
+for a device with a non-empty serial; this one's serial reads as `""` (sec. 21.1), so its grant
+is ephemeral, tied to one enumeration, and every reboot needs the Connect click. No grant for
+vendor 0x289D was persisted in the bench browser profile. Phase ① needed no click on this run
+only because none of its probes rebooted the camera: the backup took 41 s (31 windows plus the
+double read), the verify 43 s. Sec. 34's completion poison did not show on either sweep.
+
+### 35.2 The drained reader, and four wire reboots that did not take
+
+**What happened.** Phase ③'s first run, right after phase ②'s drain, logged `the restore
+session: the reader probe stalled — rebooting by command and retrying` four times, then the
+power-cycle refusal (restore failed at 19:12:20.5Z). There was no `camera did not open` line and
+no `left the bus` line between the attempts. In Chrome a reboot always drops the unit, and a
+dropped unit cannot be reopened without the click, so none of the four wire-89 reboots took: the
+camera stayed on the bus with its reader dead. The operator did NOT replug the camera; they
+re-selected it in "Connect device" and re-ran the phase. The re-run 14 s later (restore
+19:12:34Z) admitted on its first probe, staged the capture, committed, reset, and verify ran
+green. Whether the camera rebooted on its own in those 14 s (a re-select is only needed after a
+drop) or its reader recovered in place is not recorded.
+
+**What it means.** Sec. 28.4 met this stall (the exhausted 4 MiB arm, `control IN 0x4f ->
+stall`) and cleared it with a port power cycle. Sec. 34.3 then claimed that the probe's wire
+reboot clears it automatically. That claim extrapolated the stock completion-poison measurement
+and was never measured on a drained, patched boot. This run measured it, and it does not hold.
+
+**What changed.** The probe's stall line now carries the wire's own answer (stall, timeout or
+disconnect), and a detail line records whether the reboot command was acknowledged or not sent,
+so the next occurrence says what the camera answered instead of only that it failed. In the
+wizard, the power-cycle refusal's hint gives the browser's remedy (replug, "Connect device",
+run the phase again) instead of the CLI's `--resume`. The pipeline order is unchanged.
+
+### 35.3 Phase ② ends with the replug
+
+The wizard no longer leaves the drained reader for phase ③ to find. Once the drain is recorded
+and the run file saved, phase ② asks the operator to unplug the camera, plug it back in and
+press "Connect device", and it watches for that to happen. The camera must leave the bus (the
+guard records the departure, so a quick replug between two polls still counts), then a camera
+must fill the seat again. Only then does the phase report done, and the restore starts on a
+fresh boot. The count check runs on that arrival as well: with two authorized cameras on the bus,
+the phase ends with a warning to leave only the patched unit connected. A cancelled wait, or ten
+minutes with no replug, ends the phase without saving the run file again and without recording a
+failure. It leaves a warning that the replug is still owed. Phase ③'s wire-reboot loop and its
+power-cycle refusal stay in place for a run resumed in a fresh tab. The CLI is unchanged.
+
+The phase copy was corrected with it. Phase ①'s "about seven minutes, the camera rebooting
+between windows" described sec. 34's model; every phase ① on this bench since that rebuild took
+41-43 s with no reboot at all (runs 12-25-04Z, 12-30-23Z, 19-09-25Z, 19-48-23Z). The copy now
+says the probe reboots only a spent or page-shifted reader, and that each reboot needs the
+Connect click in Chrome. The step 1 runs between 10:45Z and 12:02Z that failed with "the camera
+did not come back after 60 s" were that click, never asked for.
+
+Those no-reboot sweeps are byte-exact. All 31 windows of runs 12-30-23Z, 19-09-25Z and 19-48-23Z
+are identical to the J-Link dump (sha `40447c7e…`): 93 full 65,536-byte reads, the last byte
+included, with no reboot in between.
+
+### 35.4 The completion poison was the patched firmware's
+
+Read-only probes on the bench camera (CLI, one boot, 2026-10-03 ~20:15Z) do not reproduce sec.
+34.1's completion poison at all:
+
+- **Small check after a full read, on one session.** A full m3 read, then a 28-byte m3 read on
+  the same session, right after and again 3 s later: both are the cfg record. A close and reopen
+  between them sends only `releaseInterface`/`close`, then `open`/`claimInterface`. No
+  SET_CONFIGURATION is sent, because the configuration was already 1.
+- **`probe-poison`'s exact sequence, on ONE session.** m3 28 B, m7 64 B, then full m3, m7, m3,
+  m5, m7 reads: every full read is byte-identical to the J-Link dump. `probe-poison`'s m5 "blank"
+  was correct all along, since 0x14030000 is erased in the J-Link dump too. Its m7/m3/m7 blanks
+  were the real failures.
+- **Over-read.** A read 64 B past a window's end stalls at exactly 0x10000
+  (`control IN 0x4f -> stall`): the per-arm counter is real. But the next arm, on the same
+  session, serves correct bytes, and so does a reopen. On stock firmware the counter closes the
+  window cleanly, and every arm restarts it.
+
+What differed was the firmware. Run `2026-10-01T22-53-26Z` committed the patch to bank A at
+22:56:04Z and stopped there (`nextStep: drain`). There was no drain and no restore, so from then
+on the camera booted the PATCHED image. Bank A was still patched at 11:36Z on Oct 3
+(`probe-oneshoot`: bank A the one window of 31 that differed from the factory image), and it was
+factory again by the 12:25Z backup. Every observation of the poison (`probe-poison` at 00:21Z,
+`probe-reset` at 01:16Z) falls inside that window. So does every failed phase ① from 2026-10-02
+15:41Z to 2026-10-03 12:13Z, including the 12:10Z refusal that the active slot "does not yield
+the factory plaintext". Every run and probe since then has read full windows cleanly.
+
+**The mechanism, read from the 1.3.0.0 image itself.** The reader keeps one descriptor in RAM
+at 0x10002CC0: +8 bytes remaining, +12 the position, +16 the limit, +20 the base, +28 the state.
+BeginFirmwareUpgrade's shared tail (every mode branches to 0x1008411A) sets remaining and limit
+to 0x10000 and zeroes the position with `strh r5,[r4,#12]` at 0x1008412E, a HALFWORD store. On
+stock firmware the reader treats the position as a halfword too (`ldrh`/`strh` at 0x10083F84,
+0x10083FD0, 0x10083FD8). It wraps to 0 at 64 KiB, and remaining reaching 0 closes the window:
+that is the over-read stall above.
+
+The patch's three cursor sites make the reader load and store the position as a WORD, and its
+widen site raises remaining and limit to 0x400000. The setup's `strh` is not patched, and neither
+are the other halfword accesses to +12 elsewhere in the update code. Nothing in the stock image
+touches +13..+15 near the descriptor, so the upper half is zero at boot and only the patched
+reader ever sets it. Once a read carries the position past 0xFFFF (one full 64 KiB window), the
+upper half sticks: the next arm zeroes only the low half. Every later window is then served from
+base + (upper half)·0x10000, one page further for each full window read before it. That is the
+page-walk, and its blanks are the erased blocks it walks into. Reads that stop short of 64 KiB
+never carry, which is why the 65,000- and 65,535-byte probes were always clean.
+
+After the 4 MiB drain the position is 0x400000, equal to the limit. Every later read then fails
+the reader's `position + n > limit` check at 0x10083F90, which zeroes the state and returns an
+error: the dead reader after the drain (secs. 28.4 and 35.2). Only a reboot reinitializes the
+RAM. (Why the wire-89 reboot did not take in that state in sec. 35.2 is not explained by this.)
+
+The same arithmetic predicts an older emulator measurement exactly; the emulator executes this
+firmware. The probe-then-drain run of 2026-09-24 (BRANCH_NOTES) stalled at 4,063,232 B. The
+probe had read 0x21000 B. The drain's arm zeroed the low half, leaving the position at 0x20000,
+and the drain then ran until 0x20000 + n > 0x400000: 0x3E0000 = 4,063,232 B. The per-arm budget
+explanation predicted 4 MiB − 0x21000 = 4,059,136 B.
+
+**What would remove it.** A fifth patch site, `strh r5,[r4,#12]` → `str r5,[r4,#12]` at
+0x1008412E (raw 0x3DC6, `a5 81` → `e5 60`), would make every arm zero the whole position. It is
+not applied: it changes the committed bytes (the ten-byte diff set and the rebalance word), and
+it needs the emulator suite and a hardware run before it is trusted.
+
+The pipeline needs no change for this. On stock firmware the admission probe always passes, so
+no reboot happens. A run that finds the camera already patched (a run abandoned after its commit)
+still gets the probe's reboots and refusals. Phase ② ends with the replug because the drain runs
+on the patched image.
+
+### 35.5 What the tests pin
+
+`usePreservePanel.adoption.test.tsx` adds a phase-② row for Chrome's real behavior: the unit
+drops mid-phase, no `connect` event follows, `getDevices()` answers empty, and the drain opens
+its session through the wizard's REAL opener ladder after the drop. The row asserts that the
+instruction and the status line appear while the phase keeps waiting, and that a chooser pick
+then resumes and completes the phase. On the old hook the row times out (the instruction never
+comes); it passes now. The phase-② rows now finish through the replug: the ask comes after the
+run file is saved, the unplug and the Connect click complete the phase without a second save,
+a cancelled wait keeps the drain recorded and names the replug still owed, and two authorized
+cameras after the replug end the phase with the warning. `hints.test.ts` maps a power-cycle
+refusal to the wizard's remedy and leaves other `pipeline/refused` refusals without advice.
+
+## 36. The fifth site: the arm tail's cursor reset, A/B on the emulator and through the pipeline (2026-10-03)
+
+### 36.1 The A/B
+
+Sec. 35.4 named the missing site. This section measured it before it went anywhere near the
+camera. The vendored 1.3.0.0 part was booted with `--flash`, with bank A replaced by the patched
+image: the camera after a commit and a reboot. Both variants then ran the same reads, on one
+session per boot.
+
+| Read                                       | four sites (as shipped)       | five sites                    |
+| ------------------------------------------ | ----------------------------- | ----------------------------- |
+| boot 1: m3 28 B probe on the fresh boot    | the cfg record                | the cfg record                |
+| boot 1: full m3, then full m7              | m7 served an erased block     | m7 served bank A (0x14050000) |
+| boot 1: full m3 again, then the m3 probe   | erased block; probe `ff ff …` | block 0x14010000; the record  |
+| boot 2: the 4 MiB mode-2 drain             | byte-identical to the part    | byte-identical to the part    |
+| boot 2: m3 probe after the drain (restore) | `control IN 0x4f -> stall`    | the cfg record                |
+| boot 2: full m7 after the drain            | `control IN 0x4f -> stall`    | bank A, byte-exact            |
+
+The four-site column is the bench camera's history replayed in the emulator, which runs this
+firmware. The first rows are `probe-poison`'s page-walk into erased blocks; the last two are the
+post-drain stall of secs. 28.4 and 35.2, with the same wire answer.
+
+### 36.2 The site
+
+`strh r5,[r4,#12]` → `str r5,[r4,#12]` at raw 0x3DC6 (VMA 0x1008412E), bytes `a5 81` → `e5 60`,
+now the fifth entry of `V1_2014_PATCH_SITES` (1.0.0.0, 1.2.0.0, 1.3.0.0). The patch now moves
+**thirteen** bytes: 0x238..0x23B, 0x3C1C, 0x3C1D, 0x3C68, 0x3C69, 0x3C70, 0x3C71, 0x3DB7,
+0x3DC6, 0x3DC7. Word 142 becomes `0x50C06240` (it was `0x30006240`), and all four of its bytes
+now move. The diff set and the rebalance word were computed independently of the builder and
+agree on all three images. The patched plaintext sha is `8473b5e4…`, and the post-commit part
+sha is `b22e9e20a9928241348c089f4e046c62f8a3f73db0ecb29dd2ce17eaa1cb6dcd`. The four-site part
+was `7ada1be6…`, the sha secs. 28 and 35 measured on hardware.
+
+All eleven trio builds (0.7.0.7 to 1.3.0.0) carry the identical arm tail, with this site 0x12
+past their widen site (checked on every corpus image). The 0.x profiles get it too (sec. 36.5).
+
+### 36.3 Through the pipeline (emulator)
+
+`pipeline.emulator.test.ts`, with the five-site patch built by the pipeline itself. The corpus
+entry in detail:
+
+- **P1+P2:** green. The commit moved exactly the thirteen bytes, inside bank A only.
+- **P3:** green. Round 0 hit the documented same-server post-reset wedge (sec. 23.4,
+  `GetOperationMode` stalls), and round 1 drained on a fresh server. Raw == post-commit
+  `b22e9e20…`; delivered == as-booted `40447c7e…`, 0 diffs.
+- **The advisory probe after the drain** now reports the widened window live. Under the
+  four-site patch it always stalled, and the suite recorded that as expected.
+- **The new assertion:** a mode-3 arm on the drain's own boot, after the probe's own arm, returns
+  the boot-config record exactly as P1 read it.
+- **P4:** green. The restored part == as-booted over the whole 4 MiB, and verify found 0 diffs.
+
+The four J-Link dump cases ran the same way and are all green through P4, the post-drain
+assertion included. Each case's restore lands exactly on its own dump:
+
+| Case    | Raw (post-commit) sha | Restored == as-booted sha |
+| ------- | --------------------- | ------------------------- |
+| `1.bin` | `f940e9e9…`           | `37f5f983…`               |
+| `2.bin` | `3ce5d9b7…`           | `6d94b089…`               |
+| `4.bin` | `67109b14…`           | `059931aa…`               |
+| `6.bin` | `b22e9e20…`           | `40447c7e…`               |
+
+The `3.bin` negative case still refuses (it reports firmware 4.8.2.1). `resume.emulator.test.ts`,
+the crash-and-resume run pinned to `b22e9e20…`, is green: 24 passed across the two files. Every
+P3 round 0 hit the same sec. 23.4 post-reset wedge, and every round 1 drained on a fresh server.
+That is the suite's documented shape, not the patch: the A/B above cold-boots the same image
+and reads it at once.
+
+### 36.4 The wizard
+
+Phase ② asks for the replug only when the committed patch lacks the site.
+`clearsArmCursor` checks the run state's recorded sites by their bytes, so a run file written
+before this change, and any resume of one, still gets the replug. A run committed with the fifth
+site goes straight on, and phase ③'s restore reads on the drain's own boot. That makes the first
+hardware run with the fifth site its hardware test as well. If the restore's probe stalls
+anyway, the probe's reboot loop, the power-cycle refusal and its wizard hint are all still there.
+
+### 36.5 The 0.x line
+
+`zeroXProfile` locates the site at widen + 0x12, gated on its `a5 81` before-bytes, on all eight
+0.x builds. The builder and an independent offline computation agree on every build's diff set
+and rebalance word:
+
+| Builds                                  | Bytes | Word 142     | Sites (raw)                                 |
+| --------------------------------------- | ----- | ------------ | ------------------------------------------- |
+| 0.9.0.2, 0.9.0.6, 0.9.1.0, 0.10.0.0 (A) | 13    | `0x50C06240` | widen 0x3DCC, trio, reset 0x3DDE            |
+| 0.9.0.7 (A, the 1.x offsets)            | 13    | `0x50C06240` | widen 0x3DB4, trio, reset 0x3DC6            |
+| 0.7.0.8 (B), 0.8.0.0 (B)                | 15    | `0x50C00B5B` | widen, trio, reset 0x3C3E / 0x3D76, the nop |
+| 0.7.0.7 (C)                             | 10    | `0x0000B300` | widen 0x3C86, trio, reset 0x3C98            |
+
+0.7.0.7's rebalance word now moves one byte, where it moved two before. `families.test.ts` pins
+the sites, diffs, rebalance, sum16 and staged sha per build.
+
+`families.emulator.test.ts` re-ran its three 0.x rows, one per layout, as full in-place runs:
+self-sourced backup, five-site commit, whole-part drain, restore and verify. All three are green,
+and each restored `.final` equals its as-booted part with 0 diffs:
+
+| Row               | Raw (served) sha | Delivered == as-booted sha |
+| ----------------- | ---------------- | -------------------------- |
+| 0.9.0.7           | `59dc9d95…`      | `42f87074…`                |
+| 0.8.0.0 (the nop) | `1d86551d…`      | `b3d69955…`                |
+| 0.7.0.7 (wire 88) | `1b3fb9ba…`      | `4a708830…`                |
+
+The 0.7.0.7 raw dump is the rotated serve. The other five builds share their layout's code
+byte-for-byte around every site and are covered by the unit pins.
+
+Each build's capability note now labels doc 36's shas as the four-site set's, and states the
+fifth site. I could not reproduce those historical shas offline from the corpus donor splice, so
+the notes keep them as records of doc 36's runs rather than recomputing them.
+
+These rows restore on a warm server booted from the committed state, as they always have. The
+"reads on the drain's own boot" property is asserted by the 1.3.0.0 pipeline suite (sec. 36.3)
+and the A/B (sec. 36.1).
+
+### 36.6 The 0.7.x commit and restore probes read on the wrong wire
+
+The 0.7.0.7 row's first run failed in the COMMIT session: "the reader probe failed on 4
+consecutive boots". The backup and patch had passed. Sec. 34's rebuild (`7369a65`) put an
+admission probe, a mode-3 window read, ahead of the commit's and the restore's version gate, and
+the version gate is what calls `applyReaderOp`. On a 0.7.x build the probe therefore read on
+wire 79, which stalls on that generation (doc 36.5.0). It burned four boots and refused, so
+0.7.0.7 and 0.7.0.8 could not commit or restore at all since that commit. The backup, drain and
+verify sessions were unaffected, because they pass the reader op into their probes.
+
+The fix passes `applyReaderOp(d, state.expectedVersion)` as the probe's `prepare` in both
+sessions. The re-run row is green (above). `steps.test.ts`'s 0.7.0.7 row now runs patch and
+commit too, and asserts that no read went out on wire 79. It fails on the unfixed code and passes
+now.
+
+### 36.7 What the tests pin
+
+- `patch.test.ts`: thirteen bytes and the rebalance `0x50C06240`.
+- `steps.test.ts`: thirteen bytes through the fake camera.
+- `pipeline.emulator.test.ts`: the post-drain head on the drain's boot equals P1's cfg row, and
+  the raw pin is `b22e9e20…`.
+- `resume.emulator.test.ts`: the raw pin `b22e9e20…`.
+- `usePreservePanel.adoption.test.tsx`: a fifth-site patch ends phase ② with no replug.
+- `families.test.ts`: the eight 0.x builds' five-site pins (sec. 36.5).
+- `families.emulator.test.ts`: the three layout rows' five-site diff sets.
+- `steps.test.ts`: the 0.7.0.7 commit session stays on wire 88 (sec. 36.6).
