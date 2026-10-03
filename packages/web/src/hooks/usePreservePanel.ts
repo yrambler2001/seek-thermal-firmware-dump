@@ -252,9 +252,20 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
               }
               /* A missed `connect` event must not strand the run: the camera
                * re-enumerates while the page holds nothing, and getDevices()
-               * finds it without any event or gesture. */
+               * finds it without any event or gesture. Both outcomes are
+               * logged, so a browser that cannot see the bus is visible in
+               * the wizard's own log. */
               if (device.device === null) {
-                await device.reattach();
+                const reattached = await device.reattach();
+                if (reattached) {
+                  rep.log('the camera is back on the bus — re-adopted it', 'ok');
+                } else if (attempt % 10 === 9) {
+                  rep.log(
+                    `the browser still reports no authorized camera on the bus ` +
+                      `(${String(attempt + 1)} s)`,
+                    'warn',
+                  );
+                }
               }
             }
             await waitMs(1000, signal);
