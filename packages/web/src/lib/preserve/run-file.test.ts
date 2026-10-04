@@ -3,12 +3,13 @@
  * state and the same bytes come back out — and a damaged or foreign archive
  * is refused rather than half-resumed. The version-2 state round-trips with
  * its self-sourcing fields, and the derived factory plaintext
- * (`preserve_image_plain.bin`) is a checkpoint like the rest.
+ * (`preserve_image_plain.bin`) is a checkpoint like the rest. Each step's
+ * files sit in that step's folder, and the older flat run files still load.
  */
 
 import { crc32, equalBytes, utf8 } from '@seek-fw/core';
 import { describe, expect, it } from 'vitest';
-import { buildRunFile, parseRunFile, parseZipEntries } from './run-file';
+import { buildRunFile, parseRunFile, parseZipEntries, RUN_README_FILE } from './run-file';
 import { runFileName, type CheckpointName, type PreserveRunState } from './types';
 
 function state(overrides: Partial<PreserveRunState> = {}): PreserveRunState {
@@ -150,9 +151,70 @@ describe('the run-file round trip', () => {
     const entries = parseZipEntries(zip);
     expect(entries.map((entry) => entry.name)).toEqual([
       'preserve_run.json',
-      'preserve_backup_windows.bin',
-      'preserve_bank_capture.bin',
+      'README.md',
+      '02-read-build/preserve_backup_windows.bin',
+      '02-read-build/preserve_bank_capture.bin',
     ]);
+  });
+
+  it('files every checkpoint in its step’s folder, and the README names the complete image', () => {
+    const all = new Map<CheckpointName, Uint8Array>([
+      ...CHECKPOINTS,
+      ['preserve_patch_plain_patched.bin', utf8('patched')],
+      ['preserve_dump_postwrite.bin', utf8('raw')],
+      ['preserve_dump_original.bin', utf8('delivered')],
+      ['preserve_verify_windows.bin', utf8('re-read')],
+    ]);
+    const extra = new Map([['02-read-build/decrypted/slot.bin', utf8('plain slot')]]);
+    const zip = buildRunFile(state({ deliveredSha256: '9'.repeat(64) }), all, extra);
+    const names = parseZipEntries(zip).map((entry) => entry.name);
+    expect(names).toEqual([
+      'preserve_run.json',
+      'README.md',
+      '02-read-build/preserve_backup_windows.bin',
+      '02-read-build/preserve_bank_capture.bin',
+      '02-read-build/preserve_image_plain.bin',
+      '02-read-build/preserve_patch_plain_patched.bin',
+      '03-patch-dump/preserve_dump_postwrite.bin',
+      '03-patch-dump/preserve_dump_original.bin',
+      '04-restore-verify/preserve_verify_windows.bin',
+      '02-read-build/decrypted/slot.bin',
+    ]);
+    const readme = new TextDecoder().decode(
+      parseZipEntries(zip).find((entry) => entry.name === RUN_README_FILE)?.data,
+    );
+    expect(readme).toContain('03-patch-dump/preserve_dump_original.bin');
+    expect(readme).toContain('9'.repeat(64));
+
+    /* The round trip finds every checkpoint by name, and the README is
+     * regenerated rather than carried as a stray file. */
+    const parsed = parseRunFile(zip);
+    expect([...parsed.checkpoints.keys()].sort()).toEqual([...all.keys()].sort());
+    expect([...parsed.extra.keys()]).toEqual(['02-read-build/decrypted/slot.bin']);
+  });
+
+  it('an older flat run file still loads, and re-saves in the folder layout', () => {
+    const json = utf8(JSON.stringify(state()));
+    const flat = handZip([
+      { name: 'preserve_run.json', data: json },
+      { name: 'preserve_backup_windows.bin', data: utf8('31 windows') },
+      { name: 'decrypted/slot.bin', data: utf8('plain slot') },
+      { name: 'manifest.json', data: utf8('{}') },
+      { name: 'README.md', data: utf8('# Decrypted Seek Thermal Firmware') },
+    ]);
+    const parsed = parseRunFile(flat);
+    expect([...parsed.checkpoints.keys()]).toEqual(['preserve_backup_windows.bin']);
+    expect([...parsed.extra.keys()].sort()).toEqual([
+      '02-read-build/README.md',
+      '02-read-build/decrypted/slot.bin',
+      '02-read-build/manifest.json',
+    ]);
+    const names = parseZipEntries(buildRunFile(parsed.state, parsed.checkpoints, parsed.extra)).map(
+      (entry) => entry.name,
+    );
+    expect(names).toContain('02-read-build/preserve_backup_windows.bin');
+    expect(names).toContain('02-read-build/decrypted/slot.bin');
+    expect(names.filter((name) => name === 'README.md')).toHaveLength(1);
   });
 
   it('unknown files ride along in extra and survive a rebuild', () => {
@@ -166,10 +228,14 @@ describe('the run-file round trip', () => {
     expect(parseRunFile(rebuilt).extra.has('a-friends-notes.txt')).toBe(true);
   });
 
-  it('names the file after the run id', () => {
-    expect(runFileName('preserve-2026-10-01T10-00-00Z')).toBe(
-      'preserve-run-preserve-2026-10-01T10-00-00Z.zip',
-    );
+  it('names the file start, save time, step', () => {
+    expect(
+      runFileName(
+        'preserve-2026-10-01T10-00-00Z',
+        new Date('2026-10-04T00:18:44.537Z'),
+        'verified',
+      ),
+    ).toBe('preserve-2026-10-01T10-00-00Z-2026-10-04T00-18-44Z-verified.zip');
   });
 });
 
@@ -187,6 +253,8 @@ describe('parseRunFile refusals', () => {
     } as unknown as PreserveRunState;
     const parsed = parseRunFile(buildRunFile(legacy, new Map()));
     expect(parsed.state.version).toBe(1);
+    /* With no step folder yet, the generated README is still recognised. */
+    expect(parsed.extra.size).toBe(0);
   });
 
   it('refuses a run state from a version the wizard does not read', () => {

@@ -26,6 +26,7 @@ import {
   PRESERVE_PATCHED_FILE,
   PRESERVE_PLAIN_NAME,
   PRESERVE_RUN_STATE_FILE,
+  PRESERVE_VERIFY_FILE,
 } from '@seek-fw/core';
 
 export type {
@@ -49,13 +50,15 @@ export {
   PRESERVE_PATCHED_FILE,
   PRESERVE_PLAIN_NAME,
   PRESERVE_RUN_STATE_FILE,
+  PRESERVE_VERIFY_FILE,
 } from '@seek-fw/core';
 
 /** The run-state file, by its name inside the run ZIP. */
 export const RUN_STATE_FILE: string = PRESERVE_RUN_STATE_FILE;
 
 /** The binary checkpoints a run produces, in step order — the derived
- *  factory plaintext among them, from the backup step onward. */
+ *  factory plaintext among them, from the backup step onward, and the
+ *  verify's re-read last. */
 export const CHECKPOINT_FILES = [
   PRESERVE_BACKUP_FILE,
   PRESERVE_BANK_CAPTURE_FILE,
@@ -63,9 +66,22 @@ export const CHECKPOINT_FILES = [
   PRESERVE_PATCHED_FILE,
   PRESERVE_DUMP_POSTWRITE_FILE,
   PRESERVE_DUMP_ORIGINAL_FILE,
+  PRESERVE_VERIFY_FILE,
 ] as const;
 
 export type CheckpointName = (typeof CHECKPOINT_FILES)[number];
+
+/** The step that writes each checkpoint — which decides its folder in the
+ *  run file. */
+export const CHECKPOINT_STEP: Readonly<Record<CheckpointName, PreserveStepId>> = {
+  [PRESERVE_BACKUP_FILE]: 'backup',
+  [PRESERVE_BANK_CAPTURE_FILE]: 'backup',
+  [PRESERVE_PLAIN_NAME]: 'backup',
+  [PRESERVE_PATCHED_FILE]: 'patch',
+  [PRESERVE_DUMP_POSTWRITE_FILE]: 'drain',
+  [PRESERVE_DUMP_ORIGINAL_FILE]: 'drain',
+  [PRESERVE_VERIFY_FILE]: 'verify',
+};
 
 /** Which steps put bytes on the wire's write path (the "do not unplug" set). */
 export const WRITES_FLASH: ReadonlySet<PreserveStepId> = new Set<PreserveStepId>([
@@ -173,13 +189,10 @@ export const PRESERVE_PHASES: readonly PreservePhaseMeta[] = [
     id: 'read-build',
     label: 'Read & build',
     description:
-      'Connect, read the device info, and let the run build itself: the 31 stock windows are ' +
-      'backed up, each on a session the reader probe admits (a probe that finds the reader ' +
-      'spent or page-shifted reboots the camera by command first, and in Chrome each reboot ' +
-      'needs a "Connect device" click), the active slot is read twice and the two reads must ' +
-      'agree, the factory plaintext is derived from that capture and gated, the patch is ' +
-      'built offline, and the plan below prints from what the camera produced. Read-only. ' +
-      'Under a minute when no reboot is needed.',
+      'Reads everything a normal dump can reach — 31 blocks of 64 KiB — and keeps it as your ' +
+      'backup, then prepares the small patch the next step writes. Nothing is written to the ' +
+      'camera. Usually under a minute. If the camera needs a restart along the way, the page ' +
+      'asks you to press "Connect device" and pick it again — that is expected.',
     steps: ['backup', 'patch'],
     resetsCamera: true,
     replugAfter: false,
@@ -188,13 +201,10 @@ export const PRESERVE_PHASES: readonly PreservePhaseMeta[] = [
     id: 'patch-dump',
     label: 'Patch & dump',
     description:
-      'THE WRITE, then the reward. The commit stages the conjugated patch into the active bank ' +
-      '(image length only) behind the danger dialog — the one irreversible write of the run. ' +
-      'Then the camera is reset so it boots the patched image (press "Connect device" when ' +
-      'the log asks — Chrome forgets this camera on every reboot), and the whole 4 MiB part ' +
-      'is drained through the widened window, and the run file is saved. A run whose patch ' +
-      'predates the reader fix ends by asking you to unplug the camera and plug it back in: ' +
-      'without the fix the drain leaves the reader dead until it is powered off.',
+      'Writes a small, temporary patch into the firmware block the camera starts from, so it ' +
+      'can read out all of its flash. Then the camera restarts — press "Connect device" and ' +
+      'pick it again when the page asks — and the whole 4 MiB is dumped. Step 04 puts the ' +
+      'original firmware back.',
     steps: ['commit', 'drain'],
     resetsCamera: true,
     replugAfter: true,
@@ -203,10 +213,9 @@ export const PRESERVE_PHASES: readonly PreservePhaseMeta[] = [
     id: 'restore-verify',
     label: 'Restore & verify',
     description:
-      'Put the camera back. The original bank content is staged over the active bank (the ' +
-      'other write, behind the danger dialog) and the camera is reset (press "Connect ' +
-      'device" when the log asks); then the 31 windows are re-read on the fresh boot and must ' +
-      'match the backup byte for byte — the verdict is shown on this row.',
+      'Writes your original firmware back, restarts the camera (press "Connect device" and ' +
+      'pick it again when asked), then reads everything once more to check it matches the ' +
+      'backup byte for byte.',
     steps: ['restore', 'verify'],
     resetsCamera: true,
     replugAfter: false,
@@ -226,7 +235,45 @@ export const RESETS_CAMERA: ReadonlySet<PreservePhaseId> = new Set<PreservePhase
   PRESERVE_PHASES.filter((phase) => phase.resetsCamera).map((phase) => phase.id),
 );
 
-/** `preserve-run-<runId>.zip` — the run-file naming rule. */
-export function runFileName(runId: string): string {
-  return `preserve-run-${runId}.zip`;
+/** The phase that runs a step. */
+export function phaseOfStep(step: PreserveStepId): PreservePhaseId {
+  const found = PRESERVE_PHASES.find((meta) => meta.steps.includes(step));
+  if (found === undefined) throw new Error(`no phase runs the step ${step}`);
+  return found.id;
+}
+
+/** The run file's folders: one per wizard step, numbered as the page numbers
+ *  them (Connect is step 01), each holding what that step produced. */
+export const PHASE_FOLDER: Readonly<Record<PreservePhaseId, string>> = {
+  'read-build': '02-read-build',
+  'patch-dump': '03-patch-dump',
+  'restore-verify': '04-restore-verify',
+};
+
+/** A step's name in the run file's name — what the run had got to. */
+export const STEP_FILE_LABEL: Readonly<Record<PreserveStepId, string>> = {
+  backup: 'backup',
+  patch: 'patch-built',
+  commit: 'patch-written',
+  drain: 'full-dump',
+  restore: 'restored',
+  verify: 'verified',
+};
+
+/** `2026-10-04T00:18:44.537Z` -> `2026-10-04T00-18-44Z`, the run id's own
+ *  stamp shape (no colons, so every file system takes it). */
+export function fileStamp(at: Date): string {
+  return at
+    .toISOString()
+    .replace(/\.\d{3}Z$/, 'Z')
+    .replaceAll(':', '-');
+}
+
+/**
+ * `<runId>-<saved at>-<what the run had got to>.zip` — the run id already
+ * carries the start (`preserve-2026-10-04T00-14-42Z`), so the name reads
+ * start, save time, step: `preserve-2026-10-04T00-14-42Z-2026-10-04T00-18-44Z-verified.zip`.
+ */
+export function runFileName(runId: string, at: Date, label: string): string {
+  return `${runId}-${fileStamp(at)}-${label}.zip`;
 }

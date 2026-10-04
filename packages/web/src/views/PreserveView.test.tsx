@@ -1,16 +1,19 @@
 /**
- * The wizard on the page: three phases, the image picked NOWHERE (the plan
- * prints from what the camera produced), the commit behind its danger
- * dialog, the past-commit jump behind its own, and the verify verdict shown
- * unmistakably on the last row.
+ * The wizard on the page: three phases as numbered steps, the image picked
+ * NOWHERE (the plan prints from what the camera produced), the commit behind
+ * its confirmation dialog, the past-commit jump behind its own, the verify
+ * verdict shown unmistakably on the last step — and the run's expected
+ * hand-offs (the Connect pick, the replug) asked for calmly, not in red.
  */
 
 import { act } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
 import { PreserveView } from './PreserveView';
 import type {
+  DeliveredCheck,
   PreservePanelApi,
   PreservePhaseRunOptions,
+  PreservePrompt,
   RunFileSave,
 } from '@/hooks/usePreservePanel';
 import { useReporter, type ReporterHandle } from '@/hooks/useReporter';
@@ -90,7 +93,10 @@ interface Scenario {
   readonly busy?: boolean;
   readonly has?: (name: CheckpointName) => boolean;
   readonly activePhase?: PreservePhaseId | null;
+  readonly prompt?: PreservePrompt | null;
   readonly lastSave?: RunFileSave | null;
+  readonly deliveredCheck?: DeliveredCheck | null;
+  readonly onConnect?: () => void;
 }
 
 function preserveStub(scenario: Scenario, ran: [PreservePhaseId, PreservePhaseRunOptions][]) {
@@ -102,8 +108,10 @@ function preserveStub(scenario: Scenario, ran: [PreservePhaseId, PreservePhaseRu
     state: scenario.state,
     hasCheckpoint: (name: CheckpointName): boolean => (scenario.has ?? HAS_ALL)(name),
     activePhase: scenario.activePhase ?? null,
+    prompt: scenario.prompt ?? null,
     loading: false,
     lastSave: scenario.lastSave ?? null,
+    deliveredCheck: scenario.deliveredCheck ?? null,
     runPhase: (phase: PreservePhaseId, options: PreservePhaseRunOptions = {}): Promise<void> => {
       ran.push([phase, options]);
       return Promise.resolve();
@@ -123,21 +131,23 @@ function renderPreserve(
       preserve={preserveStub(scenario, ran)}
       connected={scenario.connected}
       busy={scenario.busy === true}
+      {...(scenario.onConnect === undefined ? {} : { onConnect: scenario.onConnect })}
     />,
   );
 }
 
+/** A phase's own numbered step: the section its heading labels. */
 function phaseRow(container: HTMLElement, label: string): HTMLElement {
-  const row = [...container.querySelectorAll('li')].find((node) =>
-    node.textContent.includes(label),
+  const row = [...container.querySelectorAll('section')].find(
+    (node) => node.querySelector('h2')?.textContent.trim() === label,
   );
-  if (row === undefined) throw new Error(`no phase row labelled ${label}`);
+  if (row === undefined) throw new Error(`no phase step titled ${label}`);
   return row;
 }
 
 function runButton(row: HTMLElement): HTMLButtonElement {
   const match = [...row.querySelectorAll('button')].find((button) =>
-    ['Run phase', 'Run past the unrecorded commit'].includes(button.textContent.trim()),
+    /^(Start |Try |Run past the unrecorded commit$)/.test(button.textContent.trim()),
   );
   if (match === undefined) throw new Error(`no run button on ${row.textContent.slice(0, 40)}`);
   return match;
@@ -159,7 +169,7 @@ describe('PreserveView', () => {
     expect(container.textContent).not.toContain('Choose plaintext image');
     expect(container.textContent).not.toContain('Re-attach');
     expect(container.textContent).toContain('no firmware file to pick');
-    expect(container.textContent).toContain('ACTIVE boot slot');
+    expect(container.textContent).toContain('Steps 03 and 04 write to the camera');
     unmount();
   });
 
@@ -193,7 +203,7 @@ describe('PreserveView', () => {
     });
     const dialog = document.body.querySelector('[role="alertdialog"]');
     expect(dialog?.textContent).toContain('write to bank a at 0x14050000');
-    expect(dialog?.textContent).toContain('The commit is the irreversible write');
+    expect(dialog?.textContent).toContain('writes a small patch into the firmware block');
     act(() => {
       dialogButton('Cancel')?.click();
     });
@@ -208,9 +218,24 @@ describe('PreserveView', () => {
     view.unmount();
   });
 
-  it('phase ③ without a recorded commit is jump-only, loud, and behind its own dialog', () => {
-    const ran: [PreservePhaseId, PreservePhaseRunOptions][] = [];
+  it('right after step 02 nothing is alarming — step 04 just waits for step 03', () => {
     const state = runState({ backup: 'done', patch: 'done' }, { nextStep: 'commit' });
+    const { container, unmount } = renderPreserve({ state, connected: true });
+    expect(container.textContent).not.toContain('The commit is not on record');
+    const row = phaseRow(container, 'Restore & verify');
+    expect(row.textContent).toContain('Available after step 03 (Patch & dump)');
+    expect(row.textContent).not.toContain('already be patched');
+    expect(runButton(row).textContent.trim()).toBe('Start restore & verify');
+    expect(runButton(row).disabled).toBe(true);
+    unmount();
+  });
+
+  it('phase ③ after a FAILED commit is jump-only, loud, and behind its own dialog', () => {
+    const ran: [PreservePhaseId, PreservePhaseRunOptions][] = [];
+    const state = runState(
+      { backup: 'done', patch: 'done', commit: 'failed' },
+      { nextStep: 'commit' },
+    );
     const view = renderPreserve({ state, connected: true }, ran);
 
     expect(view.container.textContent).toContain(
@@ -267,6 +292,9 @@ describe('PreserveView', () => {
       connected: true,
     });
     const row = phaseRow(container, 'Read & build');
+    /* A finished step says so, and says nothing about being "not ready". */
+    expect(row.textContent).toContain('Done');
+    expect(row.textContent).not.toContain('Not ready');
     expect(row.textContent).toContain('Compact 1.3.0.8 (8 Hz)');
     expect(row.textContent).toContain('two agreeing reads');
     expect(row.textContent).toContain('Bytes that move on the part');
@@ -283,7 +311,9 @@ describe('PreserveView', () => {
       },
     );
     const okView = renderPreserve({ state: matched, connected: true });
-    expect(phaseRow(okView.container, 'Restore & verify').textContent).toContain('VERIFY: MATCH');
+    expect(phaseRow(okView.container, 'Restore & verify').textContent).toContain(
+      'Verified — a perfect match',
+    );
     okView.unmount();
 
     const mismatched = runState(
@@ -318,7 +348,7 @@ describe('PreserveView', () => {
     } as unknown as PreserveRunState;
     const badView = renderPreserve({ state, connected: true });
     const row = phaseRow(badView.container, 'Restore & verify');
-    expect(row.textContent).toContain('VERIFY: NO MATCH');
+    expect(row.textContent).toContain('The check found differences');
     expect(row.textContent).toContain('4096 differing byte(s)');
     badView.unmount();
   });
@@ -340,10 +370,119 @@ describe('PreserveView', () => {
         verify: { diffBytes: 0, windowsRead: 31, badWindows: [] },
       },
     );
-    const { container, unmount } = renderPreserve({ state: full, connected: true });
-    expect(container.textContent).toContain('matches the as-booted image');
+    const { container, unmount } = renderPreserve({
+      state: full,
+      connected: true,
+      deliveredCheck: { blocksCompared: 31, differing: [], onlyInFullDump: [0x14000000] },
+    });
+    /* The complete image is held against the backup — the comparison that can
+     * actually match — never against the one-slot firmware image's sha. */
+    expect(container.textContent).toContain('matches the backup on all 31 blocks');
+    expect(container.textContent).not.toContain('DOES NOT match');
+    expect(container.textContent).toContain('Only in the full dump');
+    expect(container.textContent).toContain('0x14000000');
     expect(container.textContent).toContain('Raw post-commit part');
     expect(buttonByText(container, 'Download the full archive (run file)')).toBeTruthy();
+    unmount();
+  });
+  it('the Connect pick after a restart is the user’s turn — a blue ask with its own Connect button, never red', () => {
+    let connects = 0;
+    const state = runState(
+      { backup: 'done', patch: 'done', commit: 'done' },
+      { nextStep: 'drain' },
+    );
+    const { container, unmount } = renderPreserve({
+      state,
+      connected: false,
+      busy: true,
+      activePhase: 'patch-dump',
+      prompt: { phase: 'patch-dump', kind: 'reconnect' },
+      onConnect: () => {
+        connects += 1;
+      },
+    });
+    const row = phaseRow(container, 'Patch & dump');
+    expect(row.textContent).toContain('Your turn: press Connect device and pick the camera');
+    expect(row.textContent).toContain('restarted, as planned');
+    const ask = row.querySelector('[data-slot="alert"]');
+    expect(ask?.className).toContain('border-l-primary');
+    expect(ask?.className).not.toContain('destructive');
+    /* The ask's own button works while the phase holds the run lock. */
+    const connect = buttonByText(row, 'Connect device');
+    expect(connect.disabled).toBe(false);
+    act(() => {
+      connect.click();
+    });
+    expect(connects).toBe(1);
+    /* Only the phase that waits shows it. */
+    expect(phaseRow(container, 'Read & build').textContent).not.toContain('Your turn');
+    unmount();
+  });
+
+  it('the replug a pre-fix patch owes is asked the same calm way', () => {
+    const state = runState(
+      { backup: 'done', patch: 'done', commit: 'done', drain: 'done' },
+      { nextStep: 'restore' },
+    );
+    const { container, unmount } = renderPreserve({
+      state,
+      connected: true,
+      prompt: { phase: 'patch-dump', kind: 'replug-before-restore' },
+      onConnect: () => undefined,
+    });
+    const row = phaseRow(container, 'Patch & dump');
+    expect(row.textContent).toContain('Before step 04: unplug the camera, plug it back in');
+    expect(row.querySelector('[data-slot="alert"]')?.className).toContain('border-l-primary');
+    unmount();
+  });
+
+  it('a backup that needs a power cycle asks for the replug, and its continue button carries the assertion', () => {
+    const ran: [PreservePhaseId, PreservePhaseRunOptions][] = [];
+    const state = runState({}, {
+      nextStep: 'backup',
+      steps: { backup: { status: 'failed', powerCycleRequired: true } },
+    } as unknown as Partial<PreserveRunState>);
+    const { container, unmount } = renderPreserve({ state, connected: true }, ran);
+    const row = phaseRow(container, 'Read & build');
+    expect(row.textContent).toContain('Your turn: unplug the camera, plug it back in');
+    expect(runButton(row).disabled).toBe(true);
+    const go = buttonByText(row, 'I replugged it — continue read & build');
+    expect(go.className).not.toContain('destructive');
+    act(() => {
+      go.click();
+    });
+    expect(ran).toEqual([['read-build', { powerCycled: true }]]);
+    unmount();
+  });
+
+  it('no step reads as alarming before anything has gone wrong — no red buttons, borders or badges', () => {
+    const { container, unmount } = renderPreserve({ state: runState(), connected: true });
+    for (const label of ['Read & build', 'Patch & dump', 'Restore & verify']) {
+      const row = phaseRow(container, label);
+      expect(row.innerHTML).not.toContain('destructive');
+    }
+    unmount();
+  });
+  it('a complete image that differs from the backup says where, in red', () => {
+    const full = runState(
+      {
+        backup: 'done',
+        patch: 'done',
+        commit: 'done',
+        drain: 'done',
+        restore: 'done',
+        verify: 'done',
+      },
+      { nextStep: 'done', deliveredSha256: 'a'.repeat(64) },
+    );
+    const { container, unmount } = renderPreserve({
+      state: full,
+      connected: true,
+      deliveredCheck: { blocksCompared: 31, differing: [0x14020000], onlyInFullDump: [] },
+    });
+    expect(container.textContent).toContain(
+      'differs from the backup in 1 of 31 blocks: 0x14020000',
+    );
     unmount();
   });
 });

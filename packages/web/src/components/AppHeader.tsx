@@ -36,7 +36,10 @@ const NAV: readonly NavItem[] = [
     route: 'preserve',
     label: 'Preserve (stepwise)',
     icon: <Archive className="size-4" />,
-    danger: true,
+    /* It writes too, but as a guided run that asks before each write and
+     * puts the camera back — it should read like the dump view, not like
+     * the one-shot flasher. */
+    danger: false,
   },
 ];
 
@@ -48,7 +51,7 @@ export function AppHeader({ route, connected, canUseUsb }: AppHeaderProps): Reac
         aria-hidden="true"
         className={cn(
           'absolute inset-x-0 top-0 h-0.5',
-          route === 'flash' || route === 'preserve' ? 'bg-destructive' : 'bg-primary/70',
+          route === 'flash' ? 'bg-destructive' : 'bg-primary/70',
         )}
       />
       <div className="mx-auto w-full max-w-[64rem] px-4 pt-5 pb-0 sm:px-6">

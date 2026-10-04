@@ -146,7 +146,7 @@ describe('canRunPhase — the run’s gate, as the buttons show it', () => {
     expect(third.jumpable).toBe(false); /* detection and the patch summary are missing too */
   });
 
-  it('after phase ①: phase ② arms, phase ③ is jump-only and loud', () => {
+  it('after phase ①: phase ② arms, phase ③ simply waits — the normal order is not an alarm', () => {
     const state = runState({ backup: 'done', patch: 'done', nextStep: 'commit' });
     expect(gate(state, 'read-build').missing[0]).toContain('already done');
 
@@ -156,10 +156,10 @@ describe('canRunPhase — the run’s gate, as the buttons show it', () => {
 
     const third = gate(state, 'restore-verify');
     expect(third.ok).toBe(false);
-    expect(third.pastCommit).toBe(true);
-    expect(third.jumpable).toBe(true);
+    expect(third.pastCommit).toBe(false);
+    expect(third.jumpable).toBe(false);
     expect(third.missing).toEqual(['the commit (run or resume at it first)']);
-    expect(third.jumpStartStep).toBe('restore');
+    expect(third.jumpStartStep).toBeNull();
   });
 
   it('after the commit: phase ② starts at the drain (no dialog needed for it), phase ③ arms', () => {
@@ -245,7 +245,7 @@ describe('canRunPhase — the past-commit context and the jump', () => {
     expect(second.startStep).toBe('commit');
     expect(second.jumpStartStep).toBe('drain');
     expect(second.confirm).toBe(true);
-    /* And phase ③ is jump-only, as after any commit-less state. */
+    /* And phase ③ is jump-only while the failed commit leaves it in doubt. */
     const third = gate(state, 'restore-verify');
     expect(third.ok).toBe(false);
     expect(third.jumpable).toBe(true);
@@ -253,7 +253,7 @@ describe('canRunPhase — the past-commit context and the jump', () => {
   });
 
   it('the jump refuses when anything beyond the ordering gate is missing', () => {
-    const state = runState({ backup: 'done', patch: 'done', nextStep: 'commit' });
+    const state = runState({ backup: 'done', patch: 'done', commit: 'failed', nextStep: 'commit' });
     const g = gate(state, 'restore-verify', NOTHING);
     expect(g.ok).toBe(false);
     expect(g.jumpable).toBe(false); /* the capture is gone; allowJump cannot help */

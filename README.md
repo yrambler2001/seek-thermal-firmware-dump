@@ -404,14 +404,22 @@ with sha256 of everything).
 In the browser, the **Preserve (stepwise)** view drives the same checkpoint-step API one step at a
 time; the run there is self-sourced exactly as the CLI's is — the image comes from the camera's
 active slot, never from a file the person picked — and each completed step re-issues a
-downloadable `preserve-run-<runId>.zip` (the run state plus every checkpoint produced so far,
-the derived plaintext included), from which the run resumes. The commit session never resets; the
-drain step owns the wire-89 and waits out the reboot ("camera rebooting…"). This camera has no USB
-serial number, so Chrome forgets it on every reboot: when the log asks, press "Connect device" and
-pick it again, and the phase continues by itself. A run whose committed patch predates the
-arm-tail cursor reset (the fifth site) ends Patch & dump by asking you to unplug the camera and
-plug it back in: without that site the drain leaves the reader dead until it is powered off. With
-it, the restore reads on the same boot and no replug is asked for.
+downloadable run file, named start, save time and step reached
+(`preserve-2026-10-04T00-14-42Z-2026-10-04T00-18-44Z-verified.zip`), from which the run resumes.
+Inside, the run state and a README sit at the top and every checkpoint sits in the folder of the
+page step that made it: `02-read-build/` (the backup, the twice-read boot slot, the derived and
+patched images, the backup decrypted), `03-patch-dump/` (the raw post-commit part and
+`preserve_dump_original.bin`, the complete original image) and `04-restore-verify/` (the verify's
+re-read of the 31 windows after the restore). Older flat run files still load. The finished run is
+checked by holding the complete image against the backup block by block. The commit session never
+resets; the drain step owns the wire-89 and waits out the reboot ("the camera is restarting…").
+This camera has no USB serial number, so Chrome forgets it on every reboot: the running step then
+shows a blue "Your turn" box with its own Connect device button — pick the camera again and the
+step continues by itself. These hand-offs are the expected flow, so the page asks for them calmly;
+red is kept for real failures. A run whose committed patch predates the arm-tail cursor reset (the
+fifth site) ends Patch & dump by asking you, the same way, to unplug the camera and plug it back
+in: without that site the drain leaves the reader dead until it is powered off. With it, the
+restore reads on the same boot and no replug is asked for.
 
 ## Operation mode 0, and why a cold camera used to hang
 

@@ -333,7 +333,7 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
     expect(current(mounted).panel.activePhase).toBe('patch-dump'); /* NOT cancelled */
     expect(current(mounted).device.device).toBeNull();
     await waitFor(() =>
-      linesOf(current(mounted).panel, 'patch-dump').includes('the reset was expected'),
+      linesOf(current(mounted).panel, 'patch-dump').includes('restarting, as expected'),
     );
 
     /* THE RE-ENUMERATION: same vid/pid, a new USBDevice object. */
@@ -344,7 +344,7 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
     });
     expect(current(mounted).device.device).not.toBeNull(); /* auto-adopted, no user gesture */
     await waitFor(() =>
-      linesOf(current(mounted).panel, 'patch-dump').includes('adopting it and continuing'),
+      linesOf(current(mounted).panel, 'patch-dump').includes('the camera is back — continuing'),
     );
 
     /* The boot silence ends; the drain finishes; the run file is saved and
@@ -355,7 +355,7 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
         ?.resolve(fakeOutcome('drain', handed.at(-1)?.[1] ?? current(mounted).panel.state!));
     });
     await waitFor(() =>
-      linesOf(current(mounted).panel, 'patch-dump').includes('Now unplug the camera'),
+      linesOf(current(mounted).panel, 'patch-dump').includes('Your turn: unplug the camera'),
     );
     expect(current(mounted).panel.activePhase).toBe('patch-dump');
     expect(current(mounted).panel.state?.steps.drain?.status).toBe('done');
@@ -378,6 +378,7 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
 
     await waitFor(() => current(mounted).panel.activePhase === null);
     expect(linesOf(current(mounted).panel, 'patch-dump')).toContain('back on a fresh boot');
+    expect(current(mounted).panel.prompt).toBeNull();
     expect(current(mounted).panel.state?.nextStep).toBe('restore');
     expect(current(mounted).panel.state?.steps.commit?.status).toBe('done');
     expect(current(mounted).panel.state?.steps.drain?.status).toBe('done');
@@ -405,7 +406,7 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
       usb.fire('disconnect', unitA);
     });
     await waitFor(() =>
-      linesOf(current(mounted).panel, 'patch-dump').includes('the reset was expected'),
+      linesOf(current(mounted).panel, 'patch-dump').includes('restarting, as expected'),
     );
 
     /* The drain opens its session AFTER the drop, through the ladder the
@@ -414,12 +415,22 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
       openGates.get('drain')?.();
     });
     await waitFor(() =>
-      linesOf(current(mounted).panel, 'patch-dump').includes('Press "Connect device"'),
+      linesOf(current(mounted).panel, 'patch-dump').includes(
+        'Your turn: press "Connect device" and pick the camera',
+      ),
     );
     expect(current(mounted).panel.phaseReporters['patch-dump'].progress.text).toContain(
-      'Re-connect the camera',
+      'Waiting for you — press "Connect device"',
     );
     expect(current(mounted).panel.activePhase).toBe('patch-dump'); /* still waiting, not failed */
+    /* The ask is the user's turn, not a fault: the page shows it from this
+     * state, and the log line is info, not a warning. */
+    expect(current(mounted).panel.prompt).toEqual({ phase: 'patch-dump', kind: 'reconnect' });
+    expect(
+      current(mounted).panel.phaseReporters['patch-dump'].lines.find((line) =>
+        line.text.startsWith('Your turn'),
+      )?.level,
+    ).toBe('info');
 
     /* THE CLICK: the user picks the camera in Chrome's chooser. */
     const unitA2 = fakeCameraUnit(0x0010);
@@ -430,9 +441,12 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
     expect(current(mounted).device.device).toBe(unitA2);
 
     await waitFor(() =>
-      linesOf(current(mounted).panel, 'patch-dump').includes('Now unplug the camera'),
+      linesOf(current(mounted).panel, 'patch-dump').includes('Your turn: unplug the camera'),
     );
-    expect(linesOf(current(mounted).panel, 'patch-dump')).toContain('adopting it and continuing');
+    expect(linesOf(current(mounted).panel, 'patch-dump')).toContain(
+      'the camera is back — continuing',
+    );
+    expect(current(mounted).panel.prompt).toEqual({ phase: 'patch-dump', kind: 'replug' });
     expect(current(mounted).panel.state?.steps.drain?.status).toBe('done');
     expect(current(mounted).panel.state?.nextStep).toBe('restore');
     expect(unitA2.opened).toBe(false); /* the ladder's session was closed */
@@ -445,8 +459,12 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
     await waitFor(() => current(mounted).panel.activePhase === null);
     expect(linesOf(current(mounted).panel, 'patch-dump')).toContain('the replug wait was stopped');
     expect(current(mounted).panel.phaseReporters['patch-dump'].progress.text).toContain(
-      'Unplug and replug the camera before the restore',
+      'Before the restore: unplug the camera, plug it back in',
     );
+    expect(current(mounted).panel.prompt).toEqual({
+      phase: 'patch-dump',
+      kind: 'replug-before-restore',
+    });
     expect(current(mounted).panel.state?.steps.drain?.status).toBe('done');
     expect(downloads.length).toBe(2);
     mounted.unmount();
@@ -466,7 +484,7 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
     await waitFor(() => current(mounted).panel.activePhase === null);
     const log = linesOf(current(mounted).panel, 'patch-dump');
     expect(log).toContain('no replug needed');
-    expect(log).not.toContain('Now unplug the camera');
+    expect(log).not.toContain('unplug the camera');
     expect(current(mounted).panel.state?.steps.drain?.status).toBe('done');
     expect(current(mounted).panel.phaseReporters['patch-dump'].progress.text).toContain(
       'The run file in your downloads is up to date',
@@ -483,7 +501,7 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
       void current(mounted).panel.runPhase('patch-dump');
     });
     await waitFor(() =>
-      linesOf(current(mounted).panel, 'patch-dump').includes('Now unplug the camera'),
+      linesOf(current(mounted).panel, 'patch-dump').includes('Your turn: unplug the camera'),
     );
 
     usb.authorized = [];
@@ -560,7 +578,7 @@ describe('the reset is not a swap — the guard and the opener ladder cooperate'
     });
     await waitFor(() =>
       linesOf(current(mounted).panel, 'read-build').includes(
-        'the camera left the bus — the reset was expected',
+        'the camera is restarting, as expected',
       ),
     );
     expect(current(mounted).panel.activePhase).toBe('read-build');

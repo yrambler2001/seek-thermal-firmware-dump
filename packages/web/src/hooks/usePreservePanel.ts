@@ -45,15 +45,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CancelledError,
+  FLASH_BASE,
   SeekDevice,
   SEEK_VENDOR_ID,
   clearsArmCursor,
+  preservationWindows,
   type SessionOpener,
   type WebUsbTransport,
 } from '@seek-fw/core';
 import { errorMessage } from '@seek-fw/core';
 import { downloadBytes } from '../lib/download';
-import { logHint } from '../lib/hints';
+import { isPowerCycleRefusal, logHint } from '../lib/hints';
 import { readOptions, type OptionsForm } from '../lib/options';
 import { getWebUsb } from '../lib/webusb';
 import {
@@ -67,10 +69,15 @@ import { canRunPhase, gateReason } from '../lib/preserve/gating';
 import { buildRunFile, parseRunFile } from '../lib/preserve/run-file';
 import {
   CHECKPOINT_FILES,
+  PHASE_FOLDER,
+  PRESERVE_BACKUP_FILE,
+  PRESERVE_DUMP_ORIGINAL_FILE,
   PRESERVE_PHASES,
   RESETS_CAMERA,
   RUN_STATE_FILE,
+  STEP_FILE_LABEL,
   phaseMeta,
+  runFileName,
   stepMeta,
   type CheckpointName,
   type PreservePhaseId,
@@ -122,6 +129,47 @@ export interface RunFileSave {
   readonly afterStep: PreserveStepId | 'created' | 'loaded' | 'manual';
   readonly at: string;
   readonly bytes: number;
+  /** The name it downloaded under (or was loaded from). */
+  readonly fileName: string;
+}
+
+/**
+ * The delivered 4 MiB image held against the backup taken before the first
+ * write: every block the backup read must come back identical in it, and the
+ * blocks only the whole-part dump reaches (the backup holds 0xFF there) are
+ * counted apart when they hold data.
+ */
+export interface DeliveredCheck {
+  readonly blocksCompared: number;
+  /** Flash addresses of the backed-up blocks the delivered image differs in. */
+  readonly differing: readonly number[];
+  /** Flash addresses of the blocks only the whole-part dump could read that
+   *  are not erased — what the full dump adds over a stock read. */
+  readonly onlyInFullDump: readonly number[];
+}
+
+const BLOCK = 0x10000;
+
+function isErased(bytes: Uint8Array): boolean {
+  return bytes.every((byte) => byte === 0xff);
+}
+
+export function checkDelivered(delivered: Uint8Array, backup: Uint8Array): DeliveredCheck | null {
+  if (delivered.length !== backup.length || delivered.length % BLOCK !== 0) return null;
+  const backedUp = new Set(preservationWindows().map((entry) => entry.address));
+  const differing: number[] = [];
+  const onlyInFullDump: number[] = [];
+  for (let at = 0; at < delivered.length; at += BLOCK) {
+    const address = FLASH_BASE + at;
+    const mine = delivered.subarray(at, at + BLOCK);
+    if (backedUp.has(address)) {
+      const theirs = backup.subarray(at, at + BLOCK);
+      if (mine.some((byte, index) => byte !== theirs[index])) differing.push(address);
+    } else if (!isErased(mine)) {
+      onlyInFullDump.push(address);
+    }
+  }
+  return { blocksCompared: backedUp.size, differing, onlyInFullDump };
 }
 
 export interface PreservePanelParams {
@@ -141,6 +189,26 @@ export interface PreservePhaseRunOptions {
   readonly powerCycled?: boolean;
 }
 
+/**
+ * What the wizard is waiting for the USER to do — the expected hand-offs of a
+ * run, which the page shows as a calm "your turn" ask rather than as a
+ * warning:
+ *  - `reconnect`: the camera restarted and Chrome no longer knows it (no USB
+ *    serial number), so the step waits for the "Connect device" pick;
+ *  - `replug`: the drain on a patch without the arm tail's cursor reset ends
+ *    by waiting for an unplug, a replug and the Connect pick;
+ *  - `replug-before-restore`: that wait ended unseen — the replug is still
+ *    owed before the restore;
+ *  - `power-cycle`: a step refused on a spent reader — replug, Connect, and
+ *    run the same step again.
+ * The first two clear themselves; the last two stand until the next phase
+ * starts.
+ */
+export interface PreservePrompt {
+  readonly phase: PreservePhaseId;
+  readonly kind: 'reconnect' | 'replug' | 'replug-before-restore' | 'power-cycle';
+}
+
 export interface PreservePanelApi {
   readonly loadReporter: ReporterHandle;
   readonly phaseReporters: Readonly<Record<PreservePhaseId, ReporterHandle>>;
@@ -148,8 +216,12 @@ export interface PreservePanelApi {
   readonly state: PreserveRunState | null;
   readonly hasCheckpoint: (name: CheckpointName) => boolean;
   readonly activePhase: PreservePhaseId | null;
+  /** The hand-off the wizard is waiting on, or null. */
+  readonly prompt: PreservePrompt | null;
   readonly loading: boolean;
   readonly lastSave: RunFileSave | null;
+  /** The delivered image against the backup, once both are in hand. */
+  readonly deliveredCheck: DeliveredCheck | null;
   runPhase: (phase: PreservePhaseId, options?: PreservePhaseRunOptions) => Promise<void>;
   cancel: () => void;
   saveAgain: () => void;
@@ -210,6 +282,12 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
 
   const [state, setState] = useState<PreserveRunState | null>(null);
   const [lastSave, setLastSave] = useState<RunFileSave | null>(null);
+  const [prompt, setPrompt] = useState<PreservePrompt | null>(null);
+  /* Clears only the reconnect ask: the camera came back, by the user's pick or
+   * by Chrome's own re-grant. */
+  const clearReconnect = useCallback((): void => {
+    setPrompt((current) => (current?.kind === 'reconnect' ? null : current));
+  }, []);
 
   const stateRef = useRef<PreserveRunState | null>(null);
   const checkpoints = useRef<Map<CheckpointName, Uint8Array>>(new Map());
@@ -226,16 +304,28 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
 
   /* ---- the run file ---------------------------------------------------- */
 
-  const saveRunFile = useCallback((after: RunFileSave['afterStep']): void => {
+  /* `label` names what the run had got to in the file name — the last
+   * completed step, or the step that failed or was cancelled. */
+  const saveRunFile = useCallback((after: RunFileSave['afterStep'], label?: string): void => {
     const current = stateRef.current;
     if (current === null) return;
-    const zip = buildRunFile(current, checkpoints.current, extra.current);
-    downloadBytes(zip, `preserve-run-${current.runId}.zip`, 'application/zip');
+    const now = new Date();
+    const zip = buildRunFile(current, checkpoints.current, extra.current, now);
+    const fileName = runFileName(
+      current.runId,
+      now,
+      label ??
+        (after === 'created' || after === 'loaded' || after === 'manual'
+          ? after
+          : STEP_FILE_LABEL[after]),
+    );
+    downloadBytes(zip, fileName, 'application/zip');
     setLastSave({
       runId: current.runId,
       afterStep: after,
-      at: new Date().toISOString(),
+      at: now.toISOString(),
       bytes: zip.length,
+      fileName,
     });
   }, []);
 
@@ -251,6 +341,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
 
   const makeOpener = useCallback(
     (
+      phase: PreservePhaseId,
       rep: ReporterHandle,
       signal: AbortSignal,
       patient: boolean = false,
@@ -292,17 +383,24 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
               opened.push(transport);
               const client = new SeekDevice(transport, { reporter: rep.reporter, signal });
               await transport.open();
+              if (instructed) clearReconnect();
               return client;
             } catch (error) {
               lastError = error;
               if (attempt === 0) {
+                /* On the phases that restart the camera this is the restart
+                 * itself — expected, so the log says so plainly and keeps the
+                 * wire's own words as detail. */
                 rep.log(
-                  `camera did not open (${errorMessage(error)}) — retrying for up to ` +
-                    `${String(Math.round(attempts / 60))} min; a camera that has just been ` +
-                    'reset is silent for a couple of seconds while it boots',
-                  'warn',
+                  patient
+                    ? `the camera is restarting — waiting for it to come back ` +
+                        `(${errorMessage(error)})`
+                    : `camera did not open (${errorMessage(error)}) — retrying for up to ` +
+                        `${String(Math.round(attempts / 60))} min; a camera that has just been ` +
+                        'reset is silent for a couple of seconds while it boots',
+                  patient ? 'detail' : 'warn',
                 );
-                rep.setStatus('Camera rebooting — waiting for it to come back …');
+                rep.setStatus('The camera is restarting — this takes about ten seconds …');
               }
               /* A missed `connect` event must not strand the run: the camera
                * re-enumerates while the page holds nothing, and getDevices()
@@ -313,22 +411,25 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
               if (deviceRef.current.device === null) {
                 const reattached = await deviceRef.current.reattach();
                 if (reattached) {
+                  if (instructed) clearReconnect();
                   rep.log('the camera is back on the bus — re-adopted it', 'ok');
                 } else if (!instructed && attempt >= 2) {
+                  /* Not a fault: Chrome keeps no grant for a camera without a
+                   * USB serial number, so every restart ends in this pick. */
                   instructed = true;
+                  setPrompt({ phase, kind: 'reconnect' });
                   rep.log(
-                    'Chrome lost the camera when it rebooted (this camera has no USB serial ' +
-                      'number, so Chrome cannot re-recognise it on its own). Press ' +
-                      '"Connect device" above and pick the camera — the phase continues by ' +
-                      'itself the moment it is re-connected.',
-                    'warn',
+                    'Your turn: press "Connect device" and pick the camera. It restarted as ' +
+                      'planned, and Chrome cannot recognise it again by itself (it has no USB ' +
+                      'serial number). The step carries on as soon as you pick it.',
+                    'info',
                   );
-                  rep.setStatus('Re-connect the camera — press "Connect device" and pick it …');
+                  rep.setStatus('Waiting for you — press "Connect device" and pick the camera …');
                 } else if (instructed && attempt % 30 === 29) {
                   rep.log(
-                    `still waiting for the re-connect — "Connect device" above, then pick the ` +
-                      `camera (${String(attempt + 1)} s)`,
-                    'warn',
+                    `still waiting — press "Connect device" and pick the camera ` +
+                      `(${String(attempt + 1)} s)`,
+                    'detail',
                   );
                 }
               }
@@ -347,7 +448,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
       };
       return { opener, closeAll };
     },
-    [form],
+    [clearReconnect, form],
   );
 
   /* ---- the generation guard: the reset is not a swap -------------------- */
@@ -390,7 +491,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
           'the camera is unplugged — plug it back in, then press "Connect device" and pick it',
           'detail',
         );
-        rep.setStatus('Plug the camera back in, then press "Connect device" …');
+        rep.setStatus('Waiting for you — plug the camera back in, then press "Connect device" …');
         return;
       }
       /* A device LEFT. On a phase that resets the camera this is the reset
@@ -400,10 +501,10 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
       if (RESETS_CAMERA.has(phase)) {
         sawDisconnect.current = true;
         rep.reporter.log(
-          'the camera left the bus — the reset was expected; waiting for it to re-enumerate',
+          'the camera is restarting, as expected — waiting for it to come back',
           'detail',
         );
-        rep.setStatus('Camera rebooting — waiting for it to come back …');
+        rep.setStatus('The camera is restarting — this takes about ten seconds …');
         return;
       }
       stopForSwap(rep, 'the camera left the bus mid-phase');
@@ -434,10 +535,11 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
         );
         return;
       }
-      rep.reporter.log('the camera re-enumerated — adopting it and continuing the phase', 'ok');
-      rep.setStatus('Camera back — continuing …');
+      clearReconnect();
+      rep.reporter.log('the camera is back — continuing', 'ok');
+      rep.setStatus('The camera is back — continuing …');
     })();
-  }, [device, runner, stopForSwap]);
+  }, [clearReconnect, device, runner, stopForSwap]);
 
   /* ---- the replug that ends the drain's phase ---------------------------- */
 
@@ -453,19 +555,21 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
    */
   const awaitReplug = useCallback(
     async (
+      phase: PreservePhaseId,
       rep: ReporterHandle,
       signal: AbortSignal,
     ): Promise<'replugged' | 'ambiguous' | 'not-seen'> => {
       const before = deviceRef.current.device;
       const watch = { unplugged: before === null };
       replugWatch.current = watch;
+      setPrompt({ phase, kind: 'replug' });
       rep.log(
-        'Now unplug the camera, plug it back in, then press "Connect device" and pick it. The ' +
-          'drain leaves the camera’s reader dead until it is powered off, and the restore needs ' +
-          'a fresh boot. The run file is already saved.',
-        'warn',
+        'Your turn: unplug the camera, plug it back in, then press "Connect device" and pick ' +
+          'it. This run’s patch predates the reader fix, so the camera needs a fresh power-up ' +
+          'before the restore. The run file is already saved.',
+        'info',
       );
-      rep.setStatus('Unplug the camera and plug it back in …');
+      rep.setStatus('Waiting for you — unplug the camera and plug it back in …');
       try {
         const deadline = Date.now() + REPLUG_WAIT_MS;
         while (Date.now() < deadline && !signal.aborted) {
@@ -492,6 +596,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
         return 'not-seen';
       } finally {
         replugWatch.current = null;
+        setPrompt((current) => (current?.kind === 'replug' ? null : current));
       }
     },
     [],
@@ -505,7 +610,10 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
         const rep = phaseReporters[phase];
         const meta = phaseMeta(phase);
         sawDisconnect.current = false;
-        rep.reset(meta.resetsCamera ? 'Running — the camera will reset mid-phase …' : 'Running …');
+        setPrompt(null);
+        rep.reset(
+          meta.resetsCamera ? 'Running — the camera restarts during this step …' : 'Running …',
+        );
         const allowJump = options.allowJump === true;
 
         let current = stateRef.current;
@@ -561,7 +669,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
         }
 
         const load = artifactLoader(checkpoints.current, extra.current);
-        const { opener, closeAll } = makeOpener(rep, signal, meta.resetsCamera === true);
+        const { opener, closeAll } = makeOpener(phase, rep, signal, meta.resetsCamera === true);
         let stepInFlight: PreserveStepId | null = null;
         const ran = new Set<PreserveStepId>();
         try {
@@ -596,7 +704,8 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
               if ((CHECKPOINT_FILES as readonly string[]).includes(artifact.name)) {
                 checkpoints.current.set(artifact.name as CheckpointName, artifact.data);
               } else if (artifact.name !== RUN_STATE_FILE) {
-                extra.current.set(artifact.name, artifact.data);
+                /* Filed under the step that made it — the run file's folders. */
+                extra.current.set(`${PHASE_FOLDER[phase]}/${artifact.name}`, artifact.data);
               }
             }
             current = outcome.state;
@@ -622,23 +731,24 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
             );
           }
           if (replugOwed) {
-            const replug = await awaitReplug(rep, signal);
+            const replug = await awaitReplug(phase, rep, signal);
             if (replug !== 'replugged') {
               if (replug === 'not-seen') {
+                setPrompt({ phase, kind: 'replug-before-restore' });
                 rep.log(
                   (signal.aborted
                     ? 'the replug wait was stopped'
                     : `no replug seen in ${String(Math.round(REPLUG_WAIT_MS / 60_000))} min`) +
-                    ' — unplug the camera and plug it back in before the restore; the drain ' +
-                    'left its reader dead',
-                  'warn',
+                    ' — before the restore, unplug the camera, plug it back in and press ' +
+                    '"Connect device"',
+                  'info',
                 );
               }
               rep.reporter.progress(
                 1,
                 1,
-                `${meta.label} — done, and the run file is saved. Unplug and replug the camera ` +
-                  'before the restore.',
+                `${meta.label} — done, and the run file is saved. Before the restore: unplug the ` +
+                  'camera, plug it back in and press "Connect device".',
               );
               return;
             }
@@ -652,24 +762,32 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
           if (!isCancelledStep(error)) {
             rep.log(`ERROR: ${errorMessage(error)}`, 'error');
             logHint(rep.log, error);
+            if (isPowerCycleRefusal(error)) setPrompt({ phase, kind: 'power-cycle' });
             rep.setStatus('Failed — see the log above.');
             /* A failed STEP is a fact about the run: record it so a resume
              * sees it, and refresh the file. A CANCELLED step is not
              * recorded — the previous checkpoint stands (core's rule). The
              * steps that DID finish inside this phase keep their records
              * either way, so the file names them. */
-            if (stepInFlight !== null) {
-              current = recordStepFailure(current, stepInFlight, error);
+            const failedStep = stepInFlight;
+            if (failedStep !== null) {
+              current = recordStepFailure(current, failedStep, error);
               applyState(current);
             }
-            saveRunFile(lastCompletedStep(current));
+            saveRunFile(
+              lastCompletedStep(current),
+              failedStep === null ? undefined : `${STEP_FILE_LABEL[failedStep]}-failed`,
+            );
           } else {
             rep.log('cancelled', 'warn');
             rep.setStatus('Cancelled — the run file still says where the run stopped.');
             /* The steps that finished before the cancel are recorded in
              * memory; put them in the file too, so closing the tab here
              * does not take a recorded commit with it. */
-            saveRunFile(lastCompletedStep(current));
+            saveRunFile(
+              lastCompletedStep(current),
+              stepInFlight === null ? undefined : `${STEP_FILE_LABEL[stepInFlight]}-cancelled`,
+            );
           }
         } finally {
           await closeAll();
@@ -739,6 +857,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
             afterStep: 'loaded',
             at: new Date().toISOString(),
             bytes: bytes.length,
+            fileName: file.name,
           });
         } catch (error) {
           rep.log(`cannot resume from this file: ${errorMessage(error)}`, 'error');
@@ -763,6 +882,16 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
     saveRunFile(lastCompletedStep(current));
   }, [saveRunFile]);
 
+  /* Recomputed whenever the run state moves: the checkpoints it reads are
+   * filed before the state that names them is applied. */
+  const deliveredCheck = useMemo((): DeliveredCheck | null => {
+    if (state?.deliveredSha256 === undefined) return null;
+    const delivered = checkpoints.current.get(PRESERVE_DUMP_ORIGINAL_FILE);
+    const backup = checkpoints.current.get(PRESERVE_BACKUP_FILE);
+    if (delivered === undefined || backup === undefined) return null;
+    return checkDelivered(delivered, backup);
+  }, [state]);
+
   return useMemo(
     () => ({
       loadReporter,
@@ -770,8 +899,10 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
       state,
       hasCheckpoint,
       activePhase: phaseOfPanelId(runner.active),
+      prompt,
       loading: runner.active === LOAD_PANEL_ID,
       lastSave,
+      deliveredCheck,
       runPhase,
       cancel,
       saveAgain,
@@ -783,7 +914,9 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
       state,
       hasCheckpoint,
       runner.active,
+      prompt,
       lastSave,
+      deliveredCheck,
       runPhase,
       cancel,
       saveAgain,

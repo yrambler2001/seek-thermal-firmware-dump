@@ -89,12 +89,13 @@ export function App({ support }: AppProps = {}): ReactElement {
   const preserve = usePreservePanel({ runner, device, form: options });
 
   /* The original routed the Connect panel's own log lines into whichever
-   * view's main panel was showing. Same rule. */
+   * view's main panel was showing. Same rule — on the wizard, the step that
+   * is running, since that is where a mid-run Connect pick belongs. */
   const viewReporter =
     route === 'flash'
       ? flash.infoReporter
       : route === 'preserve'
-        ? preserve.phaseReporters['read-build']
+        ? preserve.phaseReporters[preserve.activePhase ?? 'read-build']
         : dump.reporter;
   const { testing, test } = useConnectionTest({
     runner,
@@ -147,12 +148,12 @@ export function App({ support }: AppProps = {}): ReactElement {
             </p>
           ) : (
             <p>
-              Runs the v1 preservation pipeline <strong>one step at a time</strong>: back up the
-              reachable flash, patch the active slot in place, dump the whole part, restore the
-              original bank, verify. Every completed step re-issues a downloadable run file — the
-              run&apos;s only memory — so the wizard can be stopped after any step and resumed, or
-              started at a non-first step, from that file.{' '}
-              <strong>Two of the six steps write the active boot slot.</strong>
+              Makes a <strong>complete</strong> copy of the camera&apos;s 4&nbsp;MiB flash —
+              including the parts a normal dump cannot reach — and then puts the camera back exactly
+              as it was. It backs up what it can read, briefly patches the firmware so the rest can
+              be read, dumps everything, restores the original and checks it. Everything runs
+              locally in your browser. <strong>Two of the steps write to flash</strong>, and each
+              asks you first.
             </p>
           )}
         </Prose>
@@ -196,7 +197,12 @@ export function App({ support }: AppProps = {}): ReactElement {
             onProfileChoice={setProfileChoice}
           />
         ) : (
-          <PreserveView preserve={preserve} connected={device.device !== null} busy={runner.busy} />
+          <PreserveView
+            preserve={preserve}
+            connected={device.device !== null}
+            busy={runner.busy}
+            onConnect={onConnect}
+          />
         )}
       </main>
     </div>

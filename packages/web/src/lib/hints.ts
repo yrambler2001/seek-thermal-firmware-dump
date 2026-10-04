@@ -154,9 +154,11 @@ function isFirmwareTooOld(error: SeekError): boolean {
  */
 export const POWER_CYCLE_HINT =
   'In this wizard: unplug the camera and plug it back in, press "Connect device" and pick it, ' +
-  'then run the same phase again. The run is still loaded here — there is nothing to resume.';
+  'then start the same step again. The run is still loaded here — there is nothing to resume.';
 
-function isPowerCycleRefusal(error: SeekError): boolean {
+/** A step refused because the camera's reader is spent until a power cycle. */
+export function isPowerCycleRefusal(error: unknown): boolean {
+  if (!isSeekError(error)) return false;
   return error.code === 'pipeline/refused' && error.message.includes('power-cycle the camera');
 }
 

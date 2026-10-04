@@ -1,27 +1,35 @@
 /**
- * The preserve wizard: three phases, each one runner task that runs its core
- * steps back-to-back, each completed phase re-issuing the downloadable run
- * file. The image is never picked — phase ① reads it from the camera's own
- * active slot and the plan prints from what the camera produced. Everything
- * risky is doubled: the gates refuse before the button lights, the writes
- * (the ② commit, the ③ restore) and any past-commit jump open a modal first,
- * and the phases that reset the camera treat the mid-phase disconnect as the
- * reset working, not as a device swap.
+ * The preserve wizard, laid out like the dump view: the shared Connect step
+ * is 01, and each of the three phases is its own numbered step (02–04) with
+ * its start button on top, a plain-words description, and its own bar and
+ * log. The image is never picked — step 02 reads it from the camera's own
+ * active slot and the plan prints from what the camera produced.
+ *
+ * The run's expected hand-offs — the "Connect device" pick after every
+ * restart, the replug a pre-fix patch owes, the power cycle a spent reader
+ * needs — are the user's turn, not a fault: they show as a calm blue ask with
+ * the Connect button inside it, never as red. Red is kept for what really
+ * went wrong, and the two writes still open a confirmation dialog first.
  */
 
-import { useState, type ReactElement } from 'react';
+import { useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react';
 import {
   Archive,
   Circle,
   CircleCheck,
+  CircleStop,
   CircleX,
+  HardDriveDownload,
+  ListChecks,
   Loader2,
-  Lock,
   Play,
+  Plug,
+  RotateCcw,
   Save,
-  ShieldAlert,
+  ScanSearch,
 } from 'lucide-react';
 import { hexUp } from '@seek-fw/core';
+import { Panel, PanelTitle } from '@/components/Panel';
 import { Prose } from '@/components/Prose';
 import { RunPanel } from '@/components/RunPanel';
 import { Section } from '@/components/Section';
@@ -37,6 +45,7 @@ import {
 } from '@/components/ui/alert-dialog';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { Disclosure } from '@/components/ui/disclosure';
 import { KeyValue } from '@/components/KeyValue';
 import {
   Table,
@@ -49,10 +58,9 @@ import {
   TableRowHeader,
 } from '@/components/ui/table';
 import { Toolbar } from '@/components/ui/toolbar';
-import { canRunPhase, gateReason } from '@/lib/preserve/gating';
+import { canRunPhase, gateReason, type PreserveGate } from '@/lib/preserve/gating';
 import {
   PRESERVE_PHASES,
-  RESETS_CAMERA,
   WRITES_FLASH,
   phaseMeta,
   stepMeta,
@@ -60,9 +68,22 @@ import {
   type PreserveRunState,
   type PreserveStepId,
 } from '@/lib/preserve/types';
-import type { PreservePanelApi } from '@/hooks/usePreservePanel';
+import type { DeliveredCheck, PreservePanelApi, PreservePrompt } from '@/hooks/usePreservePanel';
 
 const RUN_ACCEPT = '.zip,application/zip';
+
+/** Connect is step 01, shared with the other views; the phases follow it. */
+const FIRST_PHASE_STEP = 2;
+
+const PHASE_ICON: Readonly<Record<PreservePhaseId, ReactNode>> = {
+  'read-build': <ScanSearch />,
+  'patch-dump': <HardDriveDownload />,
+  'restore-verify': <RotateCcw />,
+};
+
+function stepNumber(index: number): string {
+  return String(index + FIRST_PHASE_STEP).padStart(2, '0');
+}
 
 function bytesHex(bytes: readonly number[]): string {
   return bytes.map((byte) => byte.toString(16).padStart(2, '0')).join(' ');
@@ -112,6 +133,9 @@ export interface PreserveViewProps {
   readonly preserve: PreservePanelApi;
   readonly connected: boolean;
   readonly busy: boolean;
+  /** The Connect click, offered again inside a "your turn" ask so the user
+   *  does not have to scroll back to step 01 mid-run. */
+  readonly onConnect?: () => void;
 }
 
 interface ConfirmRequest {
@@ -119,7 +143,12 @@ interface ConfirmRequest {
   readonly jump: boolean;
 }
 
-export function PreserveView({ preserve, connected, busy }: PreserveViewProps): ReactElement {
+export function PreserveView({
+  preserve,
+  connected,
+  busy,
+  onConnect,
+}: PreserveViewProps): ReactElement {
   const [confirming, setConfirming] = useState<ConfirmRequest | null>(null);
   const { state } = preserve;
   const bankLine =
@@ -127,66 +156,59 @@ export function PreserveView({ preserve, connected, busy }: PreserveViewProps): 
       ? null
       : `bank ${state.detection.bank} at ${hexUp(state.detection.bankAddress, 8)}`;
 
-  /* The loud case: the commit is not on record while the run stands past the
-   * phase that would make it — so the phases that concern the patched part
-   * are shut (or jump-only), and the list has to say WHY at length. The
-   * likeliest cause is an interrupted commit on an already-patched camera;
-   * the recovery is the commit step's own pre-check or, explicitly, the
+  /* The one loud case: a commit attempt is on record as FAILED, so the write
+   * may already be on the camera — the steps that concern the patched part are
+   * shut (or jump-only), and the page has to say WHY. A run that simply has
+   * not reached the commit yet (right after step 02) is the normal order, not
+   * this. The recovery is the commit step's own pre-check or, explicitly, the
    * jump. */
   const pastCommitLoud =
-    state !== null &&
-    state.nextStep !== 'done' &&
-    state.steps.commit?.status !== 'done' &&
-    (state.steps.backup?.status === 'done' || state.steps.patch?.status === 'done');
+    state !== null && state.nextStep !== 'done' && state.steps.commit?.status === 'failed';
 
   return (
     <>
       <Section
         id="preserve-how"
-        title="Preserve the firmware — and put the camera back"
-        icon={<Archive />}
-        description="Three phases. The image is read from the camera's own active slot — there is no firmware file to pick anywhere; a run belongs to one camera and derives everything from it."
-      >
-        <Alert tone="err">
-          <p>
-            <strong>This wizard writes the camera&apos;s ACTIVE boot slot.</strong> The commit
-            (phase ②) and restore (phase ③) erase and reprogram the 64 KiB bank the camera is booted
-            from. An interrupted write there has no bootable fallback — recovery needs an SPI
-            programmer or SWD/J-Link. Run it on mains power, and keep every run file this page gives
-            you.
-          </p>
-        </Alert>
-        <Prose>
-          <p>
-            Each phase runs its steps back-to-back in one go and ends with the run file in your
-            downloads — the run&apos;s only memory; keep the latest one. Phase ② and phase ③ RESET
-            the camera mid-phase: it stays silent for roughly ten seconds while it boots, then
-            re-enumerates as the same unit (vid/pid {hexUp(0x289d, 4)}:{hexUp(0x10, 4)}) and the
-            wizard picks it up by itself — a slow middle is normal, not a failure. Do not replug
-            anything during a phase, and do not let the machine sleep.
-          </p>
-        </Prose>
-      </Section>
-
-      <Section
-        id="preserve-phases"
-        tone="danger"
-        title="The three phases"
-        icon={<ShieldAlert />}
-        aside={
-          <Badge tone="err">
-            <Archive />
-            Writes to flash
-          </Badge>
-        }
+        title="What to expect"
+        icon={<ListChecks />}
         description={
           state === null
-            ? 'Connect the camera, then start at phase ① — it creates the run and reads everything from it.'
+            ? 'Connect the camera, then start at step 02.'
             : `Run ${state.runId}${
                 state.expectedVersion === undefined ? '' : ` — firmware ${state.expectedVersion}`
-              }. Each completed phase updates the run file below.`
+              }.`
         }
       >
+        <Prose>
+          <ul>
+            <li>
+              The camera <strong>restarts</strong> during each step. After a restart Chrome no
+              longer recognises it (it has no USB serial number), so the page asks you to press{' '}
+              <strong>Connect device</strong> and pick the camera again. That is the normal flow —
+              the step carries on by itself once you do.
+            </li>
+            <li>There is no firmware file to pick: everything is read from the camera itself.</li>
+            <li>
+              After every step your browser downloads a <strong>run file</strong> named after the
+              run&apos;s start, the save time and the step it reached (
+              <code>preserve-…-verified.zip</code>), with one folder per step inside. Keep the
+              newest one — it lets you continue later.
+            </li>
+          </ul>
+        </Prose>
+        <Alert tone="warn">
+          <p>
+            <strong>Steps 03 and 04 write to the camera&apos;s flash</strong>, and each asks you to
+            confirm first. While one of them runs, keep the camera plugged in (unless the page asks
+            you to replug it) and the computer awake, ideally on mains power. An interrupted write
+            leaves a camera that only a hardware programmer (SPI or SWD/J-Link) can fix.
+          </p>
+          <p>
+            <strong>On a phone:</strong> before step 03, turn on airplane mode and switch off Wi-Fi
+            and mobile data, so a call or a notification cannot pull the browser away mid-write —
+            and keep the screen on. The page keeps working offline once it is open.
+          </p>
+        </Alert>
         {pastCommitLoud && (
           <Alert tone="err">
             <p>
@@ -195,44 +217,55 @@ export function PreserveView({ preserve, connected, busy }: PreserveViewProps): 
               </strong>{' '}
               The camera may already be running the patched image (an interrupted commit) or may not
               (the commit never started) — the run file cannot prove which. Do not run the dump or
-              restore phases against a patched camera without the commit on record; the way forward
-              is phase ②, whose commit pre-check reads the bank and refuses a blind replay. Only if
-              that pre-check has already refused with <em>already holds the patched bytes</em> does
-              the jump apply — and it goes through its own dialog.
+              restore against a patched camera without the commit on record; the way forward is step
+              03, whose commit pre-check reads the bank and refuses a blind replay. Only if that
+              pre-check has already refused with <em>already holds the patched bytes</em> does the
+              jump apply — and it goes through its own dialog.
             </p>
           </Alert>
         )}
-
-        <ol className="space-y-4">
-          {PRESERVE_PHASES.map((meta, index) => (
-            <PhaseRow
-              key={meta.id}
-              index={index}
-              meta={meta}
-              state={state}
-              preserve={preserve}
-              connected={connected}
-              busy={busy}
-              onArm={(jump) => {
-                setConfirming({ phase: meta.id, jump });
-              }}
-            />
-          ))}
-        </ol>
       </Section>
+
+      {PRESERVE_PHASES.map((meta, index) => (
+        <PhaseSection
+          key={meta.id}
+          index={index}
+          meta={meta}
+          state={state}
+          preserve={preserve}
+          connected={connected}
+          busy={busy}
+          onConnect={onConnect}
+          onArm={(jump) => {
+            setConfirming({ phase: meta.id, jump });
+          }}
+        />
+      ))}
+
+      {state !== null && state.nextStep === 'done' && (
+        <VerifySummary
+          state={state}
+          check={preserve.deliveredCheck}
+          busy={busy}
+          onSave={() => {
+            preserve.saveAgain();
+          }}
+        />
+      )}
 
       <Section
         id="preserve-runfile"
-        eyebrow="between phases"
-        title="Run file — save, leave, come back"
+        tone="quiet"
+        eyebrow="Optional — to continue a run later"
+        title="Run file"
         icon={<Save />}
-        description="The run's only memory. It is rebuilt and downloaded after every completed phase (and after a failed or cancelled one, with the checkpoints it did record); keep the latest one. To resume — or to start at a non-first phase after an issue — load it here and the wizard continues from what it records."
+        description="The run's only record. It downloads by itself after every step (and after a step that stopped early); keep the newest one. To continue later, or after a problem, load it here and the page picks up where it left off."
       >
         {state !== null && preserve.lastSave !== null ? (
           <KeyValue
             rows={[
               ['Run', state.runId],
-              ['File', `preserve-run-${state.runId}.zip`],
+              ['File', preserve.lastSave.fileName],
               [
                 'Last saved',
                 `after ${preserve.lastSave.afterStep} — ${preserve.lastSave.at} (${String(
@@ -244,21 +277,11 @@ export function PreserveView({ preserve, connected, busy }: PreserveViewProps): 
           />
         ) : (
           <Prose>
-            <p>No run is active. Phase ① creates one, or load a run file below.</p>
+            <p>No run is active. Step 02 starts one, or load a run file here.</p>
           </Prose>
         )}
 
         <Toolbar label="Run file actions">
-          <Button
-            variant="outline"
-            disabled={state === null || busy}
-            onClick={() => {
-              preserve.saveAgain();
-            }}
-          >
-            <Save />
-            Save the run file again
-          </Button>
           <Button
             id="preservePickRun"
             variant="default"
@@ -272,6 +295,15 @@ export function PreserveView({ preserve, connected, busy }: PreserveViewProps): 
             <Archive />
             Load a run file…
           </Button>
+          <Button
+            disabled={state === null || busy}
+            onClick={() => {
+              preserve.saveAgain();
+            }}
+          >
+            <Save />
+            Save the run file again
+          </Button>
         </Toolbar>
 
         <RunPanel
@@ -282,16 +314,6 @@ export function PreserveView({ preserve, connected, busy }: PreserveViewProps): 
           trimmed={preserve.loadReporter.trimmed}
         />
       </Section>
-
-      {state !== null && state.nextStep === 'done' && (
-        <VerifySummary
-          state={state}
-          busy={busy}
-          onSave={() => {
-            preserve.saveAgain();
-          }}
-        />
-      )}
 
       <PhaseConfirm
         request={confirming}
@@ -321,164 +343,191 @@ function pickRunFile(onPick: (file: File) => void): void {
   input.click();
 }
 
-/* ---- one phase row ------------------------------------------------------ */
+/* ---- one phase, as its own numbered step -------------------------------- */
 
-interface PhaseRowProps {
+interface PhaseSectionProps {
   readonly index: number;
   readonly meta: (typeof PRESERVE_PHASES)[number];
   readonly state: PreserveRunState | null;
   readonly preserve: PreservePanelApi;
   readonly connected: boolean;
   readonly busy: boolean;
-  /** Opens the danger dialog; `jump` marks the past-commit variant. */
+  readonly onConnect: (() => void) | undefined;
+  /** Opens the confirmation dialog; `jump` marks the past-commit variant. */
   readonly onArm: (jump: boolean) => void;
 }
 
-function PhaseRow({
+/** Why the start button is dark, in words — or null when there is nothing to
+ *  explain (it is lit, the step is done, or an ask already says what to do). */
+function notReadyLine(
+  gate: PreserveGate,
+  state: PreserveRunState | null,
+  index: number,
+): string | null {
+  if (gate.ok || gate.jumpable || gate.needsPowerCycle) return null;
+  if (state === null) return 'Available after step 02 — it starts the run.';
+  const previous = PRESERVE_PHASES[index - 1];
+  if (previous?.steps.some((step) => state.steps[step]?.status !== 'done')) {
+    return `Available after step ${stepNumber(index - 1)} (${previous.label}).`;
+  }
+  const reason = gateReason(gate);
+  return reason === null ? null : `Not ready yet — ${reason}.`;
+}
+
+function PhaseSection({
   index,
   meta,
   state,
   preserve,
   connected,
   busy,
+  onConnect,
   onArm,
-}: PhaseRowProps): ReactElement {
+}: PhaseSectionProps): ReactElement {
   const phase = meta.id;
   const gate = canRunPhase({ state, phase, has: preserve.hasCheckpoint });
   const reporter = preserve.phaseReporters[phase];
   const active = preserve.activePhase === phase;
-  const reason = gateReason(gate);
   const writes = meta.steps.some((step) => WRITES_FLASH.has(step));
   /* A phase needs the camera when any step it will actually run touches the
    * wire — everything does except a patch step resumed on its own. */
-  const startStep = gate.startStep;
+  /* Done is read off the run itself: the gate names the phase's first step
+   * as its start even when every step is recorded done. */
+  const phaseDone =
+    state !== null && meta.steps.every((step) => state.steps[step]?.status === 'done');
+  const startStep = phaseDone ? null : gate.startStep;
   const startIndex = startStep === null ? meta.steps.length : meta.steps.indexOf(startStep);
   const pending = meta.steps.slice(startIndex);
   const needsCamera = pending.some((step) => step !== 'patch');
+  const cameraMissing = needsCamera && !connected;
 
-  const phaseDone = startStep === null;
   const phaseFailed = pending.some((step) => state?.steps[step]?.status === 'failed');
+  const upNext = state !== null && state.nextStep !== 'done' && startStep === state.nextStep;
+
+  const ask: PreservePrompt['kind'] | 'power-cycle-assert' | null =
+    preserve.prompt?.phase === phase
+      ? preserve.prompt.kind
+      : gate.needsPowerCycle && !active
+        ? 'power-cycle-assert'
+        : null;
 
   const run = (jump: boolean): void => {
     if (gate.confirm || jump) onArm(jump);
     else void preserve.runPhase(phase);
   };
 
-  const Icon = active
-    ? Loader2
-    : phaseDone
-      ? CircleCheck
-      : phaseFailed
-        ? CircleX
-        : gate.ok || gate.jumpable
-          ? Play
-          : Lock;
+  const jumpOnly = gate.jumpable && !gate.ok;
+  const startLabel = jumpOnly
+    ? 'Run past the unrecorded commit'
+    : phaseFailed
+      ? `Try ${meta.label.toLowerCase()} again`
+      : `Start ${meta.label.toLowerCase()}`;
+  const notReady = phaseDone ? null : notReadyLine(gate, state, index);
+
+  const status = active ? (
+    <Badge tone="accent">
+      <Loader2 className="animate-spin motion-reduce:animate-none" />
+      Running
+    </Badge>
+  ) : phaseDone ? (
+    <Badge tone="ok">
+      <CircleCheck />
+      Done
+    </Badge>
+  ) : phaseFailed ? (
+    <Badge tone="warn">Stopped — see the log</Badge>
+  ) : upNext ? (
+    <Badge tone="accent">Up next</Badge>
+  ) : null;
 
   return (
-    <li className="space-y-3 rounded-lg border border-border/70 bg-sunken/30 p-4">
-      <div className="flex flex-wrap items-center gap-2">
-        <Icon
-          aria-hidden="true"
-          className={
-            active
-              ? 'size-4 animate-spin text-primary'
-              : phaseDone
-                ? 'size-4 text-ok'
-                : phaseFailed
-                  ? 'size-4 text-destructive'
-                  : 'size-4 text-muted-foreground'
-          }
-        />
-        <span className="font-mono text-[0.78rem] text-muted-foreground tabular-nums">
-          {String(index + 1).padStart(2, '0')}
-        </span>
-        <span className="text-[0.95rem] font-semibold">{meta.label}</span>
-        {state !== null && state.nextStep !== 'done' && startStep === state.nextStep && (
-          <Badge tone="accent">Up next</Badge>
+    <Section
+      id={`preserve-${phase}`}
+      step={String(index + FIRST_PHASE_STEP)}
+      title={meta.label}
+      icon={PHASE_ICON[phase]}
+      aside={
+        status === null && !writes ? undefined : (
+          <span className="flex flex-wrap items-center justify-end gap-1.5">
+            {/* Phone width keeps the title whole; "What to expect" and the
+             * dialog already say which steps write. */}
+            {writes && (
+              <Badge tone="neutral" className="hidden sm:inline-flex">
+                writes to the camera
+              </Badge>
+            )}
+            {status}
+          </span>
+        )
+      }
+    >
+      <Toolbar label={`${meta.label} actions`}>
+        <Button
+          variant="default"
+          disabled={(!gate.ok && !gate.jumpable) || busy || cameraMissing || gate.needsPowerCycle}
+          onClick={() => {
+            run(jumpOnly);
+          }}
+        >
+          <Play />
+          {startLabel}
+        </Button>
+        {gate.ok && gate.jumpable && (
+          <Button
+            disabled={busy || cameraMissing}
+            onClick={() => {
+              onArm(true);
+            }}
+          >
+            Skip the commit — start at the drain
+          </Button>
         )}
-        {writes && (
-          <Badge tone="err">
-            <Archive />
-            Writes to flash
-          </Badge>
-        )}
-        {RESETS_CAMERA.has(phase) && <Badge tone="neutral">resets the camera mid-phase</Badge>}
-        {phaseDone && <Badge tone="ok">done</Badge>}
-        {phaseFailed && <Badge tone="err">failed — run it again</Badge>}
-        <span className="ms-auto flex gap-2">
-          {active ? (
-            <Button variant="ghost" onClick={preserve.cancel}>
-              Cancel
-            </Button>
-          ) : (
-            <>
-              {gate.needsPowerCycle && (
-                <Button
-                  variant="destructive"
-                  disabled={busy || (needsCamera && !connected)}
-                  onClick={() => {
-                    void preserve.runPhase(phase, { powerCycled: true });
-                  }}
-                >
-                  I power-cycled the camera — re-run the phase
-                </Button>
-              )}
-              {gate.ok && gate.jumpable && (
-                <Button
-                  variant="destructive"
-                  disabled={busy || (needsCamera && !connected)}
-                  onClick={() => {
-                    onArm(true);
-                  }}
-                >
-                  Skip the commit — start at the drain
-                </Button>
-              )}
-              <Button
-                variant={writes || gate.jumpable ? 'destructive' : 'outline'}
-                disabled={!gate.ok && !gate.jumpable ? true : busy || (needsCamera && !connected)}
-                onClick={() => {
-                  run(gate.jumpable && !gate.ok);
-                }}
-              >
-                {gate.jumpable && !gate.ok ? 'Run past the unrecorded commit' : 'Run phase'}
-              </Button>
-            </>
-          )}
-        </span>
-      </div>
+        <Button variant="ghost" disabled={!active} onClick={preserve.cancel}>
+          <CircleStop />
+          Cancel
+        </Button>
+      </Toolbar>
 
-      <p className="text-[0.82rem] text-muted-foreground">{meta.description}</p>
+      <Prose>
+        <p>{meta.description}</p>
+      </Prose>
 
       <StepChips steps={meta.steps} state={state} />
 
-      {reason !== null && <p className="text-[0.78rem] text-warn">This phase {reason}.</p>}
-      {gate.needsPowerCycle && (
-        <p className="text-[0.78rem] text-warn">
-          The previous backup attempt failed, and the camera must be power-cycled before it re-runs
-          (unplug and replug it, or use its power switch). The re-run button above asserts that you
-          did — the camera cannot report a power cycle itself.
-        </p>
+      {ask !== null && (
+        <YourTurn
+          kind={ask}
+          label={meta.label}
+          busy={busy}
+          connected={connected}
+          onConnect={onConnect}
+          onPowerCycled={() => {
+            void preserve.runPhase(phase, { powerCycled: true });
+          }}
+        />
       )}
+
+      {notReady !== null && <p className="text-[0.8rem] text-muted-foreground">{notReady}</p>}
       {gate.pastCommit && (
-        <p className="text-[0.78rem] font-medium text-warn">
+        <p className="text-[0.8rem] font-medium text-warn">
           Concerns the patched part while the commit is not on record — the camera may already be
-          patched. See the warning at the top of this list.
+          patched. See the note under &ldquo;What to expect&rdquo;.
         </p>
       )}
       {phase === 'restore-verify' &&
         gate.ok &&
+        preserve.activePhase === null &&
         state !== null &&
         state.steps.commit?.status === 'done' &&
         state.steps.drain?.status !== 'done' && (
-          <p className="text-[0.78rem] text-warn">
-            The drain has not run — this phase restores the camera without delivering the whole-part
-            dump. Run phase ② first unless the dump does not matter to you.
+          <p className="text-[0.8rem] text-warn">
+            The whole-part dump has not run — this step puts the camera back without it. Run step 03
+            first unless the dump does not matter to you.
           </p>
         )}
-      {active && writes && (
-        <p className="text-[0.82rem] font-semibold text-destructive">
-          Do not unplug the camera, and do not let the machine sleep, until this phase finishes.
+      {active && writes && ask === null && (
+        <p className="text-[0.8rem] text-muted-foreground">
+          Keep the camera plugged in and the computer awake until this step finishes.
         </p>
       )}
 
@@ -488,12 +537,121 @@ function PhaseRow({
       <RunPanel
         id={`preserve-phase-${phase}`}
         label={meta.label}
-        tone={writes ? 'danger' : 'default'}
         progress={reporter.progress}
         lines={reporter.lines}
         trimmed={reporter.trimmed}
       />
-    </li>
+
+      <Disclosure summary="What this step does, in detail">
+        {meta.steps.map((step) => (
+          <p key={step}>
+            <strong className="text-foreground">{stepMeta(step).label}.</strong>{' '}
+            {stepMeta(step).description}
+          </p>
+        ))}
+      </Disclosure>
+    </Section>
+  );
+}
+
+/* ---- the user's turn: the expected hand-offs, calmly -------------------- */
+
+interface YourTurnProps {
+  readonly kind: PreservePrompt['kind'] | 'power-cycle-assert';
+  readonly label: string;
+  readonly busy: boolean;
+  readonly connected: boolean;
+  readonly onConnect: (() => void) | undefined;
+  readonly onPowerCycled: () => void;
+}
+
+const YOUR_TURN: Readonly<
+  Record<YourTurnProps['kind'], { readonly title: string; readonly body: string }>
+> = {
+  reconnect: {
+    title: 'Your turn: press Connect device and pick the camera.',
+    body:
+      'The camera restarted, as planned. Chrome cannot recognise it again by itself (it has no ' +
+      'USB serial number), so it needs you to pick it once more. The step carries on as soon as ' +
+      'you do.',
+  },
+  replug: {
+    title: 'Your turn: unplug the camera, plug it back in, then press Connect device.',
+    body:
+      'This run’s patch was made before the reader fix, so the camera needs a fresh power-up ' +
+      'before the restore. The run file is already saved.',
+  },
+  'replug-before-restore': {
+    title: 'Before step 04: unplug the camera, plug it back in, then press Connect device.',
+    body:
+      'This run’s patch was made before the reader fix, so the camera needs a fresh power-up ' +
+      'before the restore. The run file is already saved.',
+  },
+  'power-cycle': {
+    title: 'Your turn: unplug the camera, plug it back in, press Connect device — then try again.',
+    body:
+      'The camera’s reader needs a fresh power-up before it can be read again. The run is still ' +
+      'loaded here; nothing is lost.',
+  },
+  'power-cycle-assert': {
+    title: 'Your turn: unplug the camera, plug it back in, press Connect device — then continue.',
+    body:
+      'The last backup attempt stopped, and the camera needs a fresh power-up before it runs ' +
+      'again. The camera cannot report that by itself, so the button below tells the page you ' +
+      'did it.',
+  },
+};
+
+function YourTurn({
+  kind,
+  label,
+  busy,
+  connected,
+  onConnect,
+  onPowerCycled,
+}: YourTurnProps): ReactElement {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const copy = YOUR_TURN[kind];
+  /* The ask can land while the user is reading elsewhere on the page: bring
+   * it into view once, gently. */
+  useEffect(() => {
+    const node = ref.current;
+    /* jsdom has no scrollIntoView; a real browser always does. */
+    if (node !== null && 'scrollIntoView' in node) {
+      node.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }, [kind]);
+
+  return (
+    <div ref={ref} role="status" aria-live="polite">
+      <Alert tone="info">
+        <p>
+          <strong>{copy.title}</strong>
+        </p>
+        <p>{copy.body}</p>
+        <Toolbar label="Your turn" className="pt-1">
+          {onConnect !== undefined && (
+            <Button
+              variant={kind === 'power-cycle-assert' && connected ? 'outline' : 'default'}
+              onClick={onConnect}
+            >
+              <Plug />
+              Connect device
+            </Button>
+          )}
+          {kind === 'power-cycle-assert' && (
+            <Button
+              variant={connected ? 'default' : 'outline'}
+              disabled={busy || !connected}
+              onClick={onPowerCycled}
+            >
+              <Play />
+              {`I replugged it — continue ${label.toLowerCase()}`}
+            </Button>
+          )}
+        </Toolbar>
+      </Alert>
+    </div>
   );
 }
 
@@ -506,7 +664,7 @@ function StepChips({
   readonly state: PreserveRunState | null;
 }): ReactElement {
   return (
-    <ul className="flex flex-wrap gap-x-4 gap-y-1">
+    <ul className="flex flex-wrap gap-x-4 gap-y-1" aria-label="Progress">
       {steps.map((step) => {
         const record = state?.steps[step];
         const Icon =
@@ -519,7 +677,7 @@ function StepChips({
                 record?.status === 'done'
                   ? 'size-3.5 text-ok'
                   : record?.status === 'failed'
-                    ? 'size-3.5 text-destructive'
+                    ? 'size-3.5 text-warn'
                     : 'size-3.5 text-muted-foreground'
               }
             />
@@ -539,8 +697,15 @@ function PlanFromState({ state }: { readonly state: PreserveRunState }): ReactEl
     return <></>;
   }
   return (
-    <div className="space-y-3 rounded-lg border border-border/70 bg-background/60 p-3">
-      <p className="text-[0.82rem] font-semibold">The plan, from the camera&apos;s own bytes</p>
+    <Disclosure
+      summary={`The plan — ${state.buildLabel ?? state.buildId ?? 'your camera'}, ${
+        patch.diffCount === undefined ? 'the patch' : `${String(patch.diffCount)} bytes change`
+      }`}
+    >
+      <p>
+        Printed from the camera&apos;s own bytes. Nothing is written until step 03 runs, and step 04
+        puts every one of these bytes back.
+      </p>
       <KeyValue
         rows={[
           [
@@ -605,18 +770,16 @@ function PlanFromState({ state }: { readonly state: PreserveRunState }): ReactEl
           ))}
         </TableBody>
       </Table>
-      <Prose>
-        <p>
-          On the part these bytes land as the XOR-difference against the bank capture (the keystream
-          cancels), so the camera&apos;s decrypted image changes by exactly this diff and nothing
-          else. Nothing is written until phase ② runs.
-        </p>
-      </Prose>
-    </div>
+      <p>
+        On the part these bytes land as the XOR-difference against the bank capture (the keystream
+        cancels), so the camera&apos;s decrypted image changes by exactly this diff and nothing
+        else.
+      </p>
+    </Disclosure>
   );
 }
 
-/* ---- phase ③'s tail: the verify verdict, unmistakably -------------------- */
+/* ---- step 04's tail: the verify verdict --------------------------------- */
 
 function VerifyVerdict({
   state,
@@ -629,10 +792,11 @@ function VerifyVerdict({
     return (
       <Alert tone="ok">
         <p>
-          <strong>VERIFY: MATCH.</strong> A fresh boot re-read {String(verify.windowsRead)}/31
-          windows at {String(verify.diffBytes)} differing byte(s)
-          {verify.badWindows.length > 0 ? ` (short windows: ${verify.badWindows.join(',')})` : ''} —
-          the camera&apos;s flash is byte-identical to the backup taken before the first write.
+          <strong>Verified — a perfect match.</strong> After a fresh start the camera was read
+          again: {String(verify.windowsRead)}/31 blocks, {String(verify.diffBytes)} differing
+          byte(s)
+          {verify.badWindows.length > 0 ? ` (short blocks: ${verify.badWindows.join(',')})` : ''}.
+          Its flash is exactly what it was before the first write.
         </p>
       </Alert>
     );
@@ -642,7 +806,7 @@ function VerifyVerdict({
     return (
       <Alert tone="err">
         <p>
-          <strong>VERIFY: NO MATCH.</strong> The re-read found differences against the backup —{' '}
+          <strong>The check found differences against the backup.</strong>{' '}
           {failed.error ?? 'unknown reason'}
         </p>
       </Alert>
@@ -651,7 +815,7 @@ function VerifyVerdict({
   return null;
 }
 
-/* ---- the danger dialog -------------------------------------------------- */
+/* ---- the confirmation dialog -------------------------------------------- */
 
 interface PhaseConfirmProps {
   readonly request: ConfirmRequest | null;
@@ -681,26 +845,26 @@ function PhaseConfirm({ request, bankLine, onConfirm, onCancel }: PhaseConfirmPr
             <>
               <span className="block">
                 THE COMMIT IS NOT ON RECORD for this run, and you are asserting that the writes
-                landed without their checkpoints: the phase starts past the commit instead of
+                landed without their checkpoints: the step starts past the commit instead of
                 replaying it. The steps&apos; own checks still run — the version read, the bank
-                pre-checks — and a wrong guess costs a wasted drain, not a bricked camera.
+                pre-checks — and a wrong guess costs a wasted dump, not a bricked camera.
               </span>
               <span className="block">
-                Do not unplug the camera, and do not let the machine sleep, until the phase
-                finishes.
+                Keep the camera plugged in and the computer awake until the step finishes.
               </span>
             </>
           ) : (
             <>
               <span className="block">
                 {writing
-                  ? 'The commit is the irreversible write: it erases and reprograms the 64 KiB bank the camera is booted from. An interrupted write there has no bootable fallback — recovery needs an SPI programmer or SWD/J-Link. The drain that follows only reads.'
-                  : 'This restores the original bank content over the active bank — the other write of the run. An interrupted write there has no bootable fallback — recovery needs an SPI programmer or SWD/J-Link.'}
+                  ? 'This writes a small patch into the firmware block the camera starts from. Step 04 puts the original back. The dump that follows only reads.'
+                  : 'This writes your original firmware back over the patched block.'}
               </span>
               <span className="block">
-                Do not unplug the camera, and do not let the machine sleep, until the phase
-                finishes. The camera will RESET mid-phase and re-enumerate — the wizard picks it up
-                by itself.
+                Keep the camera plugged in and the computer awake while it writes — an interrupted
+                write leaves a camera that only a hardware programmer (SPI or SWD/J-Link) can fix.
+                On a phone, airplane mode on and the screen kept on. The camera then restarts; when
+                the page asks, press Connect device and pick it again. That is expected.
               </span>
             </>
           )}
@@ -724,55 +888,85 @@ function PhaseConfirm({ request, bankLine, onConfirm, onCancel }: PhaseConfirmPr
 
 interface VerifySummaryProps {
   readonly state: PreserveRunState;
+  readonly check: DeliveredCheck | null;
   readonly busy: boolean;
   readonly onSave: () => void;
 }
 
-function VerifySummary({ state, busy, onSave }: VerifySummaryProps): ReactElement {
-  const match = state.deliveredSha256 === state.imageSha256;
+function blockList(addresses: readonly number[]): string {
+  return addresses.map((address) => hexUp(address, 8)).join(', ');
+}
+
+/** The delivered image's own verdict: held against the backup taken before
+ *  the first write, block by block — the comparison that can actually match.
+ *  (Its sha is a whole 4 MiB part; the firmware image's sha is one decrypted
+ *  slot, so those two never equal each other.) */
+function deliveredVerdict(check: DeliveredCheck | null): ReactNode {
+  if (check === null) return null;
+  if (check.differing.length > 0) {
+    return (
+      <Badge tone="err">
+        {`differs from the backup in ${String(check.differing.length)} of ` +
+          `${String(check.blocksCompared)} blocks: ${blockList(check.differing)}`}
+      </Badge>
+    );
+  }
+  return (
+    <Badge tone="ok">{`matches the backup on all ${String(check.blocksCompared)} blocks`}</Badge>
+  );
+}
+
+function VerifySummary({ state, check, busy, onSave }: VerifySummaryProps): ReactElement {
   return (
     <Section
       id="preserve-done"
       tone="ok"
-      title="Run complete — the proof"
+      title="Done — your firmware is preserved"
       icon={<CircleCheck />}
-      description="The delivered image is the camera's original flash content with nothing left behind; the raw dump is the part as the commit left it."
+      description="The complete image is the camera's whole original flash, and the camera itself is back exactly as it was."
     >
-      <KeyValue
-        rows={[
-          [
-            'Delivered image',
-            <>
-              {state.deliveredSha256 ?? 'not produced'}
-              {state.deliveredSha256 !== undefined && (
-                <Badge tone={match ? 'ok' : 'err'}>
-                  {match ? 'matches the as-booted image' : 'DOES NOT match the as-booted image'}
-                </Badge>
-              )}
-            </>,
-          ],
-          ['As-booted image (read from the camera)', state.imageSha256 ?? 'not produced'],
-          [
-            'Raw post-commit part',
-            <>
-              {state.rawDumpSha256 ?? 'not produced'}
-              {state.rawDumpSha256 !== undefined && (
-                <Badge tone="neutral">recorded, not expected to match the image</Badge>
-              )}
-            </>,
-          ],
-          [
-            'Verify',
-            state.verify === undefined
-              ? (state.steps.verify?.notes ?? null)
-              : `${String(state.verify.windowsRead)}/31 windows re-read at ` +
-                `${String(state.verify.diffBytes)} differing byte(s)` +
-                (state.verify.badWindows.length > 0
-                  ? ` (short windows: ${state.verify.badWindows.join(',')})`
-                  : ''),
-          ],
-        ]}
-      />
+      <Panel>
+        <PanelTitle icon={<CircleCheck />}>The proof</PanelTitle>
+        <KeyValue
+          rows={[
+            [
+              'Complete image (4 MiB)',
+              <>
+                {state.deliveredSha256 ?? 'not produced'} {deliveredVerdict(check)}
+              </>,
+            ],
+            ...(check === null || check.onlyInFullDump.length === 0
+              ? []
+              : ([
+                  [
+                    'Only in the full dump',
+                    `${String(check.onlyInFullDump.length)} block(s) a stock read cannot reach: ` +
+                      blockList(check.onlyInFullDump),
+                  ],
+                ] as const)),
+            [
+              'Raw post-commit part',
+              <>
+                {state.rawDumpSha256 ?? 'not produced'}{' '}
+                {state.rawDumpSha256 !== undefined && (
+                  <Badge tone="neutral">the same, with the patch still in</Badge>
+                )}
+              </>,
+            ],
+            ['Firmware image (decrypted, from the boot slot)', state.imageSha256 ?? 'not produced'],
+            [
+              'Verify',
+              state.verify === undefined
+                ? (state.steps.verify?.notes ?? null)
+                : `${String(state.verify.windowsRead)}/31 windows re-read at ` +
+                  `${String(state.verify.diffBytes)} differing byte(s)` +
+                  (state.verify.badWindows.length > 0
+                    ? ` (short windows: ${state.verify.badWindows.join(',')})`
+                    : ''),
+            ],
+          ]}
+        />
+      </Panel>
       <Toolbar label="Archive actions">
         <Button variant="default" disabled={busy} onClick={onSave}>
           <Save />

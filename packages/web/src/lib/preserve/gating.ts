@@ -227,7 +227,14 @@ export function canRunPhase(input: PreserveGateInput): PreserveGate {
    * else. A phase whose only gaps are those runs ONLY as a jump; a phase
    * with no gaps at all runs normally and may additionally offer the
    * jump-past-a-failed-commit (see below). */
-  const orderOnly = ordering.length > 0 && missing.length === 0;
+  /* The commit is in doubt only when an attempt is ON RECORD as failed: the
+   * write may have landed. A run that simply has not reached the commit yet —
+   * the normal state right after phase ① — is not in doubt, and its later
+   * phases just wait. (A commit interrupted with no record at all is sorted by
+   * the commit's own pre-check, which reads the bank and records the failure
+   * that opens the jump.) */
+  const commitInDoubt = state.steps.commit?.status === 'failed' && !done(state, 'commit');
+  const orderOnly = ordering.length > 0 && missing.length === 0 && commitInDoubt;
   const ok = missing.length === 0 && ordering.length === 0;
   /* Two steps of one phase can want the same file (the commit and the drain
    * both need the capture) — named once, in first-seen order. */
@@ -248,10 +255,12 @@ export function canRunPhase(input: PreserveGateInput): PreserveGate {
   return {
     ok,
     missing: ok ? [] : orderOnly ? ordering : [...ordering, ...uniqueMissing],
-    /* Loud only where the situation is anomalous: the run stands PAST phase ①
-     * (the backup is on record) and the commit still is not. On a fresh run
-     * the ordering gaps are just the run's normal order. */
-    pastCommit: (ordering.length > 0 || stuckJump) && state.steps.backup?.status === 'done',
+    /* Loud only where the situation is anomalous: a commit attempt failed, so
+     * the camera may already run the patched image. Everywhere else the
+     * ordering gaps are just the run's normal order. */
+    pastCommit:
+      ((ordering.length > 0 && commitInDoubt) || stuckJump) &&
+      state.steps.backup?.status === 'done',
     jumpable: orderOnly || stuckJump,
     startStep,
     jumpStartStep: stuckJump ? 'drain' : orderOnly ? startStep : null,
