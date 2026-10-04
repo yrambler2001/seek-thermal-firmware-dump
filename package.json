@@ -17,6 +17,7 @@
     "build": "npm run build --workspace @seek-fw/core && npm run build --workspace @seek-fw/cli && npm run build --workspace @seek-fw/web",
     "build:docs": "npm run build --workspace @seek-fw/web",
     "dev": "npm run dev --workspace @seek-fw/web",
+    "dev:phone": "node scripts/dev-phone.mjs",
     "cli": "npm run --silent start --workspace @seek-fw/cli --",
     "typecheck": "tsc --build --force && tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/cli/tsconfig.json && tsc --noEmit -p packages/web/tsconfig.app.json && tsc --noEmit -p packages/web/tsconfig.node.json && tsc --noEmit -p tsconfig.tools.json",
     "lint": "eslint .",

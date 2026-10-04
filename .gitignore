@@ -5,3 +5,5 @@ coverage/
 .DS_Store
 .vite/
 .eslintcache
+# the dev:phone server's self-signed certificate (scripts/dev-phone.mjs)
+.cert/

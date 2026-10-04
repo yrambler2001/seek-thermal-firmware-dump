@@ -763,6 +763,7 @@ cd seek-thermal-firmware-dump
 npm ci
 
 npm run dev        # web app on http://localhost:5173
+npm run dev:phone  # the same over HTTPS on your Wi-Fi, for an Android phone
 npm run test       # vitest, all packages
 npm run check      # format + lint + typecheck + test
 npm run build      # builds core, cli, and the web app into docs/
@@ -777,11 +778,24 @@ sync.
 ### Running the web app locally
 
 WebUSB needs a secure context, which means HTTPS or `localhost`. `npm run dev` gives you the latter.
-To reach it from an Android phone over USB, forward the port so the phone sees `localhost`:
+
+On an Android phone the camera takes the phone's USB port (through an OTG adapter), so the phone
+reaches the dev server over Wi-Fi, and a plain `http://<computer>:5173` has no WebUSB. Run
 
 ```sh
-adb reverse tcp:5173 tcp:5173
+npm run dev:phone
 ```
+
+It serves the app over HTTPS on port 5174 (`PORT=…` to change it) with a self-signed certificate
+it makes in `packages/web/.cert/` for this computer's network address, and prints the address to
+open on the phone. Chrome warns that the certificate is not trusted; tap _Advanced_, then _Proceed_.
+If WebUSB is still missing on that page, `HTTP=1 npm run dev:phone` serves plain HTTP instead. Add
+the printed address under `chrome://flags/#unsafely-treat-insecure-origin-as-secure` on the phone.
+This mode has no live reload: Vite's client would reload the page as soon as the phone's Wi-Fi came
+back after airplane mode, which mid-write would end the run. Reload the page by hand after an edit.
+
+The other way is Android's _Wireless debugging_: once the phone is paired with `adb`,
+`adb reverse tcp:5173 tcp:5173` lets it open `http://localhost:5173`, with no certificate at all.
 
 ### Verifying a change against the original
 
