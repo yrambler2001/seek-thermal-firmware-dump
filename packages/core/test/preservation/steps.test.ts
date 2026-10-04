@@ -53,6 +53,7 @@ import {
   PRESERVE_PATCHED_FILE,
   PRESERVE_PLAIN_NAME,
   PRESERVE_STEP_IDS,
+  PRESERVE_VERIFY_FILE,
   backupResultFromImage,
   classifyReaderBoot,
   createPreserveRun,
@@ -1582,6 +1583,15 @@ describe('runPreserveStep — the recovery behaviours', () => {
       }
       expect(state.nextStep).toBe('done');
       expect(state.verify).toEqual({ diffBytes: 0, windowsRead: 31, badWindows: [] });
+      /* The verify's re-read is kept, laid out like the backup — and on a
+       * restored part it IS the backup, byte for byte. */
+      const reread = await store.load(PRESERVE_VERIFY_FILE);
+      const backupImage = await store.load(PRESERVE_BACKUP_FILE);
+      expect(reread?.length).toBe(FLASH_SIZE);
+      expect(await sha256hex(reread!)).toBe(await sha256hex(backupImage!));
+      expect(state.steps.verify?.artifactShas?.[PRESERVE_VERIFY_FILE]).toBe(
+        await sha256hex(reread!),
+      );
 
       /* The delivered dump is the camera's ORIGINAL flash content. */
       const delivered = await store.load(PRESERVE_DUMP_ORIGINAL_FILE);

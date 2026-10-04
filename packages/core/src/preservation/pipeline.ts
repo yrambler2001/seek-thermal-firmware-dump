@@ -829,7 +829,8 @@ export function unrotateDump(dump: Uint8Array, base: number): Uint8Array {
  * P4's verify: re-read the 31 stock windows and compare every one against the
  * P1 backup — one admitted boot per window, the backup's own discipline (the
  * completing read poisons the reader, and the segment ends with the wire
- * reboot that clears it).
+ * reboot that clears it). The full-length windows it read come back too, keyed
+ * by address, so the run can keep the re-read beside the backup.
  */
 export async function verifyAgainstBackup(
   opener: SessionOpener,
@@ -838,11 +839,17 @@ export async function verifyAgainstBackup(
   chunk: number = READ_CHUNK,
   signal?: AbortSignal,
   prepare?: (device: SeekDevice) => void,
-): Promise<{ diffBytes: number; windowsRead: number; badWindows: readonly number[] }> {
+): Promise<{
+  diffBytes: number;
+  windowsRead: number;
+  badWindows: readonly number[];
+  readBack: ReadonlyMap<number, Uint8Array>;
+}> {
   const windows = preservationWindows();
   let diffBytes = 0;
   let windowsRead = 0;
   const badWindows: number[] = [];
+  const readBack = new Map<number, Uint8Array>();
   let index = 0;
   for (const entry of windows) {
     index++;
@@ -874,6 +881,7 @@ export async function verifyAgainstBackup(
       continue;
     }
     windowsRead++;
+    readBack.set(entry.address, read.data);
     const want = backup.byAddress.get(entry.address);
     if (want === undefined) {
       badWindows.push(entry.subcmd);
@@ -884,7 +892,7 @@ export async function verifyAgainstBackup(
     }
   }
   reporter.progress(windows.length, windows.length, 'P4 verify pass done', 'items');
-  return { diffBytes, windowsRead, badWindows };
+  return { diffBytes, windowsRead, badWindows, readBack };
 }
 
 /* ==================================================================== *

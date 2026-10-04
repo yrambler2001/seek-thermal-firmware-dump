@@ -272,6 +272,10 @@ export const PRESERVE_BANK_CAPTURE_FILE = 'preserve_bank_capture.bin';
 export const PRESERVE_PATCHED_FILE = 'preserve_patch_plain_patched.bin';
 export const PRESERVE_DUMP_POSTWRITE_FILE = 'preserve_dump_postwrite.bin';
 export const PRESERVE_DUMP_ORIGINAL_FILE = 'preserve_dump_original.bin';
+/** The verify step's re-read of the 31 windows after the restore, assembled
+ *  at its flash addresses like the backup (erased 0xFF between) — the second
+ *  stock read of the run, kept so it can be compared with the backup offline. */
+export const PRESERVE_VERIFY_FILE = 'preserve_verify_windows.bin';
 
 /** The run state document a checkpointing caller rewrites after every step. */
 export const PRESERVE_RUN_STATE_FILE = 'preserve_run.json';
@@ -1939,7 +1943,12 @@ async function runVerifyStep(
     last = read;
     if (read.badWindows.length === 0) break;
   }
-  const result = last ?? { diffBytes: -1, windowsRead: 0, badWindows: [] as number[] };
+  const result = last ?? {
+    diffBytes: -1,
+    windowsRead: 0,
+    badWindows: [] as number[],
+    readBack: new Map<number, Uint8Array>(),
+  };
   if (result.diffBytes !== 0 || result.badWindows.length > 0) {
     fail(
       `the verify read ${String(result.diffBytes)} differing byte(s) over ` +
@@ -1949,6 +1958,9 @@ async function runVerifyStep(
     );
   }
 
+  const artifacts: Artifact[] =
+    last === null ? [] : [named(PRESERVE_VERIFY_FILE, assembleBackupImage(last.readBack))];
+  const shas = await shasOf(artifacts);
   const nextState: PreserveRunState = {
     ...state,
     verify: {
@@ -1959,16 +1971,14 @@ async function runVerifyStep(
     nextStep: nextStepAfter('verify'),
     steps: {
       ...state.steps,
-      verify: {
-        status: 'done',
+      verify: stepRecord(
         startedAt,
-        finishedAt: new Date().toISOString(),
-        notes:
-          `a fresh boot re-read ${String(result.windowsRead)}/` +
+        `a fresh boot re-read ${String(result.windowsRead)}/` +
           `${String(BACKUP_WINDOW_COUNT)} windows at ${String(result.diffBytes)} differing ` +
           "byte(s) — the camera's flash is byte-identical to the backup",
-      },
+        shas,
+      ),
     },
   };
-  return { state: nextState, artifacts: [] };
+  return { state: nextState, artifacts };
 }
