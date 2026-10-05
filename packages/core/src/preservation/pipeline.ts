@@ -304,8 +304,15 @@ export async function openProbedSession(
       try {
         const reboot = await opener.open();
         const outcome = await resetDevice(reboot);
+        /* 'dropped' is the usual answer, not a failure: the camera reboots
+         * before it acknowledges, so the transfer dies with the wire (measured
+         * over real WebUSB, 2026-10-05). The next open tells whether it took. */
         reporter.log(
-          `${label}: reboot command ${outcome === 'sent' ? 'acknowledged' : 'not acknowledged'}`,
+          `${label}: reboot command ${
+            outcome === 'sent'
+              ? 'acknowledged'
+              : 'sent — no reply, as when the camera reboots before answering'
+          }`,
           'detail',
         );
         await opener.close(reboot);
