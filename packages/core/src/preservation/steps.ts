@@ -1275,71 +1275,71 @@ async function runBackupStep(
     repointed: boolean;
     assembled: Uint8Array;
   }> => {
-  reporter.log(`camera reports firmware ${version}`, 'detail');
-  const prepareReader = (device: SeekDevice): void => {
-    applyReaderOp(device, version);
-  };
+    reporter.log(`camera reports firmware ${version}`, 'detail');
+    const prepareReader = (device: SeekDevice): void => {
+      applyReaderOp(device, version);
+    };
 
-  /* THE SWEEP: one admitted boot per window, each segment's probe read IS the
-   * boot-config record, and each completing read ends with the wire reboot
-   * that clears the reader poison (TESTING.md sec. 34). */
-  const backup = await backupWindows(opener, reporter, READ_CHUNK, signal, prepareReader);
-  const byAddress = backup.byAddress;
-  const cfgRow = byAddress.get(0x14010000);
-  if (cfgRow === undefined) fail('the backup does not hold the boot-config block');
-  const detection = effectiveDetection(
-    state,
-    detectActiveSlotFromHead(cfgRow.subarray(0, BOOT_CONFIG_BYTES)),
-  );
-  reporter.log(`slot: ${detection.verdict}`, 'detail');
+    /* THE SWEEP: one admitted boot per window, each segment's probe read IS the
+     * boot-config record, and each completing read ends with the wire reboot
+     * that clears the reader poison (TESTING.md sec. 34). */
+    const backup = await backupWindows(opener, reporter, READ_CHUNK, signal, prepareReader);
+    const byAddress = backup.byAddress;
+    const cfgRow = byAddress.get(0x14010000);
+    if (cfgRow === undefined) fail('the backup does not hold the boot-config block');
+    const detection = effectiveDetection(
+      state,
+      detectActiveSlotFromHead(cfgRow.subarray(0, BOOT_CONFIG_BYTES)),
+    );
+    reporter.log(`slot: ${detection.verdict}`, 'detail');
 
-  let didRepoint = false;
-  let read2 = await captureAndDerive(
-    opener,
-    byAddress,
-    detection,
-    version,
-    expectedPrefix,
-    reporter,
-    signal,
-  );
-  /* The archive rows may have been repaired by the verified-arm ladder (a
-   * swallowed sweep row is replaced by the verified capture). */
-  let archiveRows: ReadonlyMap<number, Uint8Array> = read2.byAddress;
-  /* THE RECOVERY RE-POINT, IN-STEP. A build whose route is recovery-only
-   * (the FF build) cannot run from the cfg-named bank: the 2014 bootloader
-   * rejects its 0xFFFF-sum image at slots A/B and boots the recovery bank
-   * UNCHECKED (doc 35.3) — so the bank that truly runs is recovery, and
-   * the capture that matters is recovery's. The route is only KNOWN once a
-   * capture has been derived, so the first pass may derive from the
-   * cfg-named bank; if it names a recovery-only route, the detection is
-   * re-pointed and the bank that runs is captured and derived in full. */
-  if (read2.derived.patch.route === 'recovery-only' && read2.detection.bank !== 'r') {
-    const repointed = effectiveDetection({ ...state, route: 'recovery-only' }, detection);
-    reporter.log(`slot re-pointed: ${repointed.verdict}`, 'detail');
-    read2 = await captureAndDerive(
+    let didRepoint = false;
+    let read2 = await captureAndDerive(
       opener,
-      archiveRows,
-      repointed,
+      byAddress,
+      detection,
       version,
       expectedPrefix,
       reporter,
       signal,
     );
-    archiveRows = read2.byAddress;
-    didRepoint = true;
-  }
-  return {
-    version,
-    detection: read2.detection,
-    capture: read2.capture,
-    slotReadShas: read2.slotReadShas,
-    readModes: read2.readModes,
-    serveNote: read2.serveNote,
-    derived: read2.derived,
-    repointed: didRepoint,
-    assembled: assembleBackupImage(archiveRows),
-  };
+    /* The archive rows may have been repaired by the verified-arm ladder (a
+     * swallowed sweep row is replaced by the verified capture). */
+    let archiveRows: ReadonlyMap<number, Uint8Array> = read2.byAddress;
+    /* THE RECOVERY RE-POINT, IN-STEP. A build whose route is recovery-only
+     * (the FF build) cannot run from the cfg-named bank: the 2014 bootloader
+     * rejects its 0xFFFF-sum image at slots A/B and boots the recovery bank
+     * UNCHECKED (doc 35.3) — so the bank that truly runs is recovery, and
+     * the capture that matters is recovery's. The route is only KNOWN once a
+     * capture has been derived, so the first pass may derive from the
+     * cfg-named bank; if it names a recovery-only route, the detection is
+     * re-pointed and the bank that runs is captured and derived in full. */
+    if (read2.derived.patch.route === 'recovery-only' && read2.detection.bank !== 'r') {
+      const repointed = effectiveDetection({ ...state, route: 'recovery-only' }, detection);
+      reporter.log(`slot re-pointed: ${repointed.verdict}`, 'detail');
+      read2 = await captureAndDerive(
+        opener,
+        archiveRows,
+        repointed,
+        version,
+        expectedPrefix,
+        reporter,
+        signal,
+      );
+      archiveRows = read2.byAddress;
+      didRepoint = true;
+    }
+    return {
+      version,
+      detection: read2.detection,
+      capture: read2.capture,
+      slotReadShas: read2.slotReadShas,
+      readModes: read2.readModes,
+      serveNote: read2.serveNote,
+      derived: read2.derived,
+      repointed: didRepoint,
+      assembled: assembleBackupImage(archiveRows),
+    };
   })();
 
   /* THE PRE-FLASH DUMP ARCHIVE, offline from the assembled backup: the same
@@ -1705,12 +1705,7 @@ async function runDrainStep(
        * rotated). No legitimate part image starts with four zero bytes. The
        * bias re-rolls per boot, so the camera is rebooted by command and the
        * attempt loop takes another boot. */
-      if (
-        rawDump[0] === 0 &&
-        rawDump[1] === 0 &&
-        rawDump[2] === 0 &&
-        rawDump[3] === 0
-      ) {
+      if (rawDump[0] === 0 && rawDump[1] === 0 && rawDump[2] === 0 && rawDump[3] === 0) {
         reporter.log(
           'the drain came back one page high (a page-shifted boot — the dump starts with the ' +
             'boot-config block, not a vector) — rebooting by command and taking another boot',

@@ -49,7 +49,7 @@ export interface DeviceHandle {
    * Adopts an authorized Seek camera straight from `navigator.usb.getDevices()`
    * — no chooser, no gesture, no reliance on the connect event. The reattach
    * path for the reset dance: a camera rebooted by command re-enumerates while
-     * the page holds nothing, and a missed `connect` event must not strand the
+   * the page holds nothing, and a missed `connect` event must not strand the
    * run when the device is demonstrably back on the bus. True when one was
    * adopted.
    */

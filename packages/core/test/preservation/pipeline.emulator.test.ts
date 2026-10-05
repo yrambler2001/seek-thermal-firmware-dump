@@ -652,19 +652,14 @@ describe.skipIf(UNSUPPORTED !== null)(
                 /* ---- P1: the backup (read-only), one admitted boot per
                  * window; the emulator's reader never poisons, so the
                  * segments ride straight through -------------------- */
-                st.backup = await backupWindows(
-                  emulatorOpener(emu, 'P1 segment'),
-                  silentReporter,
-                );
+                st.backup = await backupWindows(emulatorOpener(emu, 'P1 segment'), silentReporter);
                 expect(st.backup.windows.length).toBe(BACKUP_WINDOW_COUNT);
                 expect(st.backup.bytes).toBe(BACKUP_WINDOW_COUNT * 0x10000);
 
                 /* ---- P2: detect, verify, conjugate, commit --------------- */
                 const cfgRow = st.backup.byAddress.get(0x14010000);
                 expect(cfgRow, 'the P1 backup holds the boot-config block').toBeDefined();
-                const detection = detectActiveSlotFromHead(
-                  cfgRow!.subarray(0, BOOT_CONFIG_BYTES),
-                );
+                const detection = detectActiveSlotFromHead(cfgRow!.subarray(0, BOOT_CONFIG_BYTES));
                 st.detection = detection;
                 expect(
                   detection.cfg0,
@@ -700,7 +695,9 @@ describe.skipIf(UNSUPPORTED !== null)(
                   });
                   st.commit = commit;
                   expect(commit.status).toBe(0); /* the measured commit verdict */
-                  expect(commit.chunks).toBe(Math.ceil(st.plain!.length / 64)); /* 747 for 1.3.0.0 */
+                  expect(commit.chunks).toBe(
+                    Math.ceil(st.plain!.length / 64),
+                  ); /* 747 for 1.3.0.0 */
                   expect(commit.sum16).toBe(sum16(st.payload!));
                   /* NO reset in this session: the reset is P3's opener (its own
                    * phase), and keeping it out of here lets this server stop
@@ -941,7 +938,11 @@ describe.skipIf(UNSUPPORTED !== null)(
             let verify: RunState['verify'];
             try {
               verify = await withFreshSessions(row, { flash: verifySource }, (emu2) =>
-                verifyAgainstBackup(emulatorOpener(emu2, 'P4 verify segment'), st.backup!, silentReporter),
+                verifyAgainstBackup(
+                  emulatorOpener(emu2, 'P4 verify segment'),
+                  st.backup!,
+                  silentReporter,
+                ),
               );
             } catch (error) {
               process.stderr.write(

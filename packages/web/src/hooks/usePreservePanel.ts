@@ -96,7 +96,7 @@ export const PHASE_PANEL_PREFIX = 'preserve:phase:';
 function bundleTag(): string {
   try {
     const url = import.meta.url;
-    return url === undefined || url === '' ? 'unknown' : (url.split('/').pop() ?? url);
+    return url === '' ? 'unknown' : (url.split('/').pop() ?? url);
   } catch {
     return 'unknown';
   }
@@ -344,7 +344,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
       phase: PreservePhaseId,
       rep: ReporterHandle,
       signal: AbortSignal,
-      patient: boolean = false,
+      patient = false,
     ): { opener: SessionOpener; closeAll: () => Promise<void> } => {
       const opened: WebUsbTransport[] = [];
       const closeAll = async (): Promise<void> => {
@@ -636,7 +636,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
              * stale tab has masqueraded as the new code three times — Chrome
              * caches the page hard — so every run names its bundle and a
              * stale one is visible at a glance. */
-            rep.reporter.log(`wizard build: ${String(bundleTag())}`, 'detail');
+            rep.reporter.log(`wizard build: ${bundleTag()}`, 'detail');
             rep.reporter.log(
               'the image will be read from the camera’s own active slot — there is no ' +
                 'image file to pick anywhere in this wizard',
@@ -669,7 +669,7 @@ export function usePreservePanel(params: PreservePanelParams): PreservePanelApi 
         }
 
         const load = artifactLoader(checkpoints.current, extra.current);
-        const { opener, closeAll } = makeOpener(phase, rep, signal, meta.resetsCamera === true);
+        const { opener, closeAll } = makeOpener(phase, rep, signal, meta.resetsCamera);
         let stepInFlight: PreserveStepId | null = null;
         const ran = new Set<PreserveStepId>();
         try {

@@ -270,7 +270,7 @@ export async function openProbedSession(
        * probe must keep asking, a pause between each, until the dispatcher
        * comes up. 26 reads, 20 ms apart, exactly the version read's window. */
       head = await (async (): Promise<Uint8Array> => {
-        let lastError: unknown = null;
+        let lastError: Error | null = null;
         for (let probeRead = 0; probeRead < 26; probeRead++) {
           assertLive(signal);
           try {
@@ -281,8 +281,9 @@ export async function openProbedSession(
               ...(signal === undefined ? {} : { signal }),
             });
           } catch (error) {
+            /* a refusal or a stall (both Errors) asks again; anything else is not the camera */
+            if (!(error instanceof Error)) throw error;
             lastError = error;
-            if (!isWireStall(error) && !(error instanceof Error)) throw error;
           }
         }
         throw lastError ?? new Error('the reader probe never answered');
@@ -321,7 +322,7 @@ export async function openProbedSession(
     if (
       boot === 'blank' &&
       head.every((b) => b === 0xff) /* stale garbage never proceeds — only a
-                                       * genuinely unprogrammed record does */
+       * genuinely unprogrammed record does */
     ) {
       blankBoots += 1;
       if (blankBoots >= 2) {

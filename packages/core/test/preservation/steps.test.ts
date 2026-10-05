@@ -1036,12 +1036,7 @@ describe('the segment probe — reader-boot classification and admission', () =>
     /* Blank on the first two boots: the blank-record camera proceeds. */
     const camera = v1Camera(plain);
     const opener = scriptedOpener(camera, [blank(), blank()]);
-    const { device, cfgHead } = await openProbedSession(
-      opener,
-      silentReporter,
-      undefined,
-      'test',
-    );
+    const { device, cfgHead } = await openProbedSession(opener, silentReporter, undefined, 'test');
     expect(cfgHead.every((b) => b === 0xff)).toBe(true);
     await opener.close(device);
 
