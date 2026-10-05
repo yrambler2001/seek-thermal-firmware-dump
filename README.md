@@ -175,6 +175,7 @@ packages/
 legacy/index.html          the original single-file page, kept for reference
 docs/                      the built web app — GitHub Pages serves this folder
 scripts/                   the differential test against the legacy page
+e2e/                       opt-in browser runs of the web app (emulator, real camera)
 ```
 
 `core` knows nothing about React, Node or the DOM: it takes a `UsbTransport` and a `Reporter` and
@@ -767,6 +768,8 @@ npm run dev:phone  # the same over HTTPS on your Wi-Fi, for an Android phone
 npm run test       # vitest, all packages
 npm run check      # format + lint + typecheck + test
 npm run build      # builds core, cli, and the web app into docs/
+npm run e2e:emu    # opt-in: the web app in Chrome, end to end, on the emulated camera
+npm run e2e:camera # opt-in: read-only on a real camera, real WebUSB (Electron)
 ```
 
 Requires Node 22.13 or newer.
@@ -796,6 +799,105 @@ back after airplane mode, which mid-write would end the run. Reload the page by 
 
 The other way is Android's _Wireless debugging_: once the phone is paired with `adb`,
 `adb reverse tcp:5173 tcp:5173` lets it open `http://localhost:5173`, with no certificate at all.
+
+### End-to-end runs in a browser
+
+`npm test` never opens a browser. Five opt-in scripts drive the web app in a real browser instead,
+through its own buttons, dialogs and run files. None of them is part of `npm test` or
+`npm run check`.
+
+```sh
+npm run e2e:emu            # Dump & decrypt, then Preserve steps 02, 03 and 04, on the emulated camera
+npm run e2e:camera         # Dump & decrypt, then Preserve step 02 only, on a real camera, real WebUSB
+npm run e2e:camera:bridge  # the same read-only run through the Node bridge instead
+npm run e2e:camera:restart # e2e:camera, with one camera restart in step 02 (see below)
+npm run e2e:prompt         # checks whether Chrome lets a test answer its WebUSB device chooser
+```
+
+They use `puppeteer-core`, which drives a browser that is already installed and never downloads
+one of its own. `e2e:emu`, `e2e:camera:bridge` and `e2e:prompt` drive Google Chrome (the macOS path
+is the default; `SEEK_E2E_CHROME` points at another binary). The other two drive Electron, a
+development dependency; its binary is fetched the first time it is needed (about 100 MB, or run
+`npx install-electron` beforehand). Each run starts the browser on a new, empty profile in a
+temporary directory and deletes it afterwards, so your own profile is never touched. The app is
+served by a Vite dev server of the run's own, on a free port, never 5173 or 5174, with no live
+reload, so editing files mid-run does not reload the page under it.
+
+Google Chrome cannot be scripted past its WebUSB device chooser. The CDP event Puppeteer uses to
+answer a chooser fires for Web Bluetooth, and not for `navigator.usb.requestDevice()`;
+`e2e:prompt` measures that, and a pre-granting enterprise policy is not something these scripts
+install. So there are two ways to put the app in front of a device:
+
+- **Real WebUSB, in Electron** (`e2e:camera`, `e2e:camera:restart`). The page runs Chromium's own WebUSB on the real
+  macOS USB stack, with nothing in between. Electron hands the chooser to its main process
+  (`select-usb-device`, `e2e/electron/main.mjs`), which shows it to the test, and the test picks
+  the camera by its vendor and product ids, as you would in Chrome's window. Permissions are
+  Electron's own. For a camera with no serial number they are Chrome's: the grant belongs to one
+  enumeration and is dropped when the camera leaves the bus, so a restart ends in the page's blue
+  "Your turn" box and a new pick. The run records the serial string Chromium read (empty, for this
+  camera).
+- **The bridge** (`e2e:emu`, `e2e:camera:bridge`). The page's `navigator.usb` is replaced by a
+  stand-in (`e2e/lib/stand-in.ts`), and every device call goes to Node (`e2e/lib/bridge.ts`),
+  where a real device answers it: the emulator, or the camera through the CLI's own USB stack
+  (node-usb). The stand-in behaves the way Chrome does with this camera. A camera that restarts
+  sends a `disconnect`, then comes back as a new device with no `connect` event and nothing from
+  `getDevices()`. The page shows its "Your turn" box, and the test presses **Connect device** and
+  picks the camera in the bridge's chooser.
+
+Neither covers Google Chrome itself: its chooser window, its permission store, or its exact
+version. Electron 44 runs Chromium 152, a little behind Google Chrome (154 when this was written).
+
+**`e2e:emu`** needs the FW-V1 emulator (`SEEK_EMU_DIR`, as for the emulator suites). It boots the
+bench Compact 1.3.0.0's own dump and runs the whole wizard against it. A restart stops the emulator
+and boots a fresh one from the flash it was holding, as the camera boots from its flash. The run
+checks each run file's name (`preserve-<start>-<saved>-patch-built.zip`, `…-full-dump.zip`,
+`…-verified.zip`) and its folders, down to `04-restore-verify/preserve_verify_windows.bin`. It
+checks the raw and delivered dumps byte for byte against the emulated part, and the final page's
+"matches the backup on all 31 blocks" and "Verified — a perfect match.". It also checks that the
+camera's flash is back to exactly what it booted with. It takes about six minutes, headless.
+
+**`e2e:camera`** and **`e2e:camera:bridge`** are read-only:
+
+- **They will** connect, run Dump & decrypt and check its image against the camera's flash (the
+  bench unit's `40447c7e…`; `SEEK_E2E_CAMERA_SHA` names another, empty skips the check), run
+  Preserve step 02 (read the camera, build the patch in memory, and, if its reader comes up spent,
+  reboot it by command and answer the "Your turn" pick), check the step 02 run file, and check that
+  the page offers step 03 with no red alarm.
+- **They will not** start step 03 or 04, confirm a write, or open the Flash view. Three guards stop
+  it independently. The script refuses those buttons. The page refuses the flash-write requests
+  before they leave it: on real WebUSB a guard loaded before any app code locks
+  `USBDevice.prototype`'s transfer methods to a whitelist of reads, operation mode 0, the read
+  window's arm (after the camera has reported its version) and the plain reset during step 02.
+  The third guard is Electron's main process, which answers the chooser only for a Seek camera on
+  the run's own page with that guard in place; on the bridge it is the bridge, which forwards the
+  same whitelist. Anything else, `SetFeaturedFirmwareData` and `CompleteMemoryUpgrade` above all,
+  is refused unsent and fails the run.
+- They skip themselves when no camera is plugged in, when two are, or when another program holds
+  the camera's interface (a Chrome tab mid-run, the CLI). Close the app's tabs first. A run takes
+  about two minutes.
+
+**`e2e:camera:restart`** is `e2e:camera` with the one path a plain run never takes: the camera
+restarting. Step 02 reboots the camera only when its reader probe finds a dead reader, and on stock
+firmware it never does. So the page-side guard answers the first 26 of the probe's reads (28 bytes
+on `0x4F`, the probe's whole budget) with a stall, without sending them, which is what a dead
+reader answers on the wire. Everything after that is the app's own code. The probe gives up, the
+step reboots the camera with its plain `ResetDevice`, and the camera leaves the bus and comes back
+as a new device. The page shows its blue "Your turn" box, the test answers the new pick, and the
+step finishes on real reads. The guards are unchanged, and the run allows exactly one reset to go
+out. The run checks the step 02 run file and a second Dump & decrypt with the same image as the
+first, and it checks that step 03 is offered with no red alarm. It also records what Electron does
+across the re-enumeration:
+
+- a `disconnect` event and no `connect` event;
+- `getDevices()` answering empty while the app tries to re-adopt the camera, and the camera again
+  only after the pick;
+- a new device id for the same camera.
+
+It takes about two minutes.
+
+`SEEK_E2E_HEADED=1` shows the browser window, `SEEK_E2E_KEEP=1` keeps the downloads and the
+emulator's flash images (the path is printed), `SEEK_E2E_SCRATCH` chooses where they go, and
+`SEEK_E2E_PORT` pins the dev server's port.
 
 ### Verifying a change against the original
 

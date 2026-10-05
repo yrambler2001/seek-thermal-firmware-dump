@@ -1,0 +1,17 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node", "w3c-web-usb"],
+    "paths": {
+      "@seek-fw/core": ["../packages/core/src/index.ts"]
+    }
+  },
+  "include": ["**/*.ts"]
+}
