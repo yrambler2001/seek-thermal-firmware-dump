@@ -52,8 +52,22 @@ export const WRITE_GUARD: WriteGuardConfig = {
 };
 
 /** The guard as a script: what Electron's preload runs before the app. */
-export function writeGuardScript(): string {
-  return `(${installWriteGuard.toString()})(${JSON.stringify(WRITE_GUARD)});\n`;
+/**
+ * The guard as a script for Electron's preload. The default is the strict
+ * read-only guard. `lifted` is ONLY for a supervised camera write that has
+ * passed the gate (`supervised-write.ts`): it drops the flash-write ids from
+ * `neverOps` and pre-arms the reset, so the write flow's own RPCs pass — while
+ * the guard still installs, locks the prototype methods and records every
+ * transfer, and the vendor-id device pick in Electron's main process is
+ * untouched. Never used by the unattended read-only runs.
+ */
+export function writeGuardScript(options: { readonly lifted?: boolean } = {}): string {
+  const config: WriteGuardConfig = options.lifted ? { ...WRITE_GUARD, neverOps: [] } : WRITE_GUARD;
+  const arm = options.lifted
+    ? `globalThis[${JSON.stringify(WRITE_GUARD_GLOBAL)}].allowReset = true;` +
+      `globalThis[${JSON.stringify(WRITE_GUARD_GLOBAL)}].resetBudget = null;`
+    : '';
+  return `(${installWriteGuard.toString()})(${JSON.stringify(config)});\n${arm}\n`;
 }
 
 /** The Dump & decrypt archive: its layout, and its whole image against the camera's. */

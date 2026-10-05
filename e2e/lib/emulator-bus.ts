@@ -129,6 +129,32 @@ export class EmulatorBus implements UsbBus {
     await this.rebooting;
   }
 
+  /**
+   * The cable pulled: stop the current emulator and drop the device off the
+   * bus, WITHOUT a wire reset — an external unplug, not the app's own reboot.
+   * Any transfer in flight fails as the socket closes. `replug()` brings the
+   * same flash back as a NEW device (a new key, so no grant carries over).
+   */
+  async unplug(): Promise<void> {
+    await this.rebooting;
+    const device = this.current;
+    if (device === null) return;
+    this.current = null;
+    await (device.device as UsbIpWebUsbDevice).close().catch(() => undefined);
+    const boot = this.boots.at(-1);
+    this.emit({ kind: 'detach', device });
+    if (boot !== undefined) await this.stopBoot(boot);
+  }
+
+  /** The cable plugged back in: boot a fresh emulator from the flash the last
+   *  one held (its post-write `.final` when it wrote, else the as-booted image). */
+  async replug(): Promise<void> {
+    const boot = this.boots.at(-1);
+    if (boot === undefined) throw new Error('nothing to replug — no emulator has booted');
+    const final = `${boot.flashOut}.final`;
+    await this.boot({ flash: existsSync(final) ? final : boot.flashOut });
+  }
+
   check(
     device: BusDevice,
     direction: 'in' | 'out',

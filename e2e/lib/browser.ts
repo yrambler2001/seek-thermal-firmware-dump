@@ -14,8 +14,17 @@
  *    (`Browser.setDownloadBehavior`), and each one is waited for by name.
  */
 
+import { createServer as createHttpServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 
 import puppeteer, { type Browser } from 'puppeteer-core';
@@ -72,6 +81,74 @@ export async function startDevServer(): Promise<DevServer> {
   return {
     url,
     close: () => server.close(),
+  };
+}
+
+const MIME: Readonly<Record<string, string>> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.map': 'application/json',
+};
+
+/**
+ * Serves a built directory (the hosted `docs/` bundle) over plain HTTP, exactly
+ * as GitHub Pages would: static files, no dev server, no module graph, no
+ * websocket. A request that resolves to nothing falls back to `index.html`
+ * (the app routes on the hash, so any path is the one page). Every request's
+ * path is recorded in `requests`, so a test can assert the page fetches nothing
+ * from the network after it has loaded.
+ */
+export interface StaticServer extends DevServer {
+  readonly requests: string[];
+}
+
+export async function startStaticServer(dir: string): Promise<StaticServer> {
+  if (!existsSync(path.join(dir, 'index.html'))) {
+    throw new Error(`no index.html under ${dir} — build the web app first (npm run build)`);
+  }
+  const requests: string[] = [];
+  const server = createHttpServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    requests.push(url.pathname);
+    const rel = decodeURIComponent(url.pathname).replace(/^\/+/, '');
+    let file = path.join(dir, rel);
+    if (!file.startsWith(dir)) {
+      res.writeHead(403).end('forbidden');
+      return;
+    }
+    if (!existsSync(file) || statSync(file).isDirectory()) file = path.join(dir, 'index.html');
+    try {
+      const body = readFileSync(file);
+      res.writeHead(200, {
+        'content-type': MIME[path.extname(file)] ?? 'application/octet-stream',
+      });
+      res.end(body);
+    } catch {
+      res.writeHead(404).end('not found');
+    }
+  });
+  const port = await freePort();
+  await new Promise<void>((resolve) => {
+    server.listen(port, '127.0.0.1', resolve);
+  });
+  const url = `http://127.0.0.1:${String(port)}/`;
+  say(`static server (the hosted docs/ bundle): ${url}`);
+  return {
+    url,
+    requests,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => {
+          resolve();
+        });
+      }),
   };
 }
 

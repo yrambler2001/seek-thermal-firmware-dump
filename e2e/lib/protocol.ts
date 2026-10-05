@@ -49,10 +49,18 @@ export type DeviceCall =
   | { readonly method: 'controlTransferIn'; readonly setup: ControlSetup; readonly length: number }
   | { readonly method: 'controlTransferOut'; readonly setup: ControlSetup; readonly data: string };
 
-export type BridgeRequest =
+export type BridgeRequest = (
   | { readonly op: 'getDevices' }
   | { readonly op: 'requestDevice'; readonly filters: readonly UsbFilter[] }
-  | ({ readonly op: 'call'; readonly key: string } & DeviceCall);
+  | ({ readonly op: 'call'; readonly key: string } & DeviceCall)
+) & {
+  /**
+   * Which document sent it: a random id the stand-in draws once per page load.
+   * A request from a new document means the old one unloaded, and Chrome closes
+   * every device an unloaded document held — the bridge does the same.
+   */
+  readonly doc?: string;
+};
 
 /** A failure, as the DOMException the page rebuilds from it. */
 export interface BridgeFailure {

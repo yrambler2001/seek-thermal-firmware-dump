@@ -7,8 +7,9 @@
  * process over stdin/stdout, one JSON object per line:
  *
  *   out  `@@seek-e2e {"event": ...}`  ready, prompt, prompt-devices, selected,
- *                                      refused, download, usb-device-*, error
- *   in   `{"cmd": "select" | "cancel" | "quit", ...}`
+ *                                      refused, download, usb-device-*,
+ *                                      window-opened, unload-asked, error
+ *   in   `{"cmd": "select" | "cancel" | "open-window" | "quit", ...}`
  *
  * THE DEVICE PICKER, IN CODE. Chromium's chooser is replaced by Electron's
  * `select-usb-device`. Nothing is ever picked on its own: an open chooser is
@@ -130,6 +131,35 @@ async function answer(command) {
   send({ event: 'selected', id: command.id, device: describe(device) });
 }
 
+/** A window on the page, with the write guard as its preload. Every window the
+ *  run opens (the first, and a second one on the test's ask) is built here. */
+function openWindow() {
+  const window = new BrowserWindow({
+    show: HEADED,
+    width: 1280,
+    height: 900,
+    webPreferences: {
+      preload: PRELOAD,
+      /* The guard must patch the page's own USBDevice before the app runs. */
+      contextIsolation: false,
+      nodeIntegration: false,
+      sandbox: true,
+      /* A hidden window must keep real-time timers: the app's waits are 20 ms. */
+      backgroundThrottling: false,
+    },
+  });
+  /* A page mid-run asks before it unloads (its beforeunload handler). Chrome
+   * shows "Leave site?"; Electron shows nothing and silently keeps the page,
+   * which would hang a reload. The test's reload stands for the user who
+   * answers "Leave", so it is allowed through — and reported, so the test can
+   * check that the page did ask. */
+  window.webContents.on('will-prevent-unload', (event) => {
+    send({ event: 'unload-asked', id: window.webContents.id });
+    event.preventDefault();
+  });
+  return window;
+}
+
 app.whenReady().then(async () => {
   if (!HEADED) app.dock?.hide();
   const ses = session.defaultSession;
@@ -185,6 +215,20 @@ app.whenReady().then(async () => {
       app.quit();
       return;
     }
+    if (command.cmd === 'open-window') {
+      /* A second window on the same page and the same session (so the same
+       * grants), with the same preload guard: what a second tab is in Chrome. */
+      const second = openWindow();
+      second
+        .loadURL(PAGE_URL)
+        .then(() => {
+          send({ event: 'window-opened', id: second.webContents.id });
+        })
+        .catch((error) => {
+          send({ event: 'error', message: `second window: ${String(error)}` });
+        });
+      return;
+    }
     if (command.cmd === 'select' || command.cmd === 'cancel') {
       answer(command).catch((error) => {
         send({ event: 'error', message: String(error) });
@@ -198,20 +242,7 @@ app.whenReady().then(async () => {
     app.quit();
   });
 
-  const window = new BrowserWindow({
-    show: HEADED,
-    width: 1280,
-    height: 900,
-    webPreferences: {
-      preload: PRELOAD,
-      /* The guard must patch the page's own USBDevice before the app runs. */
-      contextIsolation: false,
-      nodeIntegration: false,
-      sandbox: true,
-      /* A hidden window must keep real-time timers: the app's waits are 20 ms. */
-      backgroundThrottling: false,
-    },
-  });
+  const window = openWindow();
   await window.loadURL(PAGE_URL);
   send({
     event: 'ready',

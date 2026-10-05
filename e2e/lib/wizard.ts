@@ -247,40 +247,163 @@ export class Wizard {
 
   /* ---- Dump & decrypt ------------------------------------------------------ */
 
+  /** The "Dump" section's auto-family run, the common case. */
   async dumpAndDecrypt(timeoutMs: number): Promise<DumpRun> {
+    return this.runDump({
+      panel: 'dump',
+      button: 'Start dump',
+      archive: /^seek_flash4m_.+\.zip$/,
+      timeoutMs,
+    });
+  }
+
+  /** One dump-shaped run: start it, wait for its "Done" line, collect its zip. */
+  async runDump(options: {
+    readonly panel: string;
+    readonly button: string;
+    readonly archive: RegExp;
+    readonly timeoutMs: number;
+  }): Promise<DumpRun> {
     const t0 = Date.now();
     await this.route('#/');
-    await this.click('section[aria-labelledby="dump-heading"]', 'Start dump');
-    /* A second dump starts from the first one's "Done" line: wait for it to go. */
-    await this.page.waitForFunction(
-      () =>
-        !(document.querySelector<HTMLElement>('#dump-status')?.innerText ?? '').startsWith('Done'),
-      { timeout: 15_000, polling: 100 },
-    );
+    const statusSel = `#${options.panel}-status`;
+    await this.startDump(options.panel, options.button);
     let lastReport = 0;
     for (;;) {
-      const status = await this.text('#dump-status');
+      const status = await this.text(statusSel);
       if (status.startsWith('Done — ')) break;
       if (/^(Failed|Refused|Cancelled)/.test(status)) {
-        throw new Error(`Dump & decrypt ended: ${status}\n${await this.logTail('dump')}`);
+        throw new Error(`${options.button} ended: ${status}\n${await this.logTail(options.panel)}`);
       }
-      if (Date.now() - t0 > timeoutMs) {
-        throw new Error(`Dump & decrypt did not finish in ${String(timeoutMs)} ms: ${status}`);
+      if (Date.now() - t0 > options.timeoutMs) {
+        throw new Error(
+          `${options.button} did not finish in ${String(options.timeoutMs)} ms: ${status}`,
+        );
       }
       if (Date.now() - lastReport > 15_000) {
         lastReport = Date.now();
-        say(`dump: ${status}`);
+        say(`${options.panel}: ${status}`);
       }
       await sleep(500);
     }
-    const status = await this.text('#dump-status');
+    const status = await this.text(statusSel);
     const archive = await this.downloads.waitFor(
-      (name) => /^seek_flash4m_.+\.zip$/.test(name),
+      (name) => options.archive.test(name),
       60_000,
-      'dump archive',
+      `${options.panel} archive`,
     );
-    say(`dump: ${status} (${String(Date.now() - t0)} ms)`);
+    say(`${options.panel}: ${status} (${String(Date.now() - t0)} ms)`);
     return { ms: Date.now() - t0, archive, entries: readZip(archive.bytes), status };
+  }
+
+  /** Clicks a dump/sweep start button and waits past the previous "Done" line. */
+  async startDump(panel: string, button: string): Promise<void> {
+    const section = `section[aria-labelledby="${panel === 'manual' ? 'manual' : 'dump'}-heading"]`;
+    await this.click(section, button);
+    await this.page.waitForFunction(
+      (sel: string) =>
+        !(document.querySelector<HTMLElement>(sel)?.innerText ?? '').startsWith('Done'),
+      { timeout: 15_000, polling: 100 },
+      `#${panel}-status`,
+    );
+  }
+
+  /** Waits until a dump has read at least `windows` windows (its progress text). */
+  async dumpProgressed(panel: string, windows: number, timeoutMs = 60_000): Promise<void> {
+    await this.page.waitForFunction(
+      (sel: string, want: number) => {
+        const bar = document.querySelector(`${sel} [role="progressbar"]`);
+        const now = Number(bar?.getAttribute('aria-valuenow') ?? '0');
+        const status = document.querySelector<HTMLElement>(`${sel}-status`)?.innerText ?? '';
+        return now >= want || status.includes('read 0x');
+      },
+      { timeout: timeoutMs, polling: 200 },
+      `#${panel}`,
+      windows,
+    );
+  }
+
+  /** Clicks a run panel's Cancel and waits for it to settle. Returns the status. */
+  async cancel(panel: string, section: string, timeoutMs = 60_000): Promise<string> {
+    await this.click(section, 'Cancel');
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const status = await this.text(`#${panel}-status`);
+      if (/Cancelled|Done —|Failed|Refused/.test(status)) return status;
+      if (Date.now() > deadline) throw new Error(`cancel did not settle: ${status}`);
+      await sleep(250);
+    }
+  }
+
+  /** Picks a local file into the next `<input type=file>` the click opens. */
+  private async pickFile(open: () => Promise<void>, filePath: string): Promise<void> {
+    const chooser = this.page.waitForFileChooser({ timeout: 15_000 });
+    chooser.catch(() => undefined);
+    await open();
+    const dialog = await chooser;
+    await dialog.accept([filePath]);
+  }
+
+  /** Offline "Decrypt a dump you already have": pick `filePath`, wait, collect the zip. */
+  async offlineDecrypt(filePath: string, timeoutMs = 5 * 60_000): Promise<DumpRun> {
+    const t0 = Date.now();
+    await this.route('#/');
+    await this.pickFile(
+      () => this.click('section[aria-labelledby="offline-heading"]', 'Choose dump file…'),
+      filePath,
+    );
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const status = await this.text('#offline-status');
+      if (/^Done —|^No images|^Not a usable/.test(status)) break;
+      if (/^Cancelled|^Failed|^ERROR/.test(status)) {
+        throw new Error(`offline decrypt ended: ${status}\n${await this.logTail('offline')}`);
+      }
+      if (Date.now() > deadline) throw new Error(`offline decrypt stalled: ${status}`);
+      await sleep(300);
+    }
+    const status = await this.text('#offline-status');
+    const archive = await this.downloads.waitFor(() => true, 60_000, 'offline archive');
+    say(`offline decrypt: ${status} (${String(Date.now() - t0)} ms)`);
+    return { ms: Date.now() - t0, archive, entries: readZip(archive.bytes), status };
+  }
+
+  /** The manual "firmware family" select. `value` is a profile id. */
+  async selectManualProfile(value: string): Promise<void> {
+    await this.page.select('#manualProfile', value);
+  }
+
+  /** Loads a run file into the Preserve page and waits for the resume line. */
+  async loadRunFile(filePath: string, timeoutMs = 60_000): Promise<string> {
+    await this.route('#/preserve');
+    await this.pickFile(
+      () => this.click('section[aria-labelledby="preserve-runfile-heading"]', 'Load a run file…'),
+      filePath,
+    );
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const status = await this.text('#preserve-load-status');
+      if (/^Resumed at|^Not resumed/.test(status)) {
+        say(`load run file: ${status}`);
+        return status;
+      }
+      if (Date.now() > deadline) throw new Error(`run-file load stalled: ${status}`);
+      await sleep(250);
+    }
+  }
+
+  /** The device description line (`#device-description`). */
+  async deviceDescription(): Promise<string> {
+    return this.text('#device-description');
+  }
+
+  /** Presses "Forget device" and waits for the seat to clear. */
+  async forget(): Promise<void> {
+    await this.click('section[aria-labelledby="connect-heading"]', 'Forget device');
+    await this.page.waitForFunction(
+      () => !(document.querySelector('#device-description')?.textContent ?? '').includes('VID'),
+      { timeout: 15_000, polling: 200 },
+    );
   }
 
   /* ---- the Preserve wizard ------------------------------------------------ */
@@ -302,11 +425,18 @@ export class Wizard {
    */
   async runPhase(
     phase: PhaseId,
-    options: { readonly confirm: boolean; readonly timeoutMs: number },
+    options: {
+      readonly confirm: boolean;
+      readonly timeoutMs: number;
+      /** Called with each "Your turn" ask before it is answered (e.g. a screenshot). */
+      readonly onAsk?: (ask: AskView) => Promise<void>;
+    },
   ): Promise<PhaseRun> {
     if (!this.guard.allowPhase(phase)) {
       throw new Error(`UI guard (${this.guard.name}) refuses to start ${PHASE_LABEL[phase]}`);
     }
+    /* Make sure the wizard is on screen — a caller may be anywhere. Idempotent. */
+    await this.openPreserve();
     const section = phaseSection(phase);
     const panel = `preserve-phase-${phase}`;
     const t0 = Date.now();
@@ -362,7 +492,9 @@ export class Wizard {
           if (classes.includes('border-l-primary')) return 'info' as const;
           return 'unknown' as const;
         });
-        askViews.push({ tone, text: view.ask, redAlerts: await this.redAlerts() });
+        const askView: AskView = { tone, text: view.ask, redAlerts: await this.redAlerts() };
+        askViews.push(askView);
+        await options.onAsk?.(askView);
         say(`${PHASE_LABEL[phase]}: "Your turn" ask #${String(asks)} (${tone}) — answering it`);
         const picked = await this.pickCamera(asked, 'Connect device', 240_000);
         say(`${PHASE_LABEL[phase]}: picked ${picked} in the chooser`);

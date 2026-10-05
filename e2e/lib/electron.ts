@@ -58,6 +58,8 @@ type MainEvent =
       event: 'usb-device-added' | 'usb-device-removed' | 'usb-device-revoked';
       device: ElectronDevice;
     }
+  | { event: 'window-opened'; id: number }
+  | { event: 'unload-asked'; id: number }
   | { event: 'error'; message: string };
 
 function chooserName(device: ElectronDevice): string {
@@ -278,6 +280,42 @@ export class ElectronApp implements DevicePrompter, DownloadWaiter {
     return this.state.downloads.filter((d) => d.state === 'completed').map((d) => d.name);
   }
 
+  /**
+   * A second window on the same page, the same session (so the same WebUSB
+   * grants) and the same preload write guard — a second tab, as Chrome has it.
+   * Its downloads and its choosers come through this object like the first's.
+   */
+  async openWindow(timeoutMs = 60_000): Promise<Page> {
+    const known = new Set(await this.browser.pages());
+    const opened = this.state.windowsOpened;
+    this.send({ cmd: 'open-window' });
+    await this.state.until(
+      () => (this.state.windowsOpened > opened ? true : null),
+      timeoutMs,
+      'Electron did not open a second window',
+    );
+    const origin = new URL(this.page.url()).origin;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const page = (await this.browser.pages()).find(
+        (p) => !known.has(p) && p.url().startsWith(origin),
+      );
+      if (page !== undefined) return page;
+      if (Date.now() > deadline) throw new Error('the second window never showed up over CDP');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+
+  /** How many times a page asked before unloading (its beforeunload handler). */
+  get unloadAsks(): number {
+    return this.state.unloadAsks;
+  }
+
+  /** The `usb-device-revoked` events the main process saw, as timeline lines. */
+  revocations(): string[] {
+    return this.timeline.filter((line) => line.includes('usb-device-revoked'));
+  }
+
   /** Quits Electron (killing it if it will not go) and deletes its profile. */
   async close(): Promise<void> {
     await this.browser.disconnect().catch(() => undefined);
@@ -308,6 +346,9 @@ class AppState {
   readonly downloads: { name: string; path: string; state: string; taken: boolean }[] = [];
   readonly timeline: string[] = [];
   readonly seen: ElectronDevice[] = [];
+  windowsOpened = 0;
+  /** How many times a page's beforeunload asked (Electron's will-prevent-unload). */
+  unloadAsks = 0;
   private readonly started = Date.now();
   private readonly waiters = new Set<() => void>();
 
@@ -364,6 +405,14 @@ class AppState {
       case 'usb-device-removed':
       case 'usb-device-revoked':
         this.note(`${message.event}: ${chooserName(message.device)} [${message.device.deviceId}]`);
+        break;
+      case 'window-opened':
+        this.windowsOpened += 1;
+        this.note(`window ${String(message.id)} opened`);
+        break;
+      case 'unload-asked':
+        this.unloadAsks += 1;
+        this.note(`window ${String(message.id)}: the page asked before unloading (allowed)`);
         break;
       case 'error':
         this.note(`main process error: ${message.message}`);

@@ -55,6 +55,9 @@ export interface StandInControl {
 
 export function installUsbStandIn(config: StandInConfig): void {
   const scope = globalThis as unknown as Record<string, unknown>;
+  /* This document's id: a reload is a new document, and the bridge closes what
+   * the old one held, as Chrome does when a page unloads. */
+  const doc = `${String(Date.now())}-${Math.random().toString(36).slice(2)}`;
 
   const bridge = async (request: BridgeRequest): Promise<BridgeReply> => {
     const fn = scope[config.binding];
@@ -65,7 +68,7 @@ export function installUsbStandIn(config: StandInConfig): void {
         message: 'the e2e USB bridge is not attached',
       };
     }
-    return await (fn as (r: BridgeRequest) => Promise<BridgeReply>)(request);
+    return await (fn as (r: BridgeRequest) => Promise<BridgeReply>)({ ...request, doc });
   };
 
   const failure = (reply: BridgeFailure): Error =>

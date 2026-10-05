@@ -802,9 +802,9 @@ The other way is Android's _Wireless debugging_: once the phone is paired with `
 
 ### End-to-end runs in a browser
 
-`npm test` never opens a browser. Five opt-in scripts drive the web app in a real browser instead,
-through its own buttons, dialogs and run files. None of them is part of `npm test` or
-`npm run check`.
+`npm test` never opens a browser. A family of opt-in scripts drives the web app in a real browser
+instead, through its own buttons, dialogs and run files. None of them is part of `npm test` or
+`npm run check`. `npm run e2e` runs them all (see "Every test, either target" below).
 
 ```sh
 npm run e2e:emu            # Dump & decrypt, then Preserve steps 02, 03 and 04, on the emulated camera
@@ -895,9 +895,74 @@ across the re-enumeration:
 
 It takes about two minutes.
 
+#### Every test, either target
+
+Beyond the four flows above, a set of target-agnostic checks runs the SAME test body on EITHER
+target: the emulator (the default) or the real camera over real WebUSB (`SEEK_E2E_TARGET=camera`).
+Read-only flows run on either unattended; a flow that writes flash runs freely on the emulator and,
+on the camera, only through the supervised gate below.
+
+```sh
+npm run e2e                # every unattended test (emulator + camera read-only); skips camera cleanly if none
+npm run e2e:gate           # the supervised write gate's refusals (no browser, no device)
+npm run e2e:dump           # sweep mode, the hand-picked family, and an offline decrypt (SEEK_E2E_DUMP_FILE)
+npm run e2e:cancel         # cancel Dump & decrypt (and step 02) mid-read, then read again
+npm run e2e:soak           # N Dump & decrypt runs (SEEK_E2E_SOAK_N, default 10) — identical sha, with timings
+npm run e2e:offline        # the hosted docs/ bundle, run with the network cut after it loads
+npm run e2e:resume         # load a patch-built run file and resume at step 03 (+ flat-layout and broken-zip)
+npm run e2e:reload         # reload mid-step-02 (clean restart) and after it (resume)
+npm run e2e:forget         # Forget device -> revoke -> getDevices() empty -> connect again (camera by default)
+npm run e2e:second         # a second window on the same profile: the known claim bug (emu), a no-transfer probe (camera)
+npm run e2e:phone          # 375x812 screenshots of each state, light and dark, overflow asserted
+npm run e2e:unplug         # unplug mid-dump -> clean error -> replug -> read again (emulator)
+npm run e2e:flash          # the Flash view on the emulator: reads, then flashes the camera's own image and boots it
+npm run e2e:write          # Preserve 02->03->04: a write run, gated on the camera (see below)
+```
+
+`SEEK_E2E_TARGET=camera npm run e2e:cancel` (and the like) runs a read-only check on the real
+camera; without it they default to the emulator. Each test picks a sensible default target
+(`e2e:forget` defaults to the camera), and skips cleanly when that target is not available.
+
+| Test             | emulator                                            | camera                              |
+| ---------------- | --------------------------------------------------- | ----------------------------------- |
+| `e2e:emu` / full | writes 02–04                                        | —                                   |
+| `e2e:camera*`    | —                                                   | read-only (02 only)                 |
+| `e2e:dump`       | read-only                                           | read-only                           |
+| `e2e:cancel`     | read-only                                           | read-only                           |
+| `e2e:soak`       | read-only                                           | read-only                           |
+| `e2e:offline`    | read-only                                           | read-only                           |
+| `e2e:resume`     | resumes; writes 03–04 with `SEEK_E2E_RESUME_FULL=1` | read-only (resume check only)       |
+| `e2e:reload`     | read-only                                           | read-only                           |
+| `e2e:forget`     | read-only                                           | read-only                           |
+| `e2e:second`     | two windows dump at once: pins the known claim bug  | read-only (window 2 sends nothing)  |
+| `e2e:unplug`     | read-only                                           | manual/hardware switch (supervised) |
+| `e2e:flash`      | reads; writes its own image and boots it            | n/a (view never opened)             |
+| `e2e:write`      | writes 02–04                                        | SUPERVISED only                     |
+| `e2e:phone`      | n/a (no device)                                     | n/a (no device)                     |
+
+#### Writing the real camera (supervised only)
+
+`e2e:write` runs Preserve 02→03→04. On the emulator that is an ordinary write run. On the camera it
+passes through a gate (`approveWrite`, `e2e/lib/supervised-write.ts`) that is deliberately hard to
+pass and impossible to pass by accident: it needs `SEEK_E2E_WRITE=i-understand`, a non-CI
+interactive terminal, and the operator to type back the camera's own firmware version and image
+sha. Under automation (no TTY) it refuses, so nothing is ever written to the camera. `SEEK_E2E_WRITE=dry-run`
+reads the camera up to the first write and stops. The gate's refusals are pinned by `e2e:gate`; the
+write RPC sequence is proven on the emulator (`e2e:emu`, and `e2e:write` with
+`SEEK_E2E_WRITE_FULL=1`). The actual camera 03/04 execution lifts the page write-guard for that run
+only, keeps every other guard (the vendor-id pick, the expected RPC sequence), and is left for a
+human at a terminal.
+
+The unplug / power-cycle flows on the camera use a USB power switch (`e2e/lib/power-switch.ts`): a
+MANUAL mode that asks a human to unplug and replug and waits for the bus, or the RP2040 hardware
+switch at `SEEK_E2E_SWITCH_DIR` driven over serial (`on/off/cycle <channel>`). The channel the
+camera is on must be given (`SEEK_E2E_SWITCH_CHANNEL`) before anything toggles — the switch has two
+channels and the wrong one would cut power to whatever else is plugged into it.
+
 `SEEK_E2E_HEADED=1` shows the browser window, `SEEK_E2E_KEEP=1` keeps the downloads and the
-emulator's flash images (the path is printed), `SEEK_E2E_SCRATCH` chooses where they go, and
-`SEEK_E2E_PORT` pins the dev server's port.
+emulator's flash images (the path is printed), `SEEK_E2E_SCRATCH` chooses where they go,
+`SEEK_E2E_PORT` pins the dev server's port, `SEEK_E2E_SHOTS` is the phone-screenshot directory, and
+`SEEK_E2E_DUMP_FILE` is a 4 MiB dump for the offline-decrypt check.
 
 ### Verifying a change against the original
 

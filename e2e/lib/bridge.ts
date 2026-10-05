@@ -17,6 +17,17 @@
  * the user picks it again in the chooser. The bridge models exactly that — a
  * device with a serial keeps its grant and comes back with a `connect` event.
  *
+ * TABS AND RELOADS, AS CHROME HAS THEM. A browser profile's grants are per
+ * origin, so every tab of the app sees the same ones: two bridges built on one
+ * `BrowserUsbState` share them (`openSecondPage` in a test). Each page opens the
+ * device for itself, but only ONE may hold its interface: a second page's
+ * `claimInterface` is refused with the NetworkError "Unable to claim interface."
+ * — measured on Electron 44 / Chromium 152 on macOS with this camera: the second
+ * window's `open()` succeeds, its claim is refused, and the first window's claim
+ * stands. A page that unloads (a reload) loses everything it held: Chrome closes
+ * its devices, and the bridge does the same when the next document's first call
+ * arrives (its transfers already on the wire are let finish first).
+ *
  * THE CHOOSER mirrors Puppeteer's `DeviceRequestPrompt` (`waitForDevicePrompt`,
  * `waitForDevice`, `select`, `cancel`), so a scenario written against
  * `DevicePrompter` runs unchanged against Chrome's own chooser, were CDP to
@@ -197,7 +208,26 @@ export interface BridgeOptions {
   /** Vendor OUT request ids the PAGE refuses before they reach Node (a guard). */
   readonly refuseOutInPage?: readonly number[];
   readonly log?: (line: string) => void;
+  /** The browser profile this page belongs to: pass another bridge's `shared`
+   *  for a second tab of the same app (same grants, one interface claim). */
+  readonly shared?: BrowserUsbState;
 }
+
+/**
+ * What one browser profile holds across its tabs, for one origin: the grants,
+ * and which page has each device open and which holds each interface claim.
+ */
+export class BrowserUsbState {
+  readonly granted = new Set<string>();
+  readonly persistentGrants = new Set<string>();
+  /** `<device key>#<interface>` -> the page (bridge) holding the claim. */
+  readonly claims = new Map<string, UsbBridge>();
+  /** device key -> the pages (bridges) that have it open. */
+  readonly openers = new Map<string, Set<UsbBridge>>();
+}
+
+const UNABLE_TO_CLAIM =
+  "Failed to execute 'claimInterface' on 'USBDevice': Unable to claim interface.";
 
 function infoOf(device: BusDevice): DeviceInfo {
   return {
@@ -238,10 +268,19 @@ export class UsbBridge implements DevicePrompter {
   readonly counts = new Map<string, number>();
   /** The bus and chooser events, timestamped, for the report. */
   readonly timeline: string[] = [];
+  /** Shared with every other tab of the same browser profile. */
+  readonly shared: BrowserUsbState;
   private readonly page: Page;
   private readonly log: (line: string) => void;
-  private readonly granted = new Set<string>();
-  private readonly persistentGrants = new Set<string>();
+  private readonly granted: Set<string>;
+  private readonly persistentGrants: Set<string>;
+  /** Devices THIS page has open (Chrome's per-document device handles). */
+  private readonly opened = new Set<string>();
+  /** The document making calls now, the ones that unloaded, and each one's calls in flight. */
+  private liveDoc: string | null = null;
+  private readonly retired = new Set<string>();
+  private readonly inFlight = new Map<string, Set<Promise<unknown>>>();
+  private retiring: Promise<void> = Promise.resolve();
   private readonly known = new Map<string, BusDevice>();
   private readonly gone = new Set<string>();
   private readonly unclaimedPrompts: BridgePrompt[] = [];
@@ -253,6 +292,9 @@ export class UsbBridge implements DevicePrompter {
     this.page = page;
     this.bus = bus;
     this.log = options.log ?? ((): void => undefined);
+    this.shared = options.shared ?? new BrowserUsbState();
+    this.granted = this.shared.granted;
+    this.persistentGrants = this.shared.persistentGrants;
     for (const device of bus.present()) this.known.set(device.key, device);
     this.unsubscribe = bus.subscribe((change) => {
       void this.onBusChange(change);
@@ -330,8 +372,11 @@ export class UsbBridge implements DevicePrompter {
       return;
     }
     this.gone.add(device.key);
+    /* The grant of a device with no serial number dies with its enumeration:
+     * the key never comes back (a re-enumeration is a new key), so it is left
+     * in place — every tab of the profile still sends its own disconnect. */
     const wasGranted = this.granted.has(device.key);
-    if (identityOf(device) === null) this.granted.delete(device.key);
+    this.opened.delete(device.key);
     this.note(`bus: ${label} detached${wasGranted ? ' — disconnect event' : ''}`);
     if (wasGranted) await this.tellPage({ type: 'disconnect', device: infoOf(device) });
   }
@@ -356,6 +401,78 @@ export class UsbBridge implements DevicePrompter {
   /* ---- page requests ----------------------------------------------------- */
 
   private async handle(request: BridgeRequest): Promise<BridgeReply> {
+    const doc = request.doc ?? 'unknown';
+    if (this.retired.has(doc)) {
+      return {
+        ok: false,
+        name: 'NotFoundError',
+        message: 'The page that made this call unloaded.',
+      };
+    }
+    if (this.liveDoc !== doc) {
+      if (this.liveDoc !== null) this.retire(this.liveDoc);
+      this.liveDoc = doc;
+    }
+    await this.retiring;
+    const work = this.serve(request);
+    let calls = this.inFlight.get(doc);
+    if (calls === undefined) {
+      calls = new Set();
+      this.inFlight.set(doc, calls);
+    }
+    const tracked = calls;
+    tracked.add(work);
+    try {
+      return await work;
+    } finally {
+      tracked.delete(work);
+    }
+  }
+
+  /**
+   * The page unloaded (a reload): close what its document held, as Chrome does.
+   * A transfer already on the wire is let finish first (the device answers it
+   * either way); then the claim is released and the device closed, unless
+   * another tab still has it open.
+   */
+  private retire(doc: string): void {
+    this.retired.add(doc);
+    const calls = [...(this.inFlight.get(doc) ?? [])];
+    this.inFlight.delete(doc);
+    const held = [...this.opened];
+    this.retiring = (async () => {
+      if (calls.length > 0) {
+        await Promise.race([
+          Promise.allSettled(calls),
+          new Promise((resolve) => setTimeout(resolve, 30_000)),
+        ]);
+      }
+      for (const key of held) await this.closeFor(key);
+      this.note(
+        `page: the document unloaded — ${String(calls.length)} call(s) were in flight; ` +
+          (held.length === 0 ? 'it held no device' : `closed ${held.join(', ')}`),
+      );
+    })();
+  }
+
+  /** This page lets go of `key`: its claim, then its open — and the device
+   *  itself once no tab has it open. */
+  private async closeFor(key: string): Promise<void> {
+    const entry = this.known.get(key);
+    this.opened.delete(key);
+    const openers = this.shared.openers.get(key);
+    openers?.delete(this);
+    for (const [claim, owner] of [...this.shared.claims]) {
+      if (owner !== this || !claim.startsWith(`${key}#`)) continue;
+      this.shared.claims.delete(claim);
+      await entry?.device.releaseInterface(Number(claim.split('#')[1])).catch(() => undefined);
+    }
+    if ((openers?.size ?? 0) === 0 && entry !== undefined) {
+      await entry.device.close().catch(() => undefined);
+    }
+  }
+
+  private async serve(request: BridgeRequest): Promise<BridgeReply> {
     try {
       switch (request.op) {
         case 'getDevices':
@@ -405,20 +522,29 @@ export class UsbBridge implements DevicePrompter {
       throw domError('NotFoundError', 'The device is not allowed (no grant).');
     }
     const device = entry.device;
+    const mine = (): boolean => this.opened.has(request.key);
     let value: unknown = undefined;
     switch (request.method) {
-      case 'open':
-        await device.open();
+      case 'open': {
+        if (!device.opened) await device.open();
+        this.opened.add(request.key);
+        let openers = this.shared.openers.get(request.key);
+        if (openers === undefined) {
+          openers = new Set();
+          this.shared.openers.set(request.key, openers);
+        }
+        openers.add(this);
         break;
+      }
       case 'close':
-        await device.close();
+        await this.closeFor(request.key);
         break;
       case 'forget': {
         this.granted.delete(request.key);
         const identity = identityOf(entry);
         if (identity !== null) this.persistentGrants.delete(identity);
         this.note(`page: forget() ${chooserName(entry)}`);
-        await device.close().catch(() => undefined);
+        await this.closeFor(request.key);
         break;
       }
       case 'reset':
@@ -426,13 +552,29 @@ export class UsbBridge implements DevicePrompter {
       case 'selectConfiguration':
         await device.selectConfiguration(request.n);
         break;
-      case 'claimInterface':
+      case 'claimInterface': {
+        if (!mine()) throw domError('InvalidStateError', 'The device must be opened first.');
+        const claim = `${request.key}#${String(request.n)}`;
+        const owner = this.shared.claims.get(claim);
+        if (owner !== undefined && owner !== this) {
+          this.note(`page: claimInterface(${String(request.n)}) refused — another tab holds it`);
+          throw domError('NetworkError', UNABLE_TO_CLAIM);
+        }
         await device.claimInterface(request.n);
+        this.shared.claims.set(claim, this);
         break;
-      case 'releaseInterface':
+      }
+      case 'releaseInterface': {
+        const claim = `${request.key}#${String(request.n)}`;
+        if (this.shared.claims.get(claim) !== this) {
+          throw domError('InvalidStateError', 'The interface is not claimed.');
+        }
+        this.shared.claims.delete(claim);
         await device.releaseInterface(request.n);
         break;
+      }
       case 'controlTransferIn': {
+        this.assertMayTransfer(request.key, request.setup);
         const setup = this.vendorSetup(request.setup);
         this.count('in', setup.request);
         this.enforce(this.bus.check(entry, 'in', request.setup, null), 'in', setup.request);
@@ -454,6 +596,7 @@ export class UsbBridge implements DevicePrompter {
         break;
       }
       case 'controlTransferOut': {
+        this.assertMayTransfer(request.key, request.setup);
         const setup = this.vendorSetup(request.setup);
         const bytes = new Uint8Array(Buffer.from(request.data, 'base64'));
         this.count('out', setup.request);
@@ -471,10 +614,22 @@ export class UsbBridge implements DevicePrompter {
       ok: true,
       value,
       state: {
-        opened: device.opened,
+        opened: device.opened && mine(),
         configurationValue: device.configuration?.configurationValue ?? null,
       },
     };
+  }
+
+  /** What Chrome checks before a control transfer: this page has the device
+   *  open, and an interface-recipient request goes to an interface it claimed. */
+  private assertMayTransfer(key: string, setup: ControlSetup): void {
+    if (!this.opened.has(key))
+      throw domError('InvalidStateError', 'The device must be opened first.');
+    if (setup.recipient !== 'interface') return;
+    const claim = `${key}#${String(setup.index & 0xff)}`;
+    if (this.shared.claims.get(claim) !== this) {
+      throw domError('InvalidStateError', 'The specified interface has not been claimed.');
+    }
   }
 
   /** The app sends vendor requests only; anything else is refused unsent. */
